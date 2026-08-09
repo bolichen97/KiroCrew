@@ -95,15 +95,28 @@ def _validated_loopback_return_address(value: object) -> _LoopbackCallback | Non
     )
 
 
+class _NoListener(Exception):
+    """Nothing is bound to the loopback port a return address names."""
+
+
 async def _relay_loopback_callback(callback: _LoopbackCallback) -> int:
     """Send one GET to a fixed loopback host and return its HTTP status."""
     host = "::1" if callback.ipv6 else "127.0.0.1"
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, callback.port),
-        timeout=3,
-    )
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, callback.port),
+            timeout=3,
+        )
+    except ConnectionRefusedError as refused:
+        # The kernel answered for this port and said nothing is bound to it. That
+        # is the only signal proving the listener is ABSENT rather than merely
+        # slow, saturated or unroutable, so it is the only one raised distinctly:
+        # every other dial failure stays an ordinary delivery failure. Once the
+        # connection is established the listener demonstrably exists, so nothing
+        # after this point may reach here either.
+        raise _NoListener(str(refused)) from refused
     try:
         host_header = f"[{host}]" if callback.ipv6 else host
         request = (
@@ -136,6 +149,10 @@ def _bad_gateway(error: str, code: str) -> web.Response:
     return web.json_response({"error": error, "code": code}, status=502)
 
 
+def _approval_superseded(error: str, code: str) -> web.Response:
+    return web.json_response({"error": error, "code": code}, status=409)
+
+
 async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     """POST /api/mcp/oauth/relay — deliver a failed browser redirect locally."""
     try:
@@ -161,6 +178,23 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
 
     try:
         callback_status = await _relay_loopback_callback(callback)
+    except _NoListener:
+        # Nothing is bound to that port. The listener and the PKCE verifier are
+        # created by the process that minted the authorize URL and die with it, so
+        # its absence proves the code can no longer be redeemed BY ANYONE -- a
+        # fresh listener on the same port never saw the verifier. Answering with
+        # the delivery-failure message below would blame the paste for an
+        # approval that is simply spent.
+        sel().log_api_access(
+            caller="dashboard",
+            operation="mcp_oauth_callback_relay",
+            outcome="denied",
+            resources=server,
+        )
+        return _approval_superseded(
+            "the approval this return address belongs to is no longer live",
+            "approval_superseded",
+        )
     except (asyncio.TimeoutError, OSError, ValueError):
         sel().log_api_access(
             caller="dashboard",

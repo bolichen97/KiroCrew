@@ -45,6 +45,10 @@ weeks in the open.
   toggle, and the shared MCP gateway follows it.
 - **Connections** gained a provider registry, so an integration declares what it
   is asking for and its consent URL is validated before you are sent to it.
+- Pasting an OAuth return address for an approval that has already expired now
+  says so, instead of blaming the paste — a spent approval is told apart from a
+  failed delivery, so you know to start a fresh one rather than re-copy a dead
+  address.
 - Code Review Sage works against **GitHub Enterprise Server** hosts.
 - An MCP server that authenticates with OAuth now receives the scope list and
   client id in the fields kiro-cli actually reads, so those connections
