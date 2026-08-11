@@ -67,8 +67,10 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/handoff-channels", chat.api_handoff_channels)
     app.router.add_post("/api/chat/slots/{slot}/slack-link", chat.api_chat_slot_slack_link)
     app.router.add_post("/api/chat/slots/{slot}/slack-unlink", chat.api_chat_slot_slack_unlink)
+    app.router.add_post("/api/chat/slots/{slot}/slack-pause", chat.api_chat_slot_slack_pause)
     app.router.add_post("/api/chat/slots/{slot}/mirror-link", chat.api_chat_slot_mirror_link)
     app.router.add_post("/api/chat/slots/{slot}/mirror-unlink", chat.api_chat_slot_mirror_unlink)
+    app.router.add_post("/api/chat/slots/{slot}/mirror-pause", chat.api_chat_slot_mirror_pause)
     app.router.add_get("/api/chat/channel-targets", chat.api_channel_targets)
     app.router.add_get("/api/slack/channels", chat.api_slack_channels)
 

@@ -4191,6 +4191,18 @@ class SessionManager:
         """Remove a session's Slack link (stop mirroring). Returns True if one was present."""
         return self._session_map.clear_slack_link(key)
 
+    def set_slack_paused(self, key: str, paused: bool) -> bool:
+        """Set whether turns reach the linked Slack thread; return the prior state.
+
+        Disconnecting retains the thread binding and its reverse index, so a reply
+        there still resolves to this session.
+        """
+        return self._session_map.set_slack_paused(key, paused)
+
+    def is_slack_paused(self, key: str) -> bool:
+        """True iff this session's Slack thread is disconnected but still bound."""
+        return self._session_map.is_slack_paused(key)
+
     def get_session_for_thread(self, thread_ts: str) -> str | None:
         """Return the session key linked to a Slack thread, or None."""
         return self._session_map.get_session_for_thread(thread_ts)
@@ -4351,6 +4363,18 @@ class SessionManager:
     def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
         """Clear every session mirroring to an exact location; return cleared keys."""
         return self._session_map.clear_mirror_links_at(link)
+
+    def set_mirror_paused(self, key: str, paused: bool, *, origin: bool = False) -> bool:
+        """Set whether turns reach one non-Slack delivery; return the prior state.
+
+        ``origin`` selects the born-in conversation rather than the explicit
+        mirror binding — a session can hold both, and they mute independently.
+        """
+        return self._session_map.set_mirror_paused(key, paused, origin=origin)
+
+    def is_mirror_paused(self, key: str, *, origin: bool = False) -> bool:
+        """True iff the named non-Slack delivery is disconnected (see the setter)."""
+        return self._session_map.is_mirror_paused(key, origin=origin)
 
     # Backward-compat aliases used by callers not yet migrated
     async def set_channel(self, key: str, channel_id: str) -> None:

@@ -4980,13 +4980,7 @@
       "worktree_disabled_no_project_directory": "「このセッションに追加」はコンポーザーを事前入力します。送信を押すまで何も送信されません。ワークツリーは使用不可です。このセッションにはプロジェクトディレクトリがありません (コンポーザーのプロジェクトチップで選択してください)。"
     },
     "inboundLinkChip": {
-      "confirm_release": "このセッションを{{label}}から切断しますか？\n\nそこから送信されたメッセージはここに到着しなくなり、返信はそこに配信されなくなります。そのチャネルから !sessions で再度接続できます。",
-      "driven_from": "{{label}}から駆動中",
-      "release": "切断",
-      "release_aria": "このセッションを{{label}}から切断",
-      "release_failed": "セッションを切断できませんでした: {{reason}}",
-      "released": "{{label}}から切断されました",
-      "tooltip": "このセッションは{{label}}と双方向です。返信はそこに配信され、そこから送信されたメッセージはここに到着します。"
+      "driven_from": "{{label}}から駆動中"
     },
     "infoTip": {
       "more_information": "詳細情報"
@@ -5203,23 +5197,13 @@
       "copy_url_of": "{{name}} の URL をコピー"
     },
     "linkedSurfacesSection": {
-      "confirm_release": "{{label}} からこのセッションをリリースしますか？\n\nそこに送信されたメッセージはここに到着しなくなり、返信はそこに配信されなくなります。そのチャネルから !sessions を使用して再度接続できます。",
-      "confirm_stop_mirroring": "{{label}} へのこのセッションのミラーリングを停止しますか？\n\n返信はもうそこに配信されなくなります。後で設定されたチャネルピッカーから再度リンクできます。",
-      "connected": "接続済み：{{label}}",
-      "link_failed": "チャネルをリンクできませんでした：{{reason}}",
-      "mirror": "ミラー",
-      "mirror_stopped": "{{label}} へのミラーリングを停止しました",
-      "offline": "オフライン",
-      "origin": "オリジン",
-      "post_reminder": "{{label}} にリマインダーを投稿",
-      "release": "{{label}} をリリース",
-      "released": "{{label}} からリリースされました",
-      "reminder_failed": "リマインダーを投稿できませんでした：{{reason}}",
-      "reminder_sent": "{{label}} にリマインダーが投稿されました",
-      "stop_failed": "ミラーリングを停止できませんでした：{{reason}}",
-      "stop_mirroring": "{{label}} へのミラーリングを停止",
-      "two_way": "双方向",
-      "unavailable": "この送信先は利用できません。"
+      "connect_failed": "{{label}} に接続できませんでした：{{reason}}",
+      "connect_to": "{{label}} に接続",
+      "disconnect_failed": "{{label}} から切断できませんでした：{{reason}}",
+      "disconnect_from": "{{label}} から切断",
+      "held_elsewhere": "{{label}} は別のセッションで使用中です。",
+      "unavailable": "この送信先は利用できません。",
+      "unknown_error": "不明なエラー"
     },
     "logEntry": {
       "cancelled": "キャンセル済み",
@@ -5983,11 +5967,6 @@
     "skillPickerMenu": {
       "loading_skills": "スキルを読み込み中…",
       "no_matching_skills": "一致するスキルがありません"
-    },
-    "slackLinkSection": {
-      "post_reminder_in_slack": "Slack に通知を投稿する",
-      "send_to_slack": "Slack に送信",
-      "unlink_from_slack": "Slack のリンクを解除"
     },
     "slashCommandMenu": {
       "desc_agent": "アクティブなエージェントを切り替えるか管理する",
@@ -7751,6 +7730,7 @@
       "collapse_hidden_folders": "非表示フォルダーを折りたたむ",
       "column_filter": "列フィルター",
       "column_name_optional": "列名 (任意)",
+      "connected_to": "{{label}} に接続済み",
       "create": "作成…",
       "creating": "作成中…",
       "custom": "カスタム",
@@ -7813,7 +7793,6 @@
       "match_mode": "一致モード",
       "merged": "マージ済み",
       "min": "分",
-      "mirroring_to": "{{label}} にミラーリング中",
       "model_list": "モデル一覧",
       "more": "その他",
       "more_create_options": "その他の作成オプション",
@@ -7872,6 +7851,8 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "新しい順",
       "sort_oldest": "古い順",
+      "started_in_channel": "この会話は {{channel}} で始まりました。",
+      "started_in_direct_message": "この会話はダイレクトメッセージで始まりました。",
       "streaming": "ストリーミング中",
       "switch_all_sessions": "すべてのセッションを切り替え",
       "switch_all_to_model": "すべてのモデルを切り替え…",
@@ -7884,8 +7865,6 @@
       "temporary_no_memory_reads_or_writes": "一時セッション — メモリの読み書きなし",
       "thinking": "考え中…",
       "today": "今日",
-      "two_way_with_channel": "このセッションは {{channel}} と双方向で連携しています。返信はそちらに配信され、そちらに送信されたメッセージはここに届きます。",
-      "two_way_with_direct_message": "このセッションはダイレクトメッセージと双方向で連携しています。返信はそちらに配信され、そちらに送信されたメッセージはここに届きます。",
       "unfiled": "未整理",
       "untagged": "+ タグなし",
       "untagged_2": "タグなし",

@@ -579,6 +579,37 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
   target server-side; the legacy `{conversation_id, thread_id?}` body remains
   accepted for compatibility. A successful new link posts an anchor plus the
   last five redacted messages before persisting the mirror.
+- `POST /api/chat/slots/{name}/slack-pause` | `mirror-pause` — disconnect (or
+  reconnect) a channel while **retaining** its binding, so inbound still routes
+  to the same session and a later reconnect needs no re-link. Same auth posture
+  as the link/unlink pair. Body `{paused: bool}`; `mirror-pause` also takes
+  `{origin: bool}` naming WHICH non-Slack delivery is meant, because a session
+  can hold two at once and they mute independently. Returns 409
+  `mirror_not_linked` when the named delivery does not exist. The disconnect
+  itself is never governance-gated (it only ever reduces egress); a denial
+  silences the courtesy note posted into the conversation and keeps the
+  disconnect. That note is skipped entirely for an `origin` disconnect, since the
+  mirror resolver addresses the EXPLICIT mirror — a different conversation.
+- **Three persisted pause markers, each keyed differently.** A mute must live and
+  die with the binding the user muted, so the key follows what the flag is about:
+  - `slack_paused` — the Slack thread. Cleared when the binding is REBOUND
+    (different ts or channel), NOT on an identical-coordinate write: the Slack
+    inbound path re-writes the same ts/channel every turn as its thread registry,
+    so clearing on any write let one inbound message silently un-disconnect a
+    thread.
+  - `mirror_paused` — the explicit `mirror` binding. Read/written through
+    `_mirror_key`, following the binding between the canonical row and the legacy
+    `dashboard:` spelling.
+  - `origin_paused` — the conversation the session was BORN in. Read/written on
+    the CANONICAL row, never through `_mirror_key`: that helper migrates rows
+    depending on where a MIRROR lives, which stranded the pause the moment a
+    mirror landed on the canonical row.
+  Each existence check is per flag: a born-in conversation is permanent, while an
+  explicit mirror must actually exist, so a flag with nothing behind it reads as
+  connected rather than reporting a session that delivers nowhere as merely quiet.
+  Enforcement lives at the send sites, not in storage — see
+  [messaging](messaging.md) for the `SilentRenderer` substitution that stops a
+  disconnected non-Slack conversation being written to.
 - `GET /api/chat/channel-targets` — owner-authenticated union of Slack
   destinations and every registered transport's configured targets. The
   dashboard session menu renders this list with per-channel brand icons.

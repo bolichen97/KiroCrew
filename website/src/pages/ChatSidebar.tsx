@@ -2437,20 +2437,21 @@ function ChatSidebar({
               </AnimatePresence>
               {isOut && <span className="text-accent" title={i18nT('pages.chatSidebar.popped_out_to_a_separate_window')}><ExternalLink size={10} /></span>}
               {slotChannelNamespace(s.key) && (() => {
-                // Where this conversation started — and, since the session IS the
-                // conversation rather than a copy of it, still where it is two-way
-                // with: what you type here is delivered to that channel, and what
-                // is sent there arrives here. Same wording as the inbound-link
-                // chip (`components.inboundLinkChip.tooltip`), which states the
-                // same relationship for a session driven from a channel.
+                // PROVENANCE ONLY: where this conversation started. That is
+                // history, so it stays true after the channel is disconnected —
+                // which is exactly why this glyph must not describe delivery.
+                // It previously said the session was "two-way" with the channel
+                // and that replies "are delivered there", a claim the disconnect
+                // makes false while this glyph still renders. Current delivery is
+                // the separate set of glyphs below, which filter on `paused`.
                 //
                 // `unified` gets its own key rather than an interpolated label:
                 // it has no proper noun, and an English article fragment inside
                 // a translated sentence is not something a locale can repair.
                 const ns = slotChannelNamespace(s.key)
                 const label = ns === 'unified'
-                  ? i18nT('pages.chatSidebar.two_way_with_direct_message')
-                  : i18nT('pages.chatSidebar.two_way_with_channel', { channel: slotChannelLabel(s.key) })
+                  ? i18nT('pages.chatSidebar.started_in_direct_message')
+                  : i18nT('pages.chatSidebar.started_in_channel', { channel: slotChannelLabel(s.key) })
                 // Brand mark rather than a generic bubble: the row already tells
                 // you a chat happened, so the only new information this glyph can
                 // carry is WHICH app it came from. Namespaces with no mark of
@@ -2465,17 +2466,26 @@ function ChatSidebar({
               })()}
               {/* Live mirroring, per channel. The origin glyph above is derived
                *  from the slot KEY (channelOrigin.ts) and already says where the
-               *  conversation STARTED, so this renders only `out` links — a real
-               *  mirror target — and never double-badges an origin. It replaces a
+               *  conversation STARTED, so this renders only channels currently
+               *  DELIVERING and never double-badges an origin. It replaces a
                *  `linked_to_slack` Link glyph that fired for ANY channel, because
-               *  every non-Slack transport writes its id into slack_channel_id. */}
+               *  every non-Slack transport writes its id into slack_channel_id.
+               *
+               *  `both` counts as delivering: a two-way binding is strictly MORE
+               *  connected than a one-way mirror, and filtering on `out` alone left
+               *  a session with messages flowing both ways looking unlinked. A
+               *  disconnected channel is excluded — it keeps its direction, so
+               *  without the `paused` check the sidebar promised delivery for a
+               *  session whose own menu one row away reads "Connect to X". */}
               {(s.links ?? [])
-                .filter(link => link.direction === 'out')
+                .filter(link => link.direction !== 'origin' && !link.paused)
                 .map((link, index) => (
                   <span
                     key={`${link.channel}:${link.direction}:${index}`}
                     className="inline-flex text-[10px]"
-                    title={i18nT('pages.chatSidebar.mirroring_to', { label: link.label })}
+                    role="img"
+                    aria-label={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
+                    title={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
                   >
                     <ChannelBrandIcon channel={link.channel} size={10} />
                   </span>

@@ -220,6 +220,14 @@ class FakeSessions:
         # that one user-visible action costs one whole-map write.
         self.batch_depth = 0
         self.batched_writes: list[bool] = []
+        # Interface parity with the real SessionManager: the dispatcher's
+        # disconnect gate consults this. Entries are ``(session_key, origin)``.
+        # Extended here rather than relying on the gate's fail-open, so a test
+        # about the gate exercises the gate instead of its fallback.
+        self.paused_deliveries: set[tuple[str, bool]] = set()
+
+    def is_mirror_paused(self, key: str, *, origin: bool = False) -> bool:
+        return (key, origin) in self.paused_deliveries
 
     async def get_or_create(self, key: str, *, agent: Any = None, channel_id: Any = None) -> Any:
         self.last_agent = agent
@@ -1200,6 +1208,38 @@ class TestApprovalDecider:
 class TestDispatcher:
     def _msg(self, text: str, user: str = "u1", chan: str = "c1") -> InboundMessage:
         return InboundMessage(channel_type="discord", user_id=user, conversation_id=chan, text=text)
+
+    @pytest.mark.asyncio
+    async def test_a_disconnected_conversation_gets_no_reply(self) -> None:
+        """Disconnecting Discord in the dashboard must actually stop the replies.
+
+        Discord runs its OWN copy of the turn loop rather than going through
+        ``messaging.dispatch.drive_turn``, so the gate there does not reach it.
+        Before this, the dashboard control flipped its own label and nothing else:
+        the next message in the conversation was answered exactly as before.
+
+        The turn still runs and the message still lands in the session — the
+        binding is retained by design — so this asserts on what the CONVERSATION
+        receives, which is the whole of what "disconnect" promises.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        key = d._session_key("u1")
+        # True = the conversation this session was BORN in, which is what a Discord
+        # session's own key names.
+        sess.paused_deliveries.add((key, True))
+
+        await d.handle_message(self._msg("hello"))
+
+        assert cli.sent == [], f"a disconnected conversation still replied: {cli.sent}"
+
+    @pytest.mark.asyncio
+    async def test_a_connected_conversation_still_replies(self) -> None:
+        """The non-vacuity half: without it, a broken renderer would pass above."""
+        d, cli, _ = _dispatcher({"u1"})
+
+        await d.handle_message(self._msg("hello"))
+
+        assert cli.sent, "a connected conversation must still be answered"
 
     @pytest.mark.asyncio
     async def test_new_command_bumps_generation(self) -> None:

@@ -91,7 +91,9 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     expire_slack_options,
     is_system_injection_item,
+    mirror_is_paused,
     remember_slack_options,
+    slack_mirror_is_paused,
     slot_history_key,
 )
 from kiro_crew.dashboard.handlers import (
@@ -1920,6 +1922,11 @@ async def _deliver_auth_error_to_slack(
     slack_client = getattr(state, "slack_client", None)
     if slack_client is None:
         return
+    # A disconnected thread is muted for turn output, and an auth failure IS turn
+    # output. The dashboard renders the same error, which is where a user who just
+    # disconnected the thread is working.
+    if slack_mirror_is_paused(state, session_key):
+        return
     thread_ts = getattr(slot, "_slack_thread_ts", "")
     channel_id = getattr(slot, "_slack_channel", "")
     if (not thread_ts or not channel_id) and sessions is not None:
@@ -1948,6 +1955,11 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     token). Best-effort: a delivery failure never disrupts the dashboard turn.
     """
     if not assistant_text:
+        return
+    # Disconnected: the binding is retained so a reply there still resolves here,
+    # but turn output stops. Asked before resolving so a muted channel costs no
+    # transport lookup.
+    if mirror_is_paused(state, session_key):
         return
     target = _resolve_mirror_target(state, session_key)
     if target is None:
@@ -1987,6 +1999,11 @@ async def _deliver_cross_surface_user_message(
     streaming mirror; the caller guards out slash commands and recovery turns.
     """
     if not user_message:
+        return
+    # Same gate as the reply leg: these are the two sites that carry turn output,
+    # and a disconnect silences both or the remote conversation reads as a
+    # question with no answer.
+    if mirror_is_paused(state, session_key):
         return
     target = _resolve_mirror_target(state, session_key)
     if target is None:
@@ -4121,7 +4138,16 @@ async def _run_chat(
         # ANSWER to the thread that asked: gating the whole setup leaves
         # `_mirror_thread` empty, the reply leg downstream silently no-ops, and the
         # question already sitting on Slack is never answered at all.
-        if state.slack_client and not is_slash:
+        # A DISCONNECTED thread stops here and nowhere else: `_mirror_thread` and
+        # `_mirror_chan` stay empty, which is what silences the echo, the tool
+        # stream, the assistant reply and the stream teardown together. Disconnect
+        # is the user saying "not into this conversation", which applies to the
+        # answer as much as to the echo — so it is one gate, not four.
+        if (
+            state.slack_client
+            and not is_slash
+            and not slack_mirror_is_paused(state, session_key)
+        ):
             _mirror_thread, _mirror_chan = state.sessions.get_slack_link(session_key)
             if _mirror_thread and _mirror_chan:
                 try:
@@ -5197,6 +5223,11 @@ async def _run_chat(
                     and slot._slack_channel
                     and slot._slack_thread_ts
                     and state.slack_client
+                    # An approval prompt is turn output too, and it asks for a
+                    # decision. Posting one into a thread the user disconnected
+                    # would solicit an answer where they are no longer looking;
+                    # the dashboard carries the same prompt.
+                    and not slack_mirror_is_paused(state, session_key)
                 ):
                     try:
                         _slack_approval_ts = await post_linked_approval(

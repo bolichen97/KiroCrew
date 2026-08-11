@@ -5138,13 +5138,7 @@
       "worktree_disabled_no_project_directory": "« Ajouter à cette session » pré-remplit le champ de saisie — rien n'est envoyé avant que vous appuyiez sur Envoyer. Les worktrees ne sont pas disponibles ici : cette session n'a pas de répertoire de projet (choisissez-en un via la puce Projet du champ de saisie)."
     },
     "inboundLinkChip": {
-      "confirm_release": "Dissocier cette session de {{label}} ?\n\nLes messages envoyés là-bas n'arriveront plus ici et les réponses n'y seront plus transmises. Tu peux la rattacher avec !sessions depuis ce canal.",
-      "driven_from": "Pilotée depuis {{label}}",
-      "release": "Dissocier",
-      "release_aria": "Dissocier cette session de {{label}}",
-      "release_failed": "Impossible de dissocier la session : {{reason}}",
-      "released": "Dissociée de {{label}}",
-      "tooltip": "Cette session est liée à {{label}} dans les deux sens : les réponses y sont transmises et les messages envoyés là-bas arrivent ici."
+      "driven_from": "Pilotée depuis {{label}}"
     },
     "infoTip": {
       "more_information": "Plus d’informations"
@@ -5365,23 +5359,13 @@
       "copy_url_of": "Copier l’URL de {{name}}"
     },
     "linkedSurfacesSection": {
-      "confirm_release": "Dissocier cette session de {{label}} ?\n\nLes messages envoyés là-bas n'arriveront plus ici et les réponses n'y seront plus transmises. Tu peux la rattacher avec !sessions depuis ce canal.",
-      "confirm_stop_mirroring": "Arrêter la mise en miroir de cette session vers {{label}} ?\n\nLes réponses n'y seront plus transmises. Tu pourras la relier plus tard depuis le sélecteur de canaux configurés.",
-      "connected": "Connecté : {{label}}",
-      "link_failed": "Impossible de lier le canal : {{reason}}",
-      "mirror": "Miroir",
-      "mirror_stopped": "Mise en miroir vers {{label}} arrêtée",
-      "offline": "Hors ligne",
-      "origin": "Origine",
-      "post_reminder": "Publier un rappel dans {{label}}",
-      "release": "Dissocier de {{label}}",
-      "released": "Dissociée de {{label}}",
-      "reminder_failed": "Impossible de publier le rappel : {{reason}}",
-      "reminder_sent": "Rappel publié dans {{label}}",
-      "stop_failed": "Impossible d'arrêter la mise en miroir : {{reason}}",
-      "stop_mirroring": "Arrêter la mise en miroir vers {{label}}",
-      "two_way": "Bidirectionnel",
-      "unavailable": "Cette destination est indisponible."
+      "connect_failed": "Impossible de se connecter à {{label}} : {{reason}}",
+      "connect_to": "Se connecter à {{label}}",
+      "disconnect_failed": "Impossible de se déconnecter de {{label}} : {{reason}}",
+      "disconnect_from": "Se déconnecter de {{label}}",
+      "held_elsewhere": "{{label}} est utilisé par une autre session.",
+      "unavailable": "Cette destination est indisponible.",
+      "unknown_error": "erreur inconnue"
     },
     "logEntry": {
       "cancelled": "Annulé",
@@ -6157,11 +6141,6 @@
     "skillPickerMenu": {
       "loading_skills": "Chargement des compétences…",
       "no_matching_skills": "Aucune compétence correspondante"
-    },
-    "slackLinkSection": {
-      "post_reminder_in_slack": "Publier un rappel dans Slack",
-      "send_to_slack": "Envoyer vers Slack",
-      "unlink_from_slack": "Dissocier de Slack"
     },
     "slashCommandMenu": {
       "desc_agent": "Changer ou gérer l’agent actif",
@@ -7955,6 +7934,7 @@
       "collapse_hidden_folders": "Réduire les dossiers masqués",
       "column_filter": "Filtre de colonne",
       "column_name_optional": "Nom de la colonne (optionnel)",
+      "connected_to": "Connecté à {{label}}",
       "create": "Créer…",
       "creating": "Création…",
       "custom": "Personnalisé",
@@ -8019,7 +7999,6 @@
       "match_mode": "Mode de correspondance",
       "merged": "Fusionné",
       "min": "min",
-      "mirroring_to": "Mise en miroir vers {{label}}",
       "model_list": "Liste des modèles",
       "more": "Plus",
       "more_create_options": "Plus d'options de création",
@@ -8086,6 +8065,8 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "Plus récentes",
       "sort_oldest": "Plus anciennes",
+      "started_in_channel": "Cette conversation a commencé dans {{channel}}.",
+      "started_in_direct_message": "Cette conversation a commencé dans un message privé.",
       "streaming": "Diffusion en cours",
       "switch_all_sessions": "Basculer toutes les sessions",
       "switch_all_to_model": "Basculer toutes vers le modèle…",
@@ -8098,8 +8079,6 @@
       "temporary_no_memory_reads_or_writes": "Temporaire — aucune lecture ni écriture en mémoire",
       "thinking": "Réflexion…",
       "today": "Aujourd’hui",
-      "two_way_with_channel": "Cette session est liée à {{channel}} dans les deux sens : les réponses y sont transmises et les messages envoyés là-bas arrivent ici.",
-      "two_way_with_direct_message": "Cette session est liée à un message privé dans les deux sens : les réponses y sont transmises et les messages envoyés là-bas arrivent ici.",
       "unfiled": "Non classés",
       "untagged": "+ sans étiquette",
       "untagged_2": "Non étiquetés",

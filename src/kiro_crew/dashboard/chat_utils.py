@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
@@ -1052,6 +1052,81 @@ async def expire_slack_options(
             session_key,
             tuple(p for p in options_records(state, session_key) if p not in settled),
         )
+
+
+def slack_mirror_is_paused(state: Any, session_key: str) -> bool:
+    """True when a turn must NOT be mirrored to the session's linked thread.
+
+    A pause retains the thread binding, so every inbound resolver still sees the
+    link and a reply still reaches the session that owns the thread. This is the
+    one predicate that tells outbound egress apart from that: consult it before
+    SENDING, never before routing. Gating a routing decision on it would fork a
+    new session out of a reply the user expected to continue this one.
+
+    Scope is deliberately turn mirroring — the user echo, its tool stream, the
+    assistant reply, an auth-required error and the linked approval prompt.
+    Deliveries that merely reuse the thread as an ADDRESS (a cron result, a
+    subagent completion, a requested file, an auto-nudge tick) are NOT gated: an
+    absent link makes those fall back to the owner's DM, and one of them deletes
+    the auto-nudge loop outright, so treating paused as no-link there would
+    reroute messages the user asked for and destroy a live monitor.
+
+    The channel compaction notice is also not gated, and belongs with the
+    address-based deliveries above rather than with turn output: it reports that
+    the session's own history was compacted, which stays true whether or not the
+    conversation is currently connected. (An earlier version of this note claimed
+    it "cannot reach a paused link" because an origin had no disconnect control.
+    Origin rows now DO carry one, so that reasoning is void — the exclusion
+    stands on the delivery's kind, not on the row's affordances.)
+
+    Strict ``is True`` rather than truthiness, and fails OPEN: ``sessions`` is a
+    bare ``MagicMock`` across much of the suite and returns a truthy child for
+    any unstubbed accessor, so truthiness here would silence every linked thread
+    in the test suite. Failing open leaves a muted thread noisy at worst; failing
+    closed would make a live thread silently dead.
+    """
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return False
+    try:
+        return sessions.is_slack_paused(session_key) is True
+    except Exception:
+        logger.debug("slack pause lookup failed for %s", session_key, exc_info=True)
+        return False
+
+
+def mirror_is_paused(state: Any, session_key: str, *, origin: bool = False) -> bool:
+    """True when a turn must NOT be mirrored to one of the session's non-Slack deliveries.
+
+    The channel-neutral twin of :func:`slack_mirror_is_paused`, and what a
+    dashboard disconnect suppresses for a non-Slack channel.
+
+    ``origin`` names WHICH delivery is being asked about, because a session can
+    hold two at once — the conversation it was born in and an explicit mirror —
+    and they mute independently. Callers that resolve a single outbound target
+    pass the flag matching the row the user acted on; see
+    :meth:`SessionMap.set_mirror_paused`.
+
+    The scope is narrower than Slack's because the hazard Slack has does not
+    exist here: no cron result, subagent completion, requested file or auto-nudge
+    tick reads a mirror binding at all — those address a channel explicitly — so
+    gating this cannot reroute a delivery to the owner's DM or destroy a monitor
+    loop. It covers the two sites that carry turn output: the user echo and the
+    assistant reply.
+
+    Same ``is True`` / fail-open contract as the Slack gate, for the same
+    MagicMock reason. A muted binding must stay visible to
+    ``find_mirror_sessions``, to the resume-conflict check and to both clear
+    paths, or in-channel ``!unlink`` and conflict detection break.
+    """
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return False
+    try:
+        return sessions.is_mirror_paused(session_key, origin=origin) is True
+    except Exception:
+        logger.debug("mirror pause lookup failed for %s", session_key, exc_info=True)
+        return False
 
 
 _INCOGNITO_PREFIX = (

@@ -5059,13 +5059,7 @@
       "worktree_disabled_no_project_directory": "„Zu dieser Sitzung hinzufügen“ füllt das Eingabefeld vor — es wird nichts gesendet, bis Sie auf Senden drücken. Worktrees sind hier nicht verfügbar: Diese Sitzung hat kein Projektverzeichnis (wählen Sie eines über den Projekt-Chip des Eingabefelds)."
     },
     "inboundLinkChip": {
-      "confirm_release": "Diese Sitzung von {{label}} lösen?\n\nDort gesendete Nachrichten kommen nicht mehr hier an, und Antworten werden nicht mehr dorthin geliefert. Du kannst sie mit !sessions aus diesem Kanal erneut verbinden.",
-      "driven_from": "Gesteuert von {{label}}",
-      "release": "Lösen",
-      "release_aria": "Diese Sitzung von {{label}} lösen",
-      "release_failed": "Sitzung konnte nicht gelöst werden: {{reason}}",
-      "released": "Von {{label}} gelöst",
-      "tooltip": "Diese Sitzung ist bidirektional mit {{label}} verbunden: Antworten werden dorthin geliefert, und dort gesendete Nachrichten kommen hier an."
+      "driven_from": "Gesteuert von {{label}}"
     },
     "infoTip": {
       "more_information": "Weitere Informationen"
@@ -5284,23 +5278,13 @@
       "copy_url_of": "URL von {{name}} kopieren"
     },
     "linkedSurfacesSection": {
-      "confirm_release": "Diese Sitzung von {{label}} lösen?\n\nDort gesendete Nachrichten kommen nicht mehr hier an, und Antworten werden nicht mehr dorthin geliefert. Du kannst sie mit !sessions aus diesem Kanal erneut verbinden.",
-      "confirm_stop_mirroring": "Spiegelung dieser Sitzung nach {{label}} beenden?\n\nAntworten werden dort nicht mehr geliefert. Du kannst die Sitzung später über die Auswahl konfigurierter Kanäle erneut verbinden.",
-      "connected": "Verbunden: {{label}}",
-      "link_failed": "Kanal konnte nicht verknüpft werden: {{reason}}",
-      "mirror": "Spiegeln",
-      "mirror_stopped": "Spiegelung nach {{label}} beendet",
-      "offline": "Offline",
-      "origin": "Ursprung",
-      "post_reminder": "Erinnerung in {{label}} posten",
-      "release": "{{label}} lösen",
-      "released": "Von {{label}} gelöst",
-      "reminder_failed": "Erinnerung konnte nicht gepostet werden: {{reason}}",
-      "reminder_sent": "Erinnerung in {{label}} gepostet",
-      "stop_failed": "Spiegelung konnte nicht beendet werden: {{reason}}",
-      "stop_mirroring": "Spiegelung nach {{label}} beenden",
-      "two_way": "Bidirektional",
-      "unavailable": "Dieses Ziel ist nicht verfügbar."
+      "connect_failed": "Verbindung mit {{label}} konnte nicht hergestellt werden: {{reason}}",
+      "connect_to": "Mit {{label}} verbinden",
+      "disconnect_failed": "Verbindung mit {{label}} konnte nicht getrennt werden: {{reason}}",
+      "disconnect_from": "Verbindung mit {{label}} trennen",
+      "held_elsewhere": "{{label}} wird von einer anderen Sitzung verwendet.",
+      "unavailable": "Dieses Ziel ist nicht verfügbar.",
+      "unknown_error": "unbekannter Fehler"
     },
     "logEntry": {
       "cancelled": "Abgebrochen",
@@ -6070,11 +6054,6 @@
     "skillPickerMenu": {
       "loading_skills": "Skills werden geladen…",
       "no_matching_skills": "Keine passenden Skills"
-    },
-    "slackLinkSection": {
-      "post_reminder_in_slack": "Erinnerung in Slack posten",
-      "send_to_slack": "An Slack senden",
-      "unlink_from_slack": "Verknüpfung mit Slack aufheben"
     },
     "slashCommandMenu": {
       "desc_agent": "Aktiven Agenten wechseln oder verwalten",
@@ -7853,6 +7832,7 @@
       "collapse_hidden_folders": "Ausgeblendete Ordner einklappen",
       "column_filter": "Spaltenfilter",
       "column_name_optional": "Spaltenname (optional)",
+      "connected_to": "Verbunden mit {{label}}",
       "create": "Erstellen…",
       "creating": "Wird erstellt…",
       "custom": "Benutzerdefiniert",
@@ -7916,7 +7896,6 @@
       "match_mode": "Abgleichmodus",
       "merged": "Zusammengeführt",
       "min": "Min.",
-      "mirroring_to": "Spiegelung nach {{label}}",
       "model_list": "Modellliste",
       "more": "Mehr",
       "more_create_options": "Weitere Erstellungsoptionen",
@@ -7979,6 +7958,8 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "Neueste",
       "sort_oldest": "Älteste",
+      "started_in_channel": "Diese Unterhaltung begann in {{channel}}.",
+      "started_in_direct_message": "Diese Unterhaltung begann in einer Direktnachricht.",
       "streaming": "Streaming",
       "switch_all_sessions": "Alle Sitzungen wechseln",
       "switch_all_to_model": "Alle auf Modell umstellen…",
@@ -7991,8 +7972,6 @@
       "temporary_no_memory_reads_or_writes": "Temporär — kein Lesen oder Schreiben in die Erinnerung",
       "thinking": "Denkt nach…",
       "today": "Heute",
-      "two_way_with_channel": "Diese Sitzung ist bidirektional mit {{channel}} verbunden: Antworten werden dorthin geliefert, und dort gesendete Nachrichten kommen hier an.",
-      "two_way_with_direct_message": "Diese Sitzung ist bidirektional mit einer Direktnachricht verbunden: Antworten werden dorthin geliefert, und dort gesendete Nachrichten kommen hier an.",
       "unfiled": "Nicht zugeordnet",
       "untagged": "+ ohne Tag",
       "untagged_2": "Ohne Tag",

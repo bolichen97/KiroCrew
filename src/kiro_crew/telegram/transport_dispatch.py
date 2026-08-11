@@ -35,6 +35,7 @@ from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.attachments import IngestLimits, append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
+from kiro_crew.messaging.dispatch import delivery_is_muted
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -47,6 +48,7 @@ from kiro_crew.messaging.link import (
     release_conversation_location,
     seed_generation,
 )
+from kiro_crew.messaging.renderer import SilentRenderer
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact, redact_local_paths
@@ -353,10 +355,29 @@ class TelegramDispatcher:
             session_key=session_key,
             message_thread_id=int(thread) if thread else None,
         )
+        # Same gate as Discord, for the same reason: Telegram also runs its own
+        # copy of the turn loop rather than going through ``drive_turn``, so a
+        # disconnected conversation would otherwise keep answering.
+        muted = delivery_is_muted(self.sessions, session_key, TelegramRenderer.channel_type)
+        # Handed to the driver AND closed in the finally. Not a reassignment of
+        # ``renderer`` because the concrete ``close`` is not inert (it finalizes the
+        # "🤔" placeholder and can surface an error), and a muted turn must leave
+        # nothing behind in the conversation. Typed as a union rather than the base
+        # ``Renderer`` because this channel WIDENS close to take ``failure_reason``.
+        out_renderer: TelegramRenderer | SilentRenderer = (
+            SilentRenderer(TELEGRAM_CAPABILITIES, TelegramRenderer.channel_type)
+            if muted
+            else renderer
+        )
         # Expose this turn's renderer so a concurrent mid-turn steer (a separate
         # _handle_busy task) can hand it the user's typed steer text for the
         # inline "↪️ steered: …" chip. Popped in finally.
-        self._active_renderers[session_key] = renderer
+        # Not published when muted: the steer path calls the channel-specific
+        # ``note_steer`` and already skips cleanly on absence, so this both
+        # silences the chip in a disconnected conversation and keeps that
+        # channel-local API off the shared substitute.
+        if not muted:
+            self._active_renderers[session_key] = renderer
 
         # Everything acquire-dependent runs INSIDE the try so the finally always
         # finalizes the placeholder (renderer.close -> no perma-"🤔 …"), even if
@@ -369,7 +390,9 @@ class TelegramDispatcher:
         try:
             # Ack placeholder first (before the potentially slow cold-start);
             # on_turn_start is idempotent so the driver's later call no-ops.
-            await renderer.on_turn_start()
+            # Skipped when muted, as in the Discord twin.
+            if not muted:
+                await renderer.on_turn_start()
             provider, is_new, resumed = await self.sessions.get_or_create(
                 session_key,
                 agent=agent,
@@ -436,7 +459,7 @@ class TelegramDispatcher:
 
             driver = TurnDriver(
                 provider,
-                renderer,
+                out_renderer,
                 approval_mode=self.approval_mode,
                 decider=decider,
                 # Preserve the auto_approve_subagent_spawn hook for spawn_run
@@ -518,7 +541,7 @@ class TelegramDispatcher:
             # stay on disk. Discord and the shared pipeline both already guard
             # this; Telegram was the remaining copy that did not.
             try:
-                await renderer.close(failure_reason=failure_reason)
+                await out_renderer.close(failure_reason=failure_reason)
             except Exception:
                 logger.warning(
                     "Telegram: renderer.close failed session=%s",

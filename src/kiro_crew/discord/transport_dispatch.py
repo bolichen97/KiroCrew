@@ -44,6 +44,7 @@ from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
+from kiro_crew.messaging.dispatch import delivery_is_muted
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -54,6 +55,7 @@ from kiro_crew.messaging.link import (
     release_conversation_location,
     seed_generation,
 )
+from kiro_crew.messaging.renderer import Renderer, SilentRenderer
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -299,7 +301,30 @@ class DiscordDispatcher:
         renderer = DiscordRenderer(
             self.client, channel_id, DISCORD_CAPABILITIES, session_key=session_key
         )
-        self._active_renderers[session_key] = renderer
+        # Discord runs its OWN copy of the turn loop instead of going through
+        # ``messaging.dispatch.drive_turn``, so the disconnect gate there does not
+        # reach it — without this the dashboard control changed nothing here but
+        # its own label. The turn still runs and the inbound message still lands in
+        # the session: the binding is retained by design, and the dashboard is
+        # where that user is now working. Only the writes back are dropped.
+        muted = delivery_is_muted(self.sessions, session_key, DiscordRenderer.channel_type)
+        # Handed to the driver AND closed in the finally, rather than reassigning
+        # ``renderer``: the concrete renderer's ``close`` is not inert — it posts an
+        # error placeholder when the turn produced no output, which a muted turn by
+        # definition did, so closing the real one leaked "⚠️ Error" into the
+        # conversation the user had just disconnected.
+        out_renderer: Renderer = (
+            SilentRenderer(DISCORD_CAPABILITIES, DiscordRenderer.channel_type)
+            if muted
+            else renderer
+        )
+        if not muted:
+            # Published for mid-turn steer chips. Deliberately NOT published when
+            # muted: the steer path calls the channel-specific ``note_steer`` and
+            # already skips cleanly when there is no entry, so leaving it out both
+            # silences the chip in a disconnected conversation and keeps that
+            # channel-local API off the shared substitute.
+            self._active_renderers[session_key] = renderer
         attachment_temp_paths: list[str] = []
 
         # Everything acquire-dependent runs INSIDE the try so the finally
@@ -317,7 +342,10 @@ class DiscordDispatcher:
             # refresh task, is idempotent (the driver calls it again later), and
             # the enclosing finally always finalizes the renderer, so an early
             # return below cannot leak a typing loop.
-            await renderer.on_turn_start()
+            # Skipped when muted: a disconnected conversation must not
+            # even show a typing indicator.
+            if not muted:
+                await renderer.on_turn_start()
             # Acquire before attachment I/O. A large download yields repeatedly;
             # leaving the session idle in that window lets a later message run
             # first and persist the conversation in reverse order.
@@ -411,7 +439,7 @@ class DiscordDispatcher:
 
             driver = TurnDriver(
                 provider,
-                renderer,
+                out_renderer,
                 approval_mode=self.approval_mode,
                 decider=decider,
                 auto_approve_tool=lambda title: bool(
@@ -483,7 +511,7 @@ class DiscordDispatcher:
             # otherwise leave the session permanently busy, blocking every
             # subsequent Discord message and the queue drain.
             try:
-                await renderer.close()
+                await out_renderer.close()
             except Exception:
                 logger.warning(
                     "Discord: renderer.close failed session=%s",

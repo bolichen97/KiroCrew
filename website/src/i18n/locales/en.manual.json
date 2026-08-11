@@ -1378,13 +1378,7 @@
       "worktree_disabled_no_project_directory": "\"Add to this session\" pre-fills the composer — nothing is sent until you press send. Worktrees are unavailable here: this session has no project directory (pick one with the composer's Project chip)."
     },
     "inboundLinkChip": {
-      "confirm_release": "Release this session from {{label}}?\n\nMessages sent there will stop arriving here, and replies will stop being delivered there. You can re-attach with !sessions from that channel.",
-      "driven_from": "Driven from {{label}}",
-      "release": "Release",
-      "release_aria": "Release this session from {{label}}",
-      "release_failed": "Could not release the session: {{reason}}",
-      "released": "Released from {{label}}",
-      "tooltip": "This session is two-way with {{label}}: replies are delivered there, and messages sent there arrive here."
+      "driven_from": "Driven from {{label}}"
     },
     "instancesViewport": {
       "connecting": "Connecting…",
@@ -1509,23 +1503,13 @@
       "waiting": "Waiting"
     },
     "linkedSurfacesSection": {
-      "confirm_release": "Release this session from {{label}}?\n\nMessages sent there will stop arriving here, and replies will stop being delivered there. You can re-attach with !sessions from that channel.",
-      "confirm_stop_mirroring": "Stop mirroring this session to {{label}}?\n\nReplies will no longer be delivered there. You can re-link it later from the configured-channel picker.",
-      "connected": "Connected: {{label}}",
-      "mirror": "Mirror",
-      "mirror_stopped": "Stopped mirroring to {{label}}",
-      "offline": "Offline",
-      "origin": "Origin",
-      "post_reminder": "Post reminder in {{label}}",
-      "release": "Release {{label}}",
-      "released": "Released from {{label}}",
-      "link_failed": "Could not link channel: {{reason}}",
-      "reminder_failed": "Could not post reminder: {{reason}}",
-      "reminder_sent": "Reminder posted in {{label}}",
-      "stop_failed": "Could not stop mirroring: {{reason}}",
-      "stop_mirroring": "Stop mirroring to {{label}}",
-      "two_way": "Two-way",
-      "unavailable": "This destination is unavailable."
+      "connect_failed": "Could not connect to {{label}}: {{reason}}",
+      "connect_to": "Connect to {{label}}",
+      "disconnect_failed": "Could not disconnect from {{label}}: {{reason}}",
+      "disconnect_from": "Disconnect from {{label}}",
+      "held_elsewhere": "{{label}} is in use by another session.",
+      "unavailable": "This destination is unavailable.",
+      "unknown_error": "unknown error"
     },
     "linkPreview": {
       "copied": "Copied",
@@ -2669,9 +2653,9 @@
       "last_30_days": "Last 30 Days",
       "last_7_days": "Last 7 Days",
       "dashboard_source": "Dashboard",
-      "mirroring_to": "Mirroring to {{label}}",
-      "two_way_with_channel": "This session is two-way with {{channel}}: replies are delivered there, and messages sent there arrive here.",
-      "two_way_with_direct_message": "This session is two-way with a direct message: replies are delivered there, and messages sent there arrive here.",
+      "connected_to": "Connected to {{label}}",
+      "started_in_channel": "This conversation started in {{channel}}.",
+      "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
       "new": "New",
       "new_chat": "New chat",

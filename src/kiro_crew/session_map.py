@@ -878,6 +878,19 @@ class SessionMap:
         never evicts — the load-time tie-break resolves that contest instead.
         An empty *thread_ts* is the clear sentinel and neither evicts anyone
         nor enters the reverse index.
+
+        Establishing a link also drops any ``slack_paused`` marker, so a mute
+        never outlives the binding it was set on — otherwise it would re-mute
+        the next link, which the user never paused. That drop is scoped to a
+        REBIND (different ts or channel). Identical coordinates are the SAME
+        binding and keep the mute, because this method is not only called by an
+        explicit connect: the Slack inbound path re-writes the same ts/channel on
+        every turn as its thread registry (``slack/handler.py``,
+        ``slack/transport_dispatch.py``), so clearing here unconditionally let a
+        single inbound message — or a cold start's ``set_channel`` — silently
+        un-disconnect a thread the user had muted, and later dashboard turns
+        resumed delivering to it. Connecting does not rely on this: the dashboard
+        row lifts a mute through :meth:`set_slack_paused`, not by re-linking.
         """
         key = canonical_key(key)
         entry = self._data.get(key)
@@ -892,9 +905,14 @@ class SessionMap:
                         self._thread_to_session[thread_ts] = key
                     else:
                         self._thread_to_session.setdefault(thread_ts, key)
+                # Only the eviction is a mutation on this branch now. The pause
+                # is deliberately NOT touched here — see the docstring.
                 if evicted:
                     self._save()
                 return
+            # REBIND: the mute belonged to the binding being replaced, so it goes
+            # with it rather than carrying onto a thread the user never muted.
+            entry.pop("slack_paused", None)
             old_ts = entry.get("slack_thread_ts")
             if old_ts and old_ts != thread_ts:
                 self._thread_to_session.pop(old_ts, None)
@@ -944,9 +962,54 @@ class SessionMap:
             del self._thread_to_session[old_ts]
         entry.pop("slack_thread_ts", None)
         entry.pop("slack_channel_id", None)
-        if had_link:
+        # The mute dies with the binding it muted. A marker left behind would
+        # silently re-mute whatever link the user establishes next.
+        was_paused = entry.pop("slack_paused", None) is not None
+        if had_link or was_paused:
             self._save()
         return had_link
+
+    @_guarded
+    def set_slack_paused(self, key: str, paused: bool) -> bool:
+        """Mute (or unmute) a linked Slack thread; return the PREVIOUS state.
+
+        A mute is not an unlink. The thread binding, both coordinate fields and
+        the ``_thread_to_session`` reverse index all survive, so a reply in the
+        muted thread still resolves to THIS session rather than forking a new
+        one; only outbound turn mirroring stops.
+
+        Stored as a presence flag (``True`` or absent, never ``False``) on the
+        same entry and under the same key resolution the link accessors use, so
+        the flag cannot land on a spelling they do not read. That is what makes
+        "a pause never outlives its binding" hold by construction instead of by
+        bookkeeping in every caller.
+        """
+        entry = self._data.get(canonical_key(key))
+        if not entry:
+            return False
+        was_paused = entry.get("slack_paused") is True
+        if paused and not was_paused:
+            entry["slack_paused"] = True
+            self._save()
+        elif not paused and was_paused:
+            del entry["slack_paused"]
+            self._save()
+        return was_paused
+
+    @_guarded
+    def is_slack_paused(self, key: str) -> bool:
+        """True iff this session's Slack link is muted AND still linked.
+
+        The flag is only meaningful next to a live binding: a marker with no
+        link is stale by definition, and reporting it would make an unlinked
+        session render as a muted one.
+        """
+        entry = self._data.get(canonical_key(key))
+        if not entry:
+            return False
+        if not (entry.get("slack_thread_ts") or entry.get("slack_channel_id")):
+            return False
+        return entry.get("slack_paused") is True
 
     def get_session_for_thread(self, thread_ts: str) -> str | None:
         """Return the session key linked to a Slack thread_ts, or None."""
@@ -1003,6 +1066,9 @@ class SessionMap:
             entry["mirror_accepts_inbound"] = True
         else:
             entry.pop("mirror_accepts_inbound", None)
+        # Binding is how the user reconnects, so it lifts any mute. Same reason
+        # as the Slack path: a marker outliving its binding re-mutes the next one.
+        entry.pop("mirror_paused", None)
         self._save()
 
     @_guarded
@@ -1183,6 +1249,7 @@ class SessionMap:
                 continue
             entry.pop("mirror", None)
             entry.pop("mirror_accepts_inbound", None)
+            entry.pop("mirror_paused", None)
             cleared.append(key)
         if cleared:
             self._save()
@@ -1205,11 +1272,80 @@ class SessionMap:
         if entry.get("mirror") is not None:
             entry.pop("mirror", None)
             entry.pop("mirror_accepts_inbound", None)
+            entry.pop("mirror_paused", None)
             self._save()
             return True
         if entry.get("slack_thread_ts") or entry.get("slack_channel_id"):
             return self.clear_slack_link(mkey)
         return False
+
+    @_guarded
+    def set_mirror_paused(self, key: str, paused: bool, *, origin: bool = False) -> bool:
+        """Mute (or unmute) a non-Slack delivery for *key*; return the PREVIOUS state.
+
+        Two DISTINCT non-Slack deliveries can exist on one session, so they get
+        two distinct flags rather than sharing one:
+
+        * ``mirror_paused`` — the explicit ``mirror`` binding (``origin=False``).
+        * ``origin_paused`` — the conversation the session was BORN in
+          (``origin=True``), which reaches the dashboard as a separate row
+          derived from the legacy namespaced ``slack_channel_id``.
+
+        A session born in Discord that also mirrors to Telegram renders both
+        rows, and a single scalar made disconnecting one silently disconnect the
+        other. Keying the flag to the row's source is what makes the two
+        independent; the caller says which row it is acting on, because only the
+        caller knows.
+        """
+        field = "origin_paused" if origin else "mirror_paused"
+        # The ORIGIN flag belongs to the SESSION and is keyed canonically;
+        # ``_mirror_key`` is reserved for the MIRROR flag, which belongs to the
+        # binding. That distinction is load-bearing, not stylistic: _mirror_key
+        # migrates between the canonical row and the legacy ``dashboard:``
+        # spelling depending on where a mirror binding currently lives, so writing
+        # the origin flag through it strands the pause the moment a canonical
+        # mirror is added -- the lookup moves rows, the flag does not, and the
+        # conversation the user muted silently resumes delivering.
+        entry = self._data.get(canonical_key(key) if origin else self._mirror_key(key))
+        if not entry:
+            return False
+        was_paused = entry.get(field) is True
+        if paused and not was_paused:
+            entry[field] = True
+            self._save()
+        elif not paused and was_paused:
+            del entry[field]
+            self._save()
+        return was_paused
+
+    @_guarded
+    def is_mirror_paused(self, key: str, *, origin: bool = False) -> bool:
+        """True iff the named non-Slack delivery for *key* is muted.
+
+        A mute is only meaningful next to something that can actually deliver, so
+        a flag with nothing behind it reads as not-paused rather than reporting a
+        session that mirrors nowhere as merely quiet. What counts as "something"
+        differs per flag, which is why the existence check is not shared:
+
+        * ``origin=True`` requires the session to be channel-BORN, and is read
+          from the CANONICAL row -- the session's own -- never through
+          ``_mirror_key``. That conversation is permanent, so the flag cannot be
+          orphaned by its target disappearing; it CAN be orphaned by the lookup
+          moving, which is what keying it to the mirror binding used to do.
+        * ``origin=False`` requires an explicit ``mirror`` dict, and follows the
+          binding through ``_mirror_key``.
+        """
+        canon = canonical_key(key)
+        entry = self._data.get(canon if origin else self._mirror_key(key))
+        if not entry:
+            return False
+        if origin:
+            if not is_channel_session_key(canon):
+                return False
+            return entry.get("origin_paused") is True
+        if not isinstance(entry.get("mirror"), dict):
+            return False
+        return entry.get("mirror_paused") is True
 
     @_guarded
     def max_generation(self, bucket: str) -> int:
