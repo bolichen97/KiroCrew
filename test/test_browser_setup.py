@@ -1140,6 +1140,162 @@ class TestCheckPlaywrightLaunchable:
         assert Path(detail).parent == node_dir
 
 
+class TestOperatorEnvSurvivesReregistration:
+    """A re-registration must not silently drop operator-supplied ``env``.
+
+    ``KIROCREW_PLAYWRIGHT_CMD`` is the documented escape hatch for a host whose
+    launcher is not otherwise discoverable, so an install can depend on it
+    entirely. A mode switch owns command/args/token and must leave it alone.
+    """
+
+    def _entry_with_env(self, tmp_path: Path, env: dict) -> Path:
+        return _write_mcp_json(
+            tmp_path,
+            {
+                _CANONICAL: {
+                    "command": "kirocrew",
+                    "args": ["mcp-playwright-proxy", "--extension"],
+                    "env": env,
+                }
+            },
+        )
+
+    def test_headless_keeps_launcher_override_and_drops_stale_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        mcp_json = self._entry_with_env(
+            tmp_path,
+            {"KIROCREW_PLAYWRIGHT_CMD": "/opt/pw/cli.js", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "old"},
+        )
+
+        register_playwright_proxy()
+
+        env = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"][_CANONICAL]["env"]
+        assert env["KIROCREW_PLAYWRIGHT_CMD"] == "/opt/pw/cli.js"
+        # The token describes extension mode, so headless must not carry it over.
+        assert "PLAYWRIGHT_MCP_EXTENSION_TOKEN" not in env
+
+    def test_extension_keeps_launcher_override_and_refreshes_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: True)
+        monkeypatch.setattr(setup_mod, "get_extension_token", lambda: "fresh")
+        mcp_json = self._entry_with_env(
+            tmp_path,
+            {"KIROCREW_PLAYWRIGHT_CMD": "/opt/pw/cli.js", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "old"},
+        )
+
+        register_playwright_proxy()
+
+        env = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"][_CANONICAL]["env"]
+        assert env["KIROCREW_PLAYWRIGHT_CMD"] == "/opt/pw/cli.js"
+        assert env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] == "fresh"
+
+    def test_unrelated_operator_fields_survive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A mode switch owns command/args/token and nothing else. Rebuilding the
+        # entry would drop every other key the operator added.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        mcp_json = _write_mcp_json(
+            tmp_path,
+            {
+                _CANONICAL: {
+                    "command": "kirocrew",
+                    "args": ["mcp-playwright-proxy", "--extension"],
+                    "env": {"KIROCREW_PLAYWRIGHT_CMD": "/opt/pw/cli.js"},
+                    "timeout": 60,
+                    "disabled": False,
+                }
+            },
+        )
+
+        register_playwright_proxy()
+
+        entry = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"][_CANONICAL]
+        assert entry["timeout"] == 60
+        assert entry["disabled"] is False
+        assert entry["env"]["KIROCREW_PLAYWRIGHT_CMD"] == "/opt/pw/cli.js"
+        # ...while the mode-owned fields DID change to headless.
+        assert entry["args"][:2] == ["mcp-playwright-proxy", "--config"]
+
+    def test_no_env_key_written_when_nothing_to_carry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        _write_mcp_json(tmp_path, {})
+
+        register_playwright_proxy()
+
+        mcp_json = tmp_path / ".kiro" / "settings" / "mcp.json"
+        entry = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"][_CANONICAL]
+        assert "env" not in entry
+
+
+class TestAgentShadowDetection:
+    """An agent-level server of the same name WINS, so registration must say so."""
+
+    def _agent_spec(self, tmp_path: Path, servers: dict) -> Path:
+        agents = tmp_path / ".kiro" / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        spec = agents / "kirocrew.json"
+        spec.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+        return spec
+
+    def test_reports_shadowed_when_agent_declares_same_server(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        _write_mcp_json(tmp_path, {})
+        spec = self._agent_spec(tmp_path, {_CANONICAL: {"command": "somewhere-else"}})
+
+        mcp_json, status = register_playwright_proxy()
+
+        assert status == "shadowed-by-agent"
+        # The write still happened; only the report changes.
+        servers = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"]
+        assert "mcp-playwright-proxy" in servers[_CANONICAL]["args"]
+        assert setup_mod.agent_specs_shadowing() == [spec]
+
+    def test_registered_when_agent_declares_unrelated_server(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        _write_mcp_json(tmp_path, {})
+        self._agent_spec(tmp_path, {"other-mcp": {"command": "foo"}})
+
+        _, status = register_playwright_proxy()
+        assert status == "registered"
+
+    def test_malformed_agent_spec_is_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        agents = tmp_path / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "broken.json").write_text("{not json", encoding="utf-8")
+        assert setup_mod.agent_specs_shadowing() == []
+
+
 class TestRegisterPlaywrightProxy:
     def test_creates_mcp_json_and_registers_canonical(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -1669,6 +1669,112 @@ def _kiro_mcp_locked() -> Iterator[None]:
             yield
 
 
+#: The token describes extension mode itself, so a mode switch owns it: headless
+#: must clear it rather than keep a stale one.
+_MODE_OWNED_ENV_KEY = "PLAYWRIGHT_MCP_EXTENSION_TOKEN"
+
+#: Fields a browse mode decides. Everything else on the entry belongs to the
+#: operator and is carried across a Browser-Mode round trip via the sidecar.
+_MODE_OWNED_FIELDS = frozenset({"command", "args"})
+
+
+def _carryover_path() -> Path:
+    """Where operator-owned entry fields wait out a Browser-Mode OFF period.
+
+    Turning Browser Mode off DELETES the mcp.json entry on purpose: tool
+    availability is the consent gate, so the ``browser_*`` tools must actually
+    disappear. That deletion would also take the operator's own fields with it,
+    so they are stashed here and restored by the next registration.
+    """
+    return config_dir() / "playwright-entry-carryover.json"
+
+
+def capture_entry_carryover(entry: object) -> None:
+    """Stash the operator-owned fields of a proxy entry before it is deleted.
+
+    Ignores anything that is not a Kiro Crew proxy entry, so a user's own server
+    is never copied out of their config. The guard lives here rather than at the
+    call site because callers include the stale-MCP purge, which deletes by
+    command basename and can match a server Kiro Crew does not own. The
+    mode-owned extension token is dropped rather than stashed: it is re-minted
+    per mode, and copying it would spread a credential to a second file for no
+    benefit.
+    """
+    if not isinstance(entry, dict) or not _spec_is_proxy(entry):
+        return
+    keep = {k: v for k, v in entry.items() if k not in _MODE_OWNED_FIELDS}
+    env = keep.get("env")
+    if isinstance(env, dict):
+        env = {k: v for k, v in env.items() if k != _MODE_OWNED_ENV_KEY}
+        if env:
+            keep["env"] = env
+        else:
+            keep.pop("env", None)
+    else:
+        keep.pop("env", None)
+    path = _carryover_path()
+    try:
+        if not keep:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(keep, indent=2), mode=0o600)
+    except OSError:
+        pass
+
+
+def _consume_entry_carryover() -> dict:
+    """Return the stashed operator fields and drop the stash.
+
+    One-shot on purpose: a stash that outlived its round trip would resurrect
+    configuration the operator may have deliberately abandoned.
+    """
+    path = _carryover_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        data = None
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_mode_to_entry(
+    servers: dict, canonical: str, args: list[str], token: str | None
+) -> None:
+    """Set ONLY the fields a browse mode owns on the canonical entry, in place.
+
+    ``command``, ``args`` and the extension token are what a mode switch decides;
+    every other key the operator put on this entry (a launcher pin in ``env``, a
+    ``timeout``, anything a future schema adds) is none of this function's
+    business and is left exactly as found. Rebuilding the entry from scratch
+    would discard all of it, including the ``KIROCREW_PLAYWRIGHT_CMD`` launcher
+    pin that is the only reason some hosts resolve a launcher at all.
+
+    ``token=None`` means headless: the key is removed, not carried over.
+    """
+    entry = servers.get(canonical)
+    if not isinstance(entry, dict):
+        # A fresh slot: restore whatever a previous Browser-Mode OFF stashed, so a
+        # Settings round trip does not cost the operator their own fields.
+        entry = _consume_entry_carryover()
+    entry["command"] = _kirocrew_bin()
+    entry["args"] = args
+    env = entry.get("env")
+    env = dict(env) if isinstance(env, dict) else {}
+    if token is None:
+        env.pop(_MODE_OWNED_ENV_KEY, None)
+    else:
+        env[_MODE_OWNED_ENV_KEY] = token
+    if env:
+        entry["env"] = env
+    else:
+        entry.pop("env", None)
+    servers[canonical] = entry
+
+
 def _patch_mcp_extension_unlocked(token: str) -> None:
     """Write the ``--extension`` proxy entry. Caller MUST hold ``_kiro_mcp_locked``."""
     mcp_json = _kiro_mcp_json_path()
@@ -1686,14 +1792,9 @@ def _patch_mcp_extension_unlocked(token: str) -> None:
         servers = data.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
             servers = data["mcpServers"] = {}
-        entry = {
-            "command": _kirocrew_bin(),
-            "args": ["mcp-playwright-proxy", "--extension"],
-            "env": {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": token},
-        }
         canonical = mcp_server_alias(_PLAYWRIGHT_MCP_PACKAGE)
         _drop_superseded_playwright(servers, canonical)
-        servers[canonical] = entry
+        _apply_mode_to_entry(servers, canonical, ["mcp-playwright-proxy", "--extension"], token)
         mcp_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
         platform_compat.chmod_safe(str(mcp_json), 0o600)
         _record_owned_mcp_key(canonical)
@@ -1717,13 +1818,11 @@ def _patch_mcp_headless_unlocked() -> None:
         if not isinstance(servers, dict):
             servers = data["mcpServers"] = {}
         config_path = str(config_dir() / "playwright-config.json")
-        entry = {
-            "command": _kirocrew_bin(),
-            "args": ["mcp-playwright-proxy", "--config", config_path],
-        }
         canonical = mcp_server_alias(_PLAYWRIGHT_MCP_PACKAGE)
         _drop_superseded_playwright(servers, canonical)
-        servers[canonical] = entry
+        _apply_mode_to_entry(
+            servers, canonical, ["mcp-playwright-proxy", "--config", config_path], None
+        )
         mcp_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
         _record_owned_mcp_key(canonical)
     except (json.JSONDecodeError, OSError):
@@ -1794,6 +1893,52 @@ def check_playwright_launchable() -> tuple[bool, str]:
     return True, cmd
 
 
+def agent_specs_shadowing(canonical: str | None = None) -> list[Path]:
+    """Agent spec files that declare ``canonical`` and therefore SHADOW mcp.json.
+
+    Defaults to the canonical Playwright server key.
+
+    An agent's own ``mcpServers`` declaration always wins over a settings-level
+    server of the same name, so an agent-level ``playwright-mcp`` silently
+    overrides the proxy this module just registered. Registration reads only
+    ``mcp.json``, so without this probe it reports success while the entry that
+    actually launches is somebody else's.
+
+    Best-effort: an unreadable or malformed spec is skipped rather than raising,
+    since this only decorates a status message.
+    """
+    if canonical is None:
+        canonical = mcp_server_alias(_PLAYWRIGHT_MCP_PACKAGE)
+    shadowing: list[Path] = []
+    try:
+        specs = sorted(kiro_agents_dir().glob("*.json"))
+    except OSError:
+        return shadowing
+    for spec in specs:
+        try:
+            data = json.loads(spec.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and canonical in servers:
+            shadowing.append(spec)
+    return shadowing
+
+
+def print_shadow_warning(indent: str = "    ") -> None:
+    """Name the agent specs that shadow the canonical proxy entry.
+
+    A shadowed registration wrote a correct entry that nothing will launch, so
+    every path that reports the outcome of a registration must say this rather
+    than print success.
+    """
+    for spec in agent_specs_shadowing():
+        print(f"{indent}an agent spec declares 'playwright-mcp' and wins: {spec}")
+    print(f"{indent}remove that entry, or browsing will keep using it instead")
+
+
 def register_playwright_proxy() -> tuple[Path, str]:
     """Register KiroCrew's Playwright proxy in kiro's ``mcp.json``.
 
@@ -1803,10 +1948,13 @@ def register_playwright_proxy() -> tuple[Path, str]:
     proxy entry via the mode-appropriate patch (extension vs headless config).
 
     Returns ``(mcp_json_path, status)`` where ``status`` is ``"registered"``
-    (KiroCrew's proxy was written/refreshed) or ``"kept-user-entry"`` (a
+    (KiroCrew's proxy was written/refreshed), ``"kept-user-entry"`` (a
     user-authored NON-proxy server already holds the canonical ``playwright-mcp``
     key, so we left it untouched rather than clobber their config — authorship is
-    by launch target, not key name, mirroring the boot-time migration guard).
+    by launch target, not key name, mirroring the boot-time migration guard), or
+    ``"shadowed-by-agent"`` (the entry was written, but an agent spec declares the
+    same server name and an agent's own declaration wins, so the write has no
+    effect until that spec is removed).
     """
     mcp_json = _kiro_mcp_json_path()
     # Registration is the AUTHORIZATION: once the proxy is in mcp.json the
@@ -1838,6 +1986,8 @@ def register_playwright_proxy() -> tuple[Path, str]:
         else:
             mcp_json.write_text(json.dumps({"mcpServers": {}}, indent=2), encoding="utf-8")
         _patch_mcp_for_mode_unlocked()
+    if agent_specs_shadowing(canonical):
+        return mcp_json, "shadowed-by-agent"
     return mcp_json, "registered"
 
 
@@ -1886,6 +2036,7 @@ def deregister_playwright_proxy() -> tuple[Path, str]:
                 kept_user_entry = user_owns_canonical
                 removed = False
                 if _spec_is_proxy(canon):
+                    capture_entry_carryover(canon)
                     del servers[canonical]
                     removed = True
                 before = len(servers)

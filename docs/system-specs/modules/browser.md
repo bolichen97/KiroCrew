@@ -166,6 +166,49 @@ Playwright MCP's `browser_snapshot` returns full accessibility trees (50-100K to
 - Compresses to compact outline: only interactive elements (links, buttons, inputs, headings, images) with refs
 - ~95% token reduction on heavy pages
 
+**Registration status contract:** `register_playwright_proxy()` returns one of
+four statuses, and every caller that reports the outcome must distinguish them,
+because two of the four mean the `browser_*` tools will NOT work:
+
+| Status | Meaning |
+|---|---|
+| `registered` | KiroCrew's proxy entry was written or refreshed under the canonical alias. |
+| `mode-disabled` | Browser Mode is off, so nothing was written (see above). |
+| `kept-user-entry` | A user-authored NON-proxy server holds the canonical key; it is left byte-identical. |
+| `shadowed-by-agent` | The entry was written, but an agent spec in `~/.kiro/agents/*.json` declares the same server name. An agent's own `mcpServers` declaration wins at resolution, so the write has no effect until that spec is removed. `agent_specs_shadowing()` names the offending files and `print_shadow_warning()` renders them. |
+
+**Mode switches update in place, never rebuild.** `_apply_mode_to_entry()` sets
+only the fields a mode owns — `command`, `args`, and the extension token — and
+leaves every other key on the entry untouched. An operator's `env` (notably a
+`KIROCREW_PLAYWRIGHT_CMD` launcher pin, which on some hosts is the only reason a
+launcher resolves at all), a `timeout`, or any field a future schema adds
+therefore survives `browse extension on|off`. The token is mode-owned: headless
+removes it rather than carrying a stale one.
+
+**Browser Mode OFF carries operator fields in a sidecar.** Turning Browser Mode
+off must DELETE the entry — availability is the consent gate, so the `browser_*`
+tools have to actually disappear — which would otherwise take the operator's own
+fields with it. `deregister_playwright_proxy()` therefore stashes them to
+`$KIROCREW_HOME/playwright-entry-carryover.json` (mode `0600`) and the next
+registration restores them into the fresh entry. Properties:
+
+- Captured only from an entry Kiro Crew authored (`_spec_is_proxy`), so a user's
+  own server under the canonical key is never copied out of their config. The
+  guard lives inside `capture_entry_carryover()` rather than at its call sites,
+  because the stale-MCP purge deletes by command basename and can match a server
+  Kiro Crew does not own.
+- The extension token is **not** stashed: it is re-minted per mode, and copying it
+  would spread a credential to a second file for no benefit.
+- One-shot — the stash is consumed and deleted by the restore, so it cannot
+  resurrect configuration the operator later abandoned.
+
+**The stale-MCP purge carries too.** `clean_stale_managed_mcp()` removes an entry
+whose command is the dead predecessor binary — correctly, since that command is
+unusable — and `cli_setup` registers the proxy again immediately afterwards. The
+purge therefore stashes the operator-owned fields the same way deregistration
+does, so an operator who migrated from the predecessor does not silently lose a
+launcher pin to `kirocrew setup` or an update.
+
 **Registration (one canonical server, no duplicates):** kiro-cli splits an agent
 `@server` reference on `/`, so a slash-containing key like `@playwright/mcp` is
 mis-parsed as `@server/tool` and exposes none of the server's tools. The proxy is

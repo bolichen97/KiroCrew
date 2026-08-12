@@ -113,6 +113,9 @@ def _cmd_setup() -> None:
     if reg_status == "kept-user-entry":
         print(f"  \u00b7 Proxy NOT registered           {mcp_json}")
         print("    (you already have your own 'playwright-mcp' server — left untouched)")
+    elif reg_status == "shadowed-by-agent":
+        print(f"  \u2717 Proxy registered but SHADOWED  {mcp_json}")
+        _setup.print_shadow_warning()
     else:
         print(f"  \u2713 Proxy registered               {mcp_json}")
 
@@ -198,6 +201,9 @@ def _reregister_proxy() -> None:
     if status == "kept-user-entry":
         print("  Kept your existing playwright-mcp entry in mcp.json (left untouched).")
         print("  Remove it to let KiroCrew manage the browse server.")
+    elif status == "shadowed-by-agent":
+        print("  Wrote the entry, but it is SHADOWED and will not be used:")
+        _setup.print_shadow_warning("  ")
 
 
 def _cmd_auth_health() -> None:

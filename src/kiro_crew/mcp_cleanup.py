@@ -62,6 +62,26 @@ def _invokes_meshclaw(spec: object) -> bool:
     return stem == "meshclaw"
 
 
+def _stash_operator_fields(spec: object) -> None:
+    """Carry operator-owned fields out of a proxy entry this purge deletes.
+
+    The purge removes an entry whose *command* is unusable, but fields the
+    operator added to it -- notably an ``env.KIROCREW_PLAYWRIGHT_CMD`` launcher
+    pin -- remain valid. Setup registers the proxy again right after purging
+    (``cli_setup``), which restores the stash. Only a KiroCrew-authored proxy
+    entry is captured, so a user's own server is never copied out.
+
+    Imported lazily: ``browser.setup`` is a heavier module and does not import
+    this one, so keeping the edge one-way and late avoids an import cycle.
+    """
+    try:
+        from kiro_crew.browser.setup import capture_entry_carryover  # noqa: PLC0415
+
+        capture_entry_carryover(spec)
+    except Exception:  # pragma: no cover - carryover is best-effort
+        logger.debug("Could not stash operator fields before purge", exc_info=True)
+
+
 def clean_stale_managed_mcp() -> list[str]:
     """Remove stale managed-binary MCP entries from ``~/.kiro/settings/mcp.json``.
 
@@ -98,6 +118,7 @@ def clean_stale_managed_mcp() -> list[str]:
     if not removed:
         return []
     for name in removed:
+        _stash_operator_fields(servers[name])
         del servers[name]
     try:
         _KIRO_MCP_JSON.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

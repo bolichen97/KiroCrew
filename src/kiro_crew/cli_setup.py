@@ -17,6 +17,7 @@ from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.browser.setup import (
     browser_mode_enabled,
     generate_playwright_config,
+    print_shadow_warning,
     refresh_storage_state,
     register_playwright_proxy,
 )
@@ -385,6 +386,9 @@ def _setup_impl(
             _, status = register_playwright_proxy()
             if status == "kept-user-entry":
                 print("  Kept your existing playwright-mcp entry in mcp.json (left untouched)")
+            elif status == "shadowed-by-agent":
+                print("  Proxy registered but SHADOWED by an agent spec:")
+                print_shadow_warning("  ")
             else:
                 print("  Browser Mode is on — proxy registered in mcp.json")
         except Exception:
