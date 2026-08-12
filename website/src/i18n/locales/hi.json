@@ -9738,6 +9738,7 @@
         "update_check_error_version_unparseable": "संस्करण संख्याओं की तुलना नहीं कर सके।",
         "update_check_managed_by_app": "यह बिल्ड ऐप के ज़रिए अपडेट होता है, गेटवे के ज़रिए नहीं।",
         "update_check_managed_by_image": "यह कंटेनर नई इमेज खींचकर अपडेट होता है।",
+        "update_error_install_unknown": "अपडेट इंस्टॉल करते समय कुछ गड़बड़ हो गई।",
         "update_error_integrity": "डाउनलोड अखंडता जाँच में विफल रहा और उसे रद्द कर दिया गया।",
         "update_error_misconfigured": "यह बिल्ड अपडेट नहीं जाँच सकता। इसे ठीक करने के लिए दोबारा इंस्टॉल करें।",
         "update_error_no_release": "इस चैनल के लिए अभी कोई अपडेट प्रकाशित नहीं हुआ है।",

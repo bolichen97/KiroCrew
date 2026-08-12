@@ -9619,6 +9619,7 @@
         "update_check_error_version_unparseable": "버전 번호를 비교할 수 없습니다.",
         "update_check_managed_by_app": "이 빌드는 게이트웨이가 아니라 앱을 통해 업데이트합니다.",
         "update_check_managed_by_image": "이 컨테이너는 새 이미지를 받아 업데이트합니다.",
+        "update_error_install_unknown": "업데이트를 설치하는 중 문제가 발생했습니다.",
         "update_error_integrity": "다운로드가 무결성 검사를 통과하지 못해 폐기되었습니다.",
         "update_error_misconfigured": "이 빌드는 업데이트를 확인할 수 없습니다. 다시 설치하여 해결하세요.",
         "update_error_no_release": "이 채널에는 아직 게시된 업데이트가 없습니다.",

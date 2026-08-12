@@ -9619,6 +9619,7 @@
         "update_check_error_version_unparseable": "バージョン番号を比較できませんでした。",
         "update_check_managed_by_app": "このビルドはゲートウェイではなくアプリ経由で更新します。",
         "update_check_managed_by_image": "このコンテナは新しいイメージを取得して更新します。",
+        "update_error_install_unknown": "アップデートのインストール中に問題が発生しました。",
         "update_error_integrity": "ダウンロードは整合性チェックに失敗し、破棄されました。",
         "update_error_misconfigured": "このビルドは更新を確認できません。再インストールして修正してください。",
         "update_error_no_release": "このチャネルに対してまだ更新は公開されていません。",

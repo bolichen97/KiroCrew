@@ -9738,6 +9738,7 @@
         "update_check_error_version_unparseable": "সংস্করণ নম্বর তুলনা করা যায়নি।",
         "update_check_managed_by_app": "এই বিল্ডটি অ্যাপের মাধ্যমে আপডেট হয়, গেটওয়ের মাধ্যমে নয়।",
         "update_check_managed_by_image": "এই কনটেইনারটি নতুন ইমেজ টেনে আপডেট হয়।",
+        "update_error_install_unknown": "আপডেট ইনস্টল করার সময় কিছু ভুল হয়েছে।",
         "update_error_integrity": "ডাউনলোডটি ইন্টিগ্রিটি যাচাইয়ে ব্যর্থ হয়েছে এবং বাতিল করা হয়েছে।",
         "update_error_misconfigured": "এই বিল্ড আপডেট খুঁজতে পারে না। ঠিক করতে আবার ইনস্টল করুন।",
         "update_error_no_release": "এই চ্যানেলের জন্য এখনো কোনো আপডেট প্রকাশ করা হয়নি।",

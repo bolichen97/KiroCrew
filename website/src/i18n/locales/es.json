@@ -9857,6 +9857,7 @@
         "update_check_error_version_unparseable": "No se pudieron comparar los números de versión.",
         "update_check_managed_by_app": "Esta versión se actualiza a través de la aplicación, no de la puerta de enlace.",
         "update_check_managed_by_image": "Este contenedor se actualiza descargando una imagen más reciente.",
+        "update_error_install_unknown": "Algo salió mal al instalar la actualización.",
         "update_error_integrity": "La descarga no pasó la comprobación de integridad y se descartó.",
         "update_error_misconfigured": "Esta compilación no puede buscar actualizaciones. Reinstálala para solucionarlo.",
         "update_error_no_release": "Todavía no se ha publicado ninguna actualización para este canal.",

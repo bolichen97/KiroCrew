@@ -9738,6 +9738,7 @@
         "update_check_error_version_unparseable": "Die Versionsnummern konnten nicht verglichen werden.",
         "update_check_managed_by_app": "Dieser Build wird über die App aktualisiert, nicht über das Gateway.",
         "update_check_managed_by_image": "Dieser Container wird durch ein neueres Image aktualisiert.",
+        "update_error_install_unknown": "Beim Installieren des Updates ist ein Fehler aufgetreten.",
         "update_error_integrity": "Der Download hat die Integritätsprüfung nicht bestanden und wurde verworfen.",
         "update_error_misconfigured": "Dieser Build kann nicht nach Aktualisierungen suchen. Installieren Sie neu, um dies zu beheben.",
         "update_error_no_release": "Für diesen Kanal wurde noch keine Aktualisierung veröffentlicht.",

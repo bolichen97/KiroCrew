@@ -3321,6 +3321,7 @@
         "published": "published {{when}}",
         "restarting": "Restarting...",
         "retry": "Retry",
+        "update_error_install_unknown": "Something went wrong while installing the update.",
         "update_error_integrity": "The download failed its integrity check and was discarded.",
         "update_error_misconfigured": "This build can't check for updates. Reinstall to fix it.",
         "update_error_no_release": "No update has been published for this channel yet.",

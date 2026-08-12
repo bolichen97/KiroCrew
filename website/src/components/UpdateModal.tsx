@@ -3,6 +3,7 @@ import { useQuery, useMutation } from '@tanstack/react-query'
 import { Download, X } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
+import type { UpdateState } from '../hooks/useUpdateSubscription'
 /**
  * In-app "update ready" modal for the packaged desktop app.
  *
@@ -13,17 +14,14 @@ import { i18nT } from '../i18n/t'
  * stops the bundled gateway gracefully before ShipIt swaps the .app bundle,
  * then relaunches.
  *
+ * Replayed states (payload.replayed — seeded from getInfo() after a renderer
+ * reload) never open the modal: the user already saw and possibly dismissed
+ * this prompt before the reload, and a staged build re-offers itself through
+ * the About card and nav dot. Only a LIVE 'downloaded' event interrupts.
+ *
  * No-ops entirely in the browser (query cache never gets populated without
  * the Electron preload), so it's safe to mount unconditionally in App.
  */
-
-type UpdateState = {
-  state: 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
-  version?: string
-  notes?: string
-  channel?: string
-  message?: string
-}
 
 type UpdateAPI = {
   install: () => Promise<unknown>
@@ -42,9 +40,11 @@ export default function UpdateModal() {
   })
 
   const [dismissed, setDismissed] = useState(false)
-  // Re-open on each fresh "downloaded" event (version change resets dismiss)
+  // Re-open on each fresh "downloaded" event (version change resets dismiss).
+  // Replayed payloads are excluded from both the reset and the open: a reload
+  // must not undo the user's dismissal of this same staged version.
   const [lastVersion, setLastVersion] = useState<string | undefined>(undefined)
-  if (update?.state === 'downloaded' && update.version !== lastVersion) {
+  if (update?.state === 'downloaded' && !update.replayed && update.version !== lastVersion) {
     setLastVersion(update.version)
     setDismissed(false)
   }
@@ -52,7 +52,7 @@ export default function UpdateModal() {
   const installMutation = useMutation({ mutationFn: () => getUpdateApi()!.install() })
   const installing = installMutation.isPending
 
-  const open = !!update && update.state === 'downloaded' && !dismissed
+  const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed
 
   // Escape dismisses the modal (unless an install is in flight), matching the
   // backdrop-click affordance and keeping the overlay keyboard-accessible.

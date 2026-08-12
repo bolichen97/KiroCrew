@@ -9619,6 +9619,7 @@
         "update_check_error_version_unparseable": "无法比较版本号。",
         "update_check_managed_by_app": "此版本通过应用自身更新，不经由网关。",
         "update_check_managed_by_image": "此容器通过拉取更新的镜像来升级。",
+        "update_error_install_unknown": "安装更新时出了点问题。",
         "update_error_integrity": "下载的更新未通过完整性校验，已丢弃。",
         "update_error_misconfigured": "此版本无法检查更新，请重新安装以修复。",
         "update_error_no_release": "此更新通道尚未发布任何更新。",
