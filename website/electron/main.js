@@ -78,6 +78,7 @@ const {
 } = require("./remote-token");
 
 const { migrateRemoteHostConfig, getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
+const { decideLocalSpawn } = require("./local-gateway-policy");
 
 const store = new Store({
   defaults: {
@@ -89,6 +90,7 @@ const store = new Store({
     lastNudgedVersion: "",                 // last update version announced via native notification (nudge once per version)
     themeAccent: "",                       // user's resolved theme accent hex; injected into the boot splash
     updateChannel: "",                     // "" = follow build stamp; "insider"|"stable" = user opt-in (Settings > About)
+    runLocalGateway: true,                 // spawn a gateway on this machine at launch; off = pure client of a configured remote (Settings > Developer, next-launch scoped)
   },
 });
 
@@ -621,12 +623,56 @@ function startGateway() {
           resolve(false);
           return;
         }
-        spawnGateway(resolve);
+        spawnGatewayIfEnabled(resolve);
       })
       .catch(() => {
-        spawnGateway(resolve);
+        spawnGatewayIfEnabled(resolve);
       });
   });
+}
+
+// Every local spawn goes through the "Run Local Gateway" gate (Settings →
+// Developer, decision table in local-gateway-policy.js). Both startGateway()
+// arms need it — the nothing-answered-the-probe arm and the fall-through after
+// resolveGatewayConflict() — and routing the retry/recovery callers through
+// startGateway() keeps them gated too: a plain Retry re-probes, it never
+// spawns what the user turned off.
+function spawnGatewayIfEnabled(resolve) {
+  const remoteHost = getRemoteHostConfig(store, PORT)?.host || "";
+  const verdict = decideLocalSpawn({
+    runLocalGateway: store.get("runLocalGateway"),
+    remoteHost,
+    // Next-launch scoping: a gateway THIS session spawned keeps its recovery
+    // respawns even if the user flips the setting off mid-session — the
+    // persisted value gates only a future launch. False on every fresh boot.
+    ownedGatewayActive: weSpawnedGateway,
+  });
+  if (verdict.spawn) {
+    if (verdict.reason === "no-remote-configured") {
+      // Setting off but no remote configured: spawn anyway. The setting means
+      // "prefer my configured remote"; with no remote there is nowhere else to
+      // connect, and refusing to start anything would brick the launch.
+      glog(`run-local-gateway is off but no remote host is configured for :${PORT} — spawning anyway (nothing else to connect to)`);
+    } else if (verdict.reason === "recovering-owned-gateway") {
+      glog(`run-local-gateway is off but this session owns the gateway on :${PORT} — respawning (the setting takes effect on next launch)`);
+    }
+    spawnGateway(resolve);
+    return;
+  }
+  // Pure-client mode: the user turned the local gateway off and configured a
+  // remote for this port, but the remote did not answer the probe. Do NOT
+  // spawn — surface an unreachable state instead (the boot wait fail-fasts on
+  // gatewayStartFailure and shows the retry dialog; see showLoadingThenConnect).
+  // Nothing was spawned and nothing was adopted, so weSpawnedGateway /
+  // reusedLocalGateway stay false: recovery must treat the remote like any
+  // external gateway — reconnect when it heals, never respawn locally.
+  glog(`run-local-gateway is off and remote ${verdict.host} is not answering on :${PORT} — NOT spawning a local gateway`);
+  gatewayStartFailure = {
+    error: `the local gateway is turned off (Settings → Developer) and the remote gateway at ${verdict.host} is not reachable`,
+    remoteUnreachable: verdict.host,
+  };
+  sendStatus(`Can't reach ${verdict.host}`);
+  resolve(false);
 }
 
 // Resolve the KiroCrew project root (the tree that ships `agents/` + `skills/`)
@@ -1916,7 +1962,9 @@ function showGatewayErrorDialog(parentWin, opts) {
       body { font-family:-apple-system,sans-serif; padding:20px; background:${dark ? "#1e293b" : "#f8fafc"}; color:${fg};
         display:flex; flex-direction:column; height:100vh; }
       .title { font-size:15px; font-weight:700; margin-bottom:6px; }
-      .msg { font-size:13px; line-height:1.45; margin-bottom:10px; }
+      /* pre-line so a caller can separate "what happened" from remedies with
+         blank lines; existing single-paragraph messages render unchanged. */
+      .msg { font-size:13px; line-height:1.45; margin-bottom:10px; white-space:pre-line; }
       .pathline { font-size:11px; color:${muted}; margin-bottom:6px; word-break:break-all; }
       /* Scrollable, fixed-height log pane — the whole point of this window. */
       pre.log { flex:1 1 auto; min-height:120px; overflow:auto; white-space:pre;
@@ -2393,14 +2441,32 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     let logTail = "";
     try { logTail = tailLines(fs.readFileSync(logPath, "utf8"), 60); } catch { /* no log yet */ }
 
+    // Pure-client mode declined the spawn (Run Local Gateway off + configured
+    // remote not answering). A positive, current-boot signal — check it BEFORE
+    // the portConflict log-tail heuristic, which can match stale lines from a
+    // previous launch. Retry below re-probes without spawning (startGateway
+    // routes through the same gate).
+    const remoteUnreachable = (failedToStart && err.failure && err.failure.remoteUnreachable) || "";
+
     // A wedged/other gateway already holding this flavor's port is a distinct,
     // recoverable case: the spawn dies with "address already in use" and a plain
     // retry can't help (the holder is still there). Detect it and offer to
     // force-stop the stuck KiroCrew process. Only meaningful for OUR own port.
-    const portConflict = failedToStart && backendUrl === BACKEND_URL && isPortInUse(logTail);
+    const portConflict = !remoteUnreachable && failedToStart && backendUrl === BACKEND_URL && isPortInUse(logTail);
 
     let title, message;
-    if (portConflict) {
+    if (remoteUnreachable) {
+      title = `Kiro Crew — can't reach ${remoteUnreachable}`;
+      // The usual remedy (flip the toggle in Settings) is served by the very
+      // gateway that is down, so the copy must name an escape that works with
+      // no dashboard: a manually started gateway answers the next re-probe and
+      // is adopted by the reuse path.
+      message = `Run Local Gateway is turned off (Settings → Developer) and the remote gateway at `
+        + `${remoteUnreachable} is not answering on port ${PORT}.\n\n`
+        + `Check that the remote gateway and your tunnel are up, then retry — Retry re-probes `
+        + `without starting a local gateway.\n\n`
+        + `To use this machine instead, run "kirocrew gateway" in a terminal, then retry.`;
+    } else if (portConflict) {
       title = `Kiro Crew — port ${PORT} already in use`;
       message = `Another Kiro Crew gateway is already using port ${PORT} (it may be wedged). `
         + `Force-stop it and retry, or quit. From a terminal you can also run: `
@@ -2868,6 +2934,20 @@ app.whenReady().then(async () => {
   ipcMain.handle("zoom:set", (event, factor) => applyZoom(event.sender, clampZoomFactor(factor)));
   ipcMain.handle("zoom:step", (event, dir) =>
     applyZoom(event.sender, stepZoomFactor(event.sender.getZoomFactor(), dir > 0 ? +1 : -1)));
+
+  // "Run Local Gateway" bridge for the Settings > Developer toggle. The spawn
+  // decision is owned by the main process (it runs before any renderer
+  // exists), so the renderer round-trips through IPC to read/write the
+  // persisted setting. Next-launch scoped by design: flipping it never stops
+  // or starts a gateway in this session — startGateway() reads the store on
+  // the next boot. Both handlers return the effective value so the toggle can
+  // render it without a second round-trip (same contract as zoom above).
+  ipcMain.handle("local-gateway:get", () => store.get("runLocalGateway") !== false);
+  ipcMain.handle("local-gateway:set", (_event, enabled) => {
+    const value = !!enabled;
+    store.set("runLocalGateway", value);
+    return value;
+  });
 
   // ── Native browser panel IPC ──
   // The dashboard renderer drives the embedded browser view: it opens/navigates,

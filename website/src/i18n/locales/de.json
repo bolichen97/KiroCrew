@@ -10076,6 +10076,9 @@
         "developer_mode": "Entwicklermodus",
         "developer_tools": "Entwicklerwerkzeuge",
         "open_developer_page": "Entwicklerseite öffnen",
+        "run_local_gateway": "Lokales Gateway ausführen",
+        "run_local_gateway_desc": "Startet das integrierte Gateway auf diesem Rechner beim Start. Ausschalten, um nur ein konfiguriertes Remote-Gateway zu verwenden. Wirksam ab dem nächsten Start. Wird ignoriert, wenn kein Remote-Gateway konfiguriert ist.",
+        "run_local_gateway_unsupported": "Nur in der Desktop-App verfügbar — ein Browser-Dashboard hat kein lokales Gateway zu steuern.",
         "show_developer_page_in_sidebar_with_logs_system": "Entwicklerseite in der Seitenleiste mit Protokollen, Systemmetriken und Erinnerungsinterna anzeigen"
       },
       "discordPanel": {

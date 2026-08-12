@@ -72,6 +72,18 @@ contextBridge.exposeInMainWorld("zoomAPI", {
   step: (dir) => ipcRenderer.invoke("zoom:step", dir),
 });
 
+// "Run Local Gateway" bridge for the Settings > Developer toggle. The spawn
+// decision belongs to the main process (it happens before the renderer
+// exists), so the renderer round-trips through IPC to read/write the
+// persisted setting. Next-launch scoped: flipping it changes nothing in the
+// running session. Both calls resolve with the effective value. Absent in
+// plain browsers and the PWA — the renderer treats a missing bridge as
+// "no local gateway to control" and hides the toggle.
+contextBridge.exposeInMainWorld("localGatewayAPI", {
+  get: () => ipcRenderer.invoke("local-gateway:get"),
+  set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
+});
+
 // Native browser panel bridge. The Browser side panel is a real embedded
 // Chromium view owned by the main process, composited over the panel rect —
 // not an iframe and not in the React tree. So the renderer has to (a) report

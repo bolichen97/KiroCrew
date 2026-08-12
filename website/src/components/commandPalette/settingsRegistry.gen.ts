@@ -478,6 +478,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.run-local-gateway",
+    "label": "Run Local Gateway",
+    "description": "Start the built-in gateway on this machine at launch. Turn off to use only a configured remote gateway. Takes effect on next launch. Ignored when no remote gateway is configured.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "display.display-mode",
     "label": "Display Mode",
     "description": "How the session color is applied to the row.",

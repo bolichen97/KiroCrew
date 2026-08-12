@@ -10195,6 +10195,9 @@
         "developer_mode": "Mode développeur",
         "developer_tools": "Outils de développement",
         "open_developer_page": "Ouvrir la page Développeur",
+        "run_local_gateway": "Exécuter la passerelle locale",
+        "run_local_gateway_desc": "Démarre la passerelle intégrée sur cette machine au lancement. Désactivez pour n'utiliser qu'une passerelle distante configurée. Prend effet au prochain lancement. Ignoré si aucune passerelle distante n'est configurée.",
+        "run_local_gateway_unsupported": "Disponible uniquement dans l'application de bureau — un tableau de bord dans le navigateur n'a pas de passerelle locale à contrôler.",
         "show_developer_page_in_sidebar_with_logs_system": "Afficher la page Développeur dans la barre latérale, avec les journaux, les métriques système et les détails internes de la mémoire"
       },
       "discordPanel": {

@@ -78,6 +78,7 @@
       "window-state.js",
       "gateway-liveness.js",
       "gateway-recovery.js",
+      "local-gateway-policy.js",
       "pyspy-dump.js",
       "perf-metrics.js",
       "host-config.js",

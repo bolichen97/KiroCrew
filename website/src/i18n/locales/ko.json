@@ -9957,6 +9957,9 @@
         "developer_mode": "개발자 모드",
         "developer_tools": "개발자 도구",
         "open_developer_page": "개발자 페이지 열기",
+        "run_local_gateway": "로컬 게이트웨이 실행",
+        "run_local_gateway_desc": "실행 시 이 컴퓨터에서 내장 게이트웨이를 시작합니다. 끄면 구성된 원격 게이트웨이만 사용합니다. 다음 실행 시 적용됩니다. 원격 게이트웨이가 구성되어 있지 않으면 무시됩니다.",
+        "run_local_gateway_unsupported": "데스크톱 앱에서만 사용할 수 있습니다. 브라우저 대시보드에는 제어할 로컬 게이트웨이가 없습니다.",
         "show_developer_page_in_sidebar_with_logs_system": "사이드바에 로그, 시스템 지표, 메모리 내부 정보가 포함된 개발자 페이지 표시"
       },
       "discordPanel": {

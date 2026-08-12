@@ -10195,6 +10195,9 @@
         "developer_mode": "Modo desenvolvedor",
         "developer_tools": "Ferramentas de desenvolvedor",
         "open_developer_page": "Abrir a página Desenvolvedor",
+        "run_local_gateway": "Executar gateway local",
+        "run_local_gateway_desc": "Inicia o gateway integrado nesta máquina ao abrir. Desative para usar apenas um gateway remoto configurado. Entra em vigor na próxima inicialização. Ignorado quando nenhum gateway remoto está configurado.",
+        "run_local_gateway_unsupported": "Disponível apenas no aplicativo desktop — um painel no navegador não tem gateway local para controlar.",
         "show_developer_page_in_sidebar_with_logs_system": "Mostrar a página Desenvolvedor na barra lateral, com Logs, Métricas do sistema e Detalhes internos da memória"
       },
       "discordPanel": {

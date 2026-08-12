@@ -9957,6 +9957,9 @@
         "developer_mode": "开发者模式",
         "developer_tools": "开发者工具",
         "open_developer_page": "打开开发者页面",
+        "run_local_gateway": "运行本地网关",
+        "run_local_gateway_desc": "启动时在本机运行内置网关。关闭后仅使用已配置的远程网关。下次启动时生效。未配置远程网关时此设置将被忽略。",
+        "run_local_gateway_unsupported": "仅在桌面应用中可用——浏览器仪表板没有可控制的本地网关。",
         "show_developer_page_in_sidebar_with_logs_system": "在侧边栏显示开发者页面，包含日志、系统指标与记忆内部信息"
       },
       "discordPanel": {

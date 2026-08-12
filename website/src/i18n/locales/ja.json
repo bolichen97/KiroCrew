@@ -9957,6 +9957,9 @@
         "developer_mode": "開発者モード",
         "developer_tools": "開発者ツール",
         "open_developer_page": "開発者ページを開く",
+        "run_local_gateway": "ローカルゲートウェイを実行",
+        "run_local_gateway_desc": "起動時にこのマシンで内蔵ゲートウェイを起動します。オフにすると、設定済みのリモートゲートウェイのみを使用します。次回起動時に反映されます。リモートゲートウェイが設定されていない場合、この設定は無視されます。",
+        "run_local_gateway_unsupported": "デスクトップアプリでのみ利用可能です。ブラウザーのダッシュボードには制御できるローカルゲートウェイがありません。",
         "show_developer_page_in_sidebar_with_logs_system": "サイドバーに開発者ページを表示（ログ、システムメトリクス、メモリ内部情報を含む）"
       },
       "discordPanel": {
