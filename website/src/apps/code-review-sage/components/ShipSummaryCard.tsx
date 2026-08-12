@@ -48,8 +48,9 @@ export default function ShipSummaryCard({
       {(posted || onPost || (selectable && !posted)) && (
         <div className="flex items-center gap-2 border-t border-border-strong bg-panel-strong px-3.5 py-2">
           {selectable && !posted && (
-            <label className="flex items-center gap-2 text-[11.5px] text-muted cursor-pointer">
+            <label htmlFor="ship-summary-select" className="flex items-center gap-2 text-[11.5px] text-muted cursor-pointer">
               <input
+                id="ship-summary-select"
                 type="checkbox"
                 checked={selected}
                 onChange={onToggle}

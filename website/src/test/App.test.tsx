@@ -40,6 +40,7 @@ vi.mock('../api/client', () => ({
       color: '',
       onboarded: true,
       import_onboarded: true,
+      privacy_acked: true,
     }),
     updateThemeConfig: vi.fn().mockResolvedValue({}),
     onboardingImportScan: vi.fn().mockResolvedValue({

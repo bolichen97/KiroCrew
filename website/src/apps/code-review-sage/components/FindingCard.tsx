@@ -31,6 +31,7 @@
 // it cannot be reinterpreted as markup.
 import { Check, Loader2, MessageSquarePlus } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { useId } from 'react'
 import MarkdownRenderer from '../../../components/MarkdownRenderer'
 import type { Finding } from '../lib/types'
 
@@ -123,6 +124,7 @@ export default function FindingCard({
   /** Accessible name for the checkbox — the card's own text is long. */
   label?: string
 }) {
+  const checkboxId = useId()
   const { text, border, word } = severityVisual(finding.severity)
   const location = [finding.file, finding.line != null && finding.line !== '' ? String(finding.line) : null]
     .filter(Boolean)
@@ -191,8 +193,9 @@ export default function FindingCard({
       {showActions && (
         <div className="flex items-center gap-2 border-t border-border-strong bg-panel-strong px-3.5 py-2">
           {selectable && !posted && (
-            <label className="flex items-center gap-2 text-[11.5px] text-muted cursor-pointer">
+            <label htmlFor={checkboxId} className="flex items-center gap-2 text-[11.5px] text-muted cursor-pointer">
               <input
+                id={checkboxId}
                 type="checkbox"
                 checked={selected}
                 onChange={onToggle}

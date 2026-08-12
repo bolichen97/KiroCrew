@@ -6522,7 +6522,8 @@
     "sessions": "세션",
     "settings": "설정",
     "task_runner": "태스크 러너",
-    "webhooks": "Webhooks"
+    "webhooks": "Webhooks",
+    "today": "Today"
   },
   "pages": {
     "agentsPage": {
@@ -11334,6 +11335,52 @@
     "worldsPopout": {
       "hide_controls": "컨트롤 숨기기",
       "show_controls": "컨트롤 표시"
+    },
+    "todayPage": {
+      "approve": "Approve",
+      "approval_actions": "Approval actions",
+      "approval_prompt": "Review the request and approve or deny without leaving Today.",
+      "close": "Close",
+      "close_drawer": "Close drawer",
+      "completed": "Completed",
+      "crew_fallback": "Crew",
+      "decision_prompt": "This session is waiting on a decision. Open it to see the options and respond.",
+      "decision_required": "Decision required",
+      "deny": "Deny",
+      "empty_subtitle": "Active sessions from Chat or Slack threads show up here.",
+      "empty_title": "Nothing needs you right now.",
+      "idle": "Idle",
+      "items_need_you": "{{count}} item needs you",
+      "items_need_you_plural": "{{count}} items need you",
+      "needs_approval": "Needs approval",
+      "needs_you": "Needs You",
+      "no_pending_approval": "No pending approval found for this session.",
+      "none_in_bucket": "None.",
+      "nothing_needs_you": "Nothing needs you right now",
+      "open_session": "Open session",
+      "open_to_respond": "Open to respond",
+      "resolve_error": "Couldn't resolve — open the session to respond.",
+      "resolve_error_drawer": "Couldn't resolve here — open the session to respond.",
+      "session_details": "Session details",
+      "slack_origin": "Slack · {{channel}}",
+      "status": "Status",
+      "stopping": "Stopping",
+      "thread": "thread",
+      "title": "Today",
+      "untitled_session": "Untitled session",
+      "working": "Working",
+      "working_agents": "Working · agents",
+      "working_heading": "Working",
+      "approve_all": "Approve All",
+      "batch_selected": "{{count}} selected",
+      "cancel": "Cancel",
+      "deny_all": "Deny All",
+      "deselect": "Deselect",
+      "deselect_all": "Deselect all",
+      "select": "Select",
+      "select_all": "Select all",
+      "tool_request": "Tool Request",
+      "unknown_tool": "Unknown tool"
     }
   },
   "privacyDisclosure": {

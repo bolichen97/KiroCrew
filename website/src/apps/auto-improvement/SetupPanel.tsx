@@ -186,14 +186,14 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
 
       {/* Step 1 — choose the repository */}
       <div className="flex flex-col gap-2">
-        <label className="text-[13px] text-muted">{i18nT('autoImprovement.repoLabel')}</label>
+        <span className="text-[13px] text-muted">{i18nT('autoImprovement.repoLabel')}</span>
         <div className="flex items-center gap-2">
           <Input
+            aria-label={i18nT('autoImprovement.repoLabel')}
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder={i18nT('apps.autoImprovement.setupPanel.https_github_com_owner_repo')}
             className="flex-1"
-            aria-label={i18nT('autoImprovement.repoLabel')}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && url.trim()) clone.mutate(url.trim())
             }}
@@ -229,10 +229,10 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
       {/* Step 2 — pick a base branch (only when a clone exists) */}
       {configured && branches.length > 0 ? (
         <div className="mt-3 flex flex-col gap-2">
-          <label className="flex items-center gap-1 text-[13px] text-muted">
+          <span id="auto-improve-branch-label" className="flex items-center gap-1 text-[13px] text-muted">
             <GitBranch className="lucide-inline" size={13} />
             {i18nT('autoImprovement.branchLabel')}
-          </label>
+          </span>
           {/* Guarantee the CONFIGURED branch is always a selectable option. A picker
               whose value matches no option falls back to its placeholder, which would
               silently misreport the branch a run targets — so if the branches list has
@@ -253,8 +253,9 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
               instead of drafting a pull request. The backend still refuses a
               protected branch (the spine's non-overridable denylist), so this
               only ever applies to a feature branch the operator named. */}
-          <label className="mt-1 flex items-start gap-2">
+          <label htmlFor="auto-improve-commit" className="mt-1 flex items-start gap-2">
             <input
+              id="auto-improve-commit"
               type="checkbox"
               checked={directCommit}
               onChange={(e) => saveConfig.mutate({ directCommit: e.target.checked })}
