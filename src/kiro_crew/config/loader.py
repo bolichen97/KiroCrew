@@ -167,6 +167,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "session_summary",
         "telemetry",
         "snapshot_dir",
+        "redact_backup_uploads",
         "timezone",
         "auto_update",
         "registries",
@@ -5296,6 +5297,17 @@ class KiroCrewConfig:
             "Defaults to ~/.kiro/crew/snapshots if empty.",
         ),
     )
+    redact_backup_uploads: bool = field(
+        default=True,
+        metadata=_meta(
+            "Redact Backup Uploads",
+            "Strip credential material from a backup before it is uploaded off-host. "
+            "The local archive is never redacted, so it still restores complete. "
+            "Turning this OFF uploads credentials in plaintext, which is what makes the "
+            "off-host copy restore complete — set it only if you accept that the bucket "
+            "then holds usable secrets.",
+        ),
+    )
     registries: list[ExternalRegistryConfig] = field(
         default_factory=list,
         metadata=_meta(
@@ -6133,6 +6145,7 @@ class KiroCrewConfig:
             auto_update=data.get("auto_update", True),
             timezone=data.get("timezone", ""),
             snapshot_dir=data.get("snapshot_dir", ""),
+            redact_backup_uploads=bool(data.get("redact_backup_uploads", True)),
             registries=[
                 ExternalRegistryConfig(
                     name=str(r.get("name", "")),
@@ -6362,6 +6375,7 @@ class KiroCrewConfig:
             "session_summary": asdict(self.session_summary),
             "telemetry": asdict(self.telemetry),
             "snapshot_dir": self.snapshot_dir,
+            "redact_backup_uploads": self.redact_backup_uploads,
             "timezone": self.timezone,
             "auto_update": self.auto_update,
         }

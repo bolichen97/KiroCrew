@@ -4244,6 +4244,22 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own startup reader opens it directly rather than through this
     # gate, so both keep working.
     "live_target.json",
+    # Where `kirocrew snapshot --to-s3` sends the operator's memory. The backup
+    # path deliberately takes no bucket from its caller and writes only to what
+    # this directory records, which is precisely why it is a trust anchor: an
+    # agent that could author the record could redirect every future backup to a
+    # bucket it controls, and `--expected-bucket-owner` would then dutifully
+    # verify the ATTACKER's ownership. That is bulk exfiltration of the whole
+    # memory store through a sanctioned code path.
+    #
+    # The DIRECTORY is classified, not just `destination.json` inside it. Naming
+    # only the leaf leaves the container writable, and a writable container is
+    # the same hole one level up: replace `backup/` with a symlink and the
+    # protected leaf now resolves somewhere unprotected, where the record can be
+    # rewritten at will. Restore's rollback copies live at `pre-restore-<ts>/`,
+    # not here, so nothing legitimate is shut out. `load_destination` opens the
+    # file directly rather than through this gate, so the product keeps working.
+    "backup",
     # The computer-use primary enable ({enabled, allowed_apps, extra_denied_apps}).
     # Same class of control as ``denied_commands.json`` directly above, and here
     # for the same reason: flipping ``enabled`` grants full desktop observation

@@ -264,6 +264,17 @@ def _harden_bucket(bucket: str, profile: str, tagset: str) -> None:
     # document after hardening and would overwrite it.
 
 
+def harden_bucket(bucket: str, profile: str, tagset: str) -> None:
+    """Public seam for callers outside this module (the backup destination).
+
+    Delegates rather than reimplementing, so an at-rest control added to the single
+    implementation applies to every caller. ``tagset`` is the caller's own marker:
+    a backup bucket must NOT carry the deploy-managed tag, or deploy's teardown and
+    reaper would treat it as their resource.
+    """
+    _harden_bucket(bucket, profile, tagset)
+
+
 def create_private_bucket(bucket: str, region: str, profile: str) -> None:
     """Create a fully private bucket: BPA on, AES256 SSE, ACLs disabled (§3)."""
     create = ["s3api", "create-bucket", "--bucket", bucket, "--region", region]
