@@ -2941,3 +2941,108 @@ class TestPollTerminalTitles:
              patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
             await terminal.poll_terminal_titles(self._app(sess))  # must not raise
         ws.send_str.assert_not_awaited()
+
+
+class TestBootAllowTerminalGate:
+    """``boot.allow_terminal: false`` disables the panel; absence must not.
+
+    Every terminal route gates on ``_is_enabled``, so this one function is the
+    whole enforcement surface. ``api_terminal_list`` already reports
+    ``enabled: false``, which the frontend uses to hide the Terminal entry — so
+    a policy deny degrades to "not offered" rather than a dead black panel.
+
+    Scope, deliberately: this disables the SURFACE. A permitted terminal still
+    spawns an intentionally unsandboxed PTY with no per-command governance.
+    """
+
+    @staticmethod
+    def _ceiling(monkeypatch, allow_terminal):
+        class _Boot:
+            pass
+
+        _Boot.allow_terminal = allow_terminal
+
+        class _Ceiling:
+            boot = _Boot()
+
+        class _Ctx:
+            governance = _Ceiling()
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context", lambda: _Ctx()
+        )
+
+    @staticmethod
+    def _fresh_cache(monkeypatch):
+        """Defeat the 30s memo so each case reads the policy it just set."""
+        terminal._enabled_cache[0] = False
+        terminal._enabled_cache[1] = 0.0
+        monkeypatch.setattr(terminal, "_get_config", lambda request: {})
+
+    def test_policy_false_disables_the_panel(self, monkeypatch):
+        self._fresh_cache(monkeypatch)
+        self._ceiling(monkeypatch, False)
+        assert terminal._is_enabled(MagicMock()) is False
+
+    def test_policy_absent_leaves_the_panel_enabled(self, monkeypatch):
+        """REGRESSION GUARD. The key defaulted False for its whole un-consumed
+        life, so binding that default would remove the terminal from every
+        governed host — including one whose policy never mentions it."""
+        self._fresh_cache(monkeypatch)
+        self._ceiling(monkeypatch, None)
+        assert terminal._is_enabled(MagicMock()) is True
+
+    def test_policy_true_leaves_the_panel_enabled(self, monkeypatch):
+        self._fresh_cache(monkeypatch)
+        self._ceiling(monkeypatch, True)
+        assert terminal._is_enabled(MagicMock()) is True
+
+    def test_ungoverned_host_leaves_the_panel_enabled(self, monkeypatch):
+        self._fresh_cache(monkeypatch)
+
+        class _Ctx:
+            governance = None
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context", lambda: _Ctx()
+        )
+        assert terminal._is_enabled(MagicMock()) is True
+
+    def test_transient_context_error_does_not_take_the_panel_down(self, monkeypatch):
+        """Availability posture: a transient context failure must not disable a
+        feature on an ungoverned host."""
+        self._fresh_cache(monkeypatch)
+
+        def _boom():
+            raise RuntimeError("context not composed yet")
+
+        monkeypatch.setattr("kiro_crew.platform.context.current_context", _boom)
+        assert terminal._is_enabled(MagicMock()) is True
+
+    def test_composition_error_disables_rather_than_failing_open(self, monkeypatch):
+        """A governed host whose overlay never composed must NOT get a terminal.
+
+        ``current_context`` raises ``PlatformCompositionError`` precisely to stop
+        a swallowing caller reintroducing a silent fail-open, and it re-raises on
+        every call rather than caching — so treating it as a transient would hand
+        an open terminal to the one host whose governance is known broken. This
+        is the same posture ``sandbox._governance_require_sandbox`` takes.
+        """
+        self._fresh_cache(monkeypatch)
+        from kiro_crew.platform.context import PlatformCompositionError
+
+        def _uncomposed():
+            raise PlatformCompositionError("non-standalone profile, no context")
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context", _uncomposed
+        )
+        assert terminal._is_enabled(MagicMock()) is False
+
+    def test_config_disable_still_wins_independently(self, monkeypatch):
+        """The config path and the policy path are independent ANDs."""
+        terminal._enabled_cache[0] = False
+        terminal._enabled_cache[1] = 0.0
+        monkeypatch.setattr(terminal, "_get_config", lambda request: {"enabled": False})
+        self._ceiling(monkeypatch, True)
+        assert terminal._is_enabled(MagicMock()) is False

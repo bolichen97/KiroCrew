@@ -1128,10 +1128,40 @@ def register_scope(name: str, spec: ScopeSpec) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class BootControls:
-    """Policy-only boot constraints (not a governed scope; checked at startup)."""
+    """Policy-only boot constraints (not a governed scope; checked at startup).
 
-    require_sandbox: bool = True
-    allow_terminal: bool = False
+    ``require_sandbox`` and ``allow_terminal`` are **tri-state**: ``None`` means
+    the policy did not write the key, and an unwritten key must preserve today's
+    behaviour rather than bind its declared default.
+
+    That distinction is load-bearing, not stylistic.  These keys were parsed but
+    consumed by nothing for their whole life, so their declared defaults were
+    never pressure-tested against a real fleet.  Binding them as declared would
+    have changed behaviour for every existing governed policy: ``allow_terminal``
+    defaulted to ``False``, so consuming it would silently remove the web
+    terminal from every governed host, and ``require_sandbox`` defaulted to
+    ``True``, so consuming it would newly fail-closed every governed host that
+    relies on the ``sandbox_allow_unsandboxed_exec`` escape.  Absence therefore
+    means "no opinion" — the same rule the governed scopes already follow, where
+    a control the policy does not name is ungoverned.
+
+    ``fail_closed`` stays a plain ``bool`` because ``parse_policy`` rejects
+    ``false`` outright: boot already aborts unconditionally, so the only honest
+    values are "declared true" and "not declared".  Every written value must be
+    a real JSON boolean — a quoted ``"false"`` is refused rather than coerced,
+    because ``bool("false")`` is ``True`` and would bind the inverse control.
+
+    ``require_sandbox`` closes the ``sandbox_allow_unsandboxed_exec`` escape and
+    *only* that one — the escape the ordinal floor cannot reach.  It does not
+    clamp ``agent.sandbox: "off"``, which returns unconfined argv before this
+    pin is consulted, so a policy pinning ``require_sandbox`` alone still leaves
+    an agent-writable route to an unsandboxed subprocess.  Pair it with a
+    ``sandbox.min_level`` floor, whose ordinal clamp is what rewrites ``off``
+    upward; the two controls are complementary, not alternatives.
+    """
+
+    require_sandbox: Optional[bool] = None
+    allow_terminal: Optional[bool] = None
     fail_closed: bool = True
 
 
@@ -1528,10 +1558,62 @@ def parse_policy(
     boot_raw = data.get("boot")
     if not isinstance(boot_raw, dict):
         raise PlatformCompositionError("security policy requires a 'boot' object")
+    # ``boot`` was the ONE block that silently ignored unknown keys while every
+    # archetype rejects a typo fail-closed.  Harmless while nothing consumed it;
+    # a silent security hole now that ``require_sandbox`` binds, because
+    # ``{"require_sandbxo": true}`` would read as "no opinion" and the operator
+    # would believe the fail-open escape was forbidden.
+    _reject_unknown_keys(
+        boot_raw, {"require_sandbox", "allow_terminal", "fail_closed"}, "boot"
+    )
+    # Every written boot value must be a real JSON boolean.  ``bool("false")``
+    # is ``True``, so coercing a quoted typo would bind the OPPOSITE of what the
+    # operator wrote, and for ``allow_terminal`` that opposite is fail-OPEN: the
+    # web terminal stays reachable across a fleet whose policy says it is shut,
+    # while ``policy show`` reports ``allow_terminal=True`` and corroborates the
+    # wrong belief.  A quoted value would also dodge the ``fail_closed: false``
+    # refusal below, because ``"false" is False`` is never true.  These keys
+    # bound to nothing before this change, so refusing every non-boolean
+    # (``0``/``1`` and ``null`` included) cannot break a policy that worked.
+    for key in ("require_sandbox", "allow_terminal", "fail_closed"):
+        if key in boot_raw and not isinstance(boot_raw[key], bool):
+            raise PlatformCompositionError(
+                f"boot.{key} must be a JSON boolean (true or false), not "
+                f"{type(boot_raw[key]).__name__}. A quoted \"false\" reads as "
+                "true and would silently invert the control."
+            )
+    # ``fail_closed: false`` is refused rather than honoured.  Boot already
+    # aborts unconditionally on an unreadable policy or a weakening profile
+    # ordinal, so the key cannot relax anything; wiring it would turn it into a
+    # switch that lets a fleet boot ungoverned, which is an anti-feature in a
+    # security ceiling.  Refusing is louder than silently ignoring, and leaves
+    # the door open for a separately-named runtime-polarity control later.
+    if boot_raw.get("fail_closed") is False:
+        raise PlatformCompositionError(
+            "boot.fail_closed cannot be set to false: boot is unconditionally "
+            "fail-closed (an unreadable policy or a profile looser than the "
+            "ceiling aborts startup regardless of this key). Remove the key, or "
+            "set it to true to declare the posture explicitly."
+        )
+    written_require_sandbox = boot_raw.get("require_sandbox")
+    written_allow_terminal = boot_raw.get("allow_terminal")
     boot = BootControls(
-        require_sandbox=bool(boot_raw.get("require_sandbox", True)),
-        allow_terminal=bool(boot_raw.get("allow_terminal", False)),
-        fail_closed=bool(boot_raw.get("fail_closed", True)),
+        # Tri-state: absent means "no opinion", NOT the declared default.  See
+        # BootControls' docstring for why binding the declared defaults would
+        # have changed behaviour for every existing governed policy.  The
+        # ``isinstance`` narrows for the type checker only — the loop above has
+        # already refused every non-boolean, so no written value is dropped.
+        require_sandbox=(
+            written_require_sandbox
+            if isinstance(written_require_sandbox, bool)
+            else None
+        ),
+        allow_terminal=(
+            written_allow_terminal if isinstance(written_allow_terminal, bool) else None
+        ),
+        # Only ``True`` can reach here: ``false`` is refused above and so is
+        # every non-boolean, so an absent key and a declared ``true`` agree.
+        fail_closed=True,
     )
     controls = _parse_controls(data, is_policy=True)
     identity = data.get("identity") or {}

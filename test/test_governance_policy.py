@@ -1554,3 +1554,117 @@ class TestValidateReportsUngovernedCapabilities:
         ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
         out = self._validate(capsys, ceiling)
         assert "UNGOVERNED" not in out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The boot block: tri-state keys, the fail_closed refusal, typo rejection
+# ──────────────────────────────────────────────────────────────────────────
+class TestBootControls:
+    """``boot`` keys bind only when written, and one of them refuses to weaken.
+
+    All three keys were parsed but consumed by nothing for their whole life, so
+    their declared defaults were never pressure-tested. Binding a declared
+    default would have changed behavior for every existing governed policy:
+    ``allow_terminal`` defaulted ``False`` (would delete the web terminal
+    fleet-wide) and ``require_sandbox`` defaulted ``True`` (would newly
+    fail-closed every host relying on the escape). Hence tri-state.
+    """
+
+    def _boot(self, **keys):
+        body = {"version": 1, "boot": keys}
+        return parse_policy(body).boot
+
+    def test_absent_keys_are_none_not_their_declared_defaults(self):
+        """REGRESSION GUARD for the whole design. Absence must be 'no opinion'."""
+        boot = self._boot(fail_closed=True)
+        assert boot.require_sandbox is None
+        assert boot.allow_terminal is None
+
+    def test_written_keys_bind_their_value(self):
+        boot = self._boot(require_sandbox=True, allow_terminal=False)
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+
+    def test_written_false_is_distinguishable_from_absent(self):
+        """``False`` and ``None`` must not collapse — one binds, one does not."""
+        assert self._boot(require_sandbox=False).require_sandbox is False
+        assert self._boot().require_sandbox is None
+
+    def test_empty_boot_object_is_valid_and_opinion_free(self):
+        boot = self._boot()
+        assert (boot.require_sandbox, boot.allow_terminal) == (None, None)
+        assert boot.fail_closed is True
+
+    def test_fail_closed_false_is_refused(self):
+        """Boot aborts unconditionally, so ``false`` could only mislead.
+
+        Wiring it would turn it into a switch that lets a fleet boot ungoverned.
+        Refusing is louder than silently ignoring.
+        """
+        with pytest.raises(PlatformCompositionError) as exc:
+            self._boot(fail_closed=False)
+        assert "cannot be set to false" in str(exc.value)
+        assert "unconditionally" in str(exc.value)
+
+    def test_fail_closed_true_and_absent_both_resolve_true(self):
+        assert self._boot(fail_closed=True).fail_closed is True
+        assert self._boot().fail_closed is True
+
+    def test_stringy_boolean_is_refused_not_coerced(self):
+        """``bool("false")`` is ``True``, so coercion would invert the control.
+
+        The fail-open case is ``allow_terminal: "false"``: an operator who quotes
+        the value means to close the web terminal, and coercing it would leave
+        the terminal open while ``policy show`` reported it closed — the policy
+        and the running fleet would disagree with nothing to flag it.
+        """
+        for key in ("require_sandbox", "allow_terminal", "fail_closed"):
+            with pytest.raises(PlatformCompositionError) as excinfo:
+                self._boot(**{key: "false"})
+            assert f"boot.{key}" in str(excinfo.value)
+            assert "JSON boolean" in str(excinfo.value)
+
+    def test_stringy_fail_closed_cannot_dodge_the_false_refusal(self):
+        """``"false" is False`` is never true, so a quoted typo would slip past.
+
+        Without the type check, ``fail_closed: "false"`` is accepted silently
+        while a real ``false`` is refused loudly — the guard would be dodgeable
+        by exactly the mistake it exists to catch.
+        """
+        with pytest.raises(PlatformCompositionError) as excinfo:
+            self._boot(fail_closed="false")
+        assert "JSON boolean" in str(excinfo.value)
+
+    def test_integer_boolean_lookalikes_are_refused(self):
+        """``0``/``1`` are refused too: these keys bound to nothing before now,
+        so no working policy can have relied on the JSON-ish spelling."""
+        for value in (0, 1):
+            with pytest.raises(PlatformCompositionError):
+                self._boot(require_sandbox=value)
+
+    def test_explicit_null_is_refused_rather_than_read_as_absent(self):
+        """A written ``null`` is ambiguous — refuse it instead of guessing."""
+        with pytest.raises(PlatformCompositionError):
+            self._boot(allow_terminal=None)
+
+    def test_real_booleans_still_bind_after_the_type_check(self):
+        """The check must refuse look-alikes without narrowing the real values."""
+        assert self._boot(require_sandbox=True).require_sandbox is True
+        assert self._boot(allow_terminal=False).allow_terminal is False
+        assert self._boot(fail_closed=True).fail_closed is True
+
+    def test_unknown_boot_key_is_rejected(self):
+        """``boot`` was the ONE block that silently ignored typos.
+
+        Harmless while nothing consumed it; a silent security hole once
+        ``require_sandbox`` binds, because the misspelling reads as "no opinion"
+        while the author believes the escape is forbidden.
+        """
+        with pytest.raises(PlatformCompositionError) as exc:
+            self._boot(require_sandbxo=True)
+        assert "require_sandbxo" in str(exc.value)
+
+    def test_boot_object_is_still_required(self):
+        with pytest.raises(PlatformCompositionError) as exc:
+            parse_policy({"version": 1})
+        assert "requires a 'boot' object" in str(exc.value)

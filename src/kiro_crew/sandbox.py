@@ -2747,6 +2747,42 @@ def reset_backend() -> None:
 _SANDBOX_MODE_ALIASES = {"auto": "standard"}
 
 
+def _governance_require_sandbox() -> bool:
+    """Read the governed ``boot.require_sandbox`` pin, or ``False`` when unset.
+
+    This closes a hole that ``sandbox.min_level`` structurally cannot: the floor
+    clamps the *mode*, and it gates the ``mode == "off"`` and first-party
+    escapes, but ``_allow_unsandboxed_exec`` is a separate boolean the floor
+    never feeds into.  So on a host with no sandbox backend, a policy pinning
+    ``sandbox.min_level: strict`` could still be defeated by setting
+    ``agent.sandbox_allow_unsandboxed_exec`` — and that flag lives in
+    ``config.json``, which is NOT on the sensitive-path floor, so the agent can
+    write it directly.  ``boot.require_sandbox`` is the un-weakenable
+    counterpart, mirroring how ``channels.posture`` is the policy-only
+    counterpart to the ``slack.allowed_enterprise_ids`` config knob.
+
+    Absence means ``False`` ("no opinion") rather than the declared default —
+    binding an unwritten key would newly fail-closed every governed host that
+    relies on the escape.  See ``BootControls``.
+
+    Error posture matches :func:`_governance_sandbox_floor`: a
+    ``PlatformCompositionError`` (a host that should be governed but could not
+    compose) propagates rather than silently downgrading the guarantee; any
+    other transient error reads as "unpinned".
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    try:
+        from kiro_crew.platform.context import current_context
+
+        boot = getattr(getattr(current_context(), "governance", None), "boot", None)
+        return getattr(boot, "require_sandbox", None) is True
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        return False
+
+
 def _governance_sandbox_floor() -> str | None:
     """Read the governed ``sandbox.min_level`` floor, or ``None`` when ungoverned.
 
@@ -2872,6 +2908,10 @@ def wrap_argv(
     # the carve-out condition can never disagree about the same host.
     governance_floor = _governance_sandbox_floor()
     mode = _clamp_sandbox_mode_to_floor(mode, governance_floor)
+    # Read the ``boot.require_sandbox`` pin on the same ONE-read discipline: it
+    # is consulted by the no-backend gate AND the first-party carve-out below,
+    # and the two must never disagree about whether this host is pinned.
+    require_sandbox = _governance_require_sandbox()
 
     if mode == "off":
         # Fix #2: verify kiro-cli delegation before honoring "off". The
@@ -3147,7 +3187,15 @@ def wrap_argv(
         # This addresses a penetration-test finding — the previous behavior silently
         # returned unmodified argv, allowing the agent subprocess to access all
         # credential paths without any OS-level isolation.
-        if not _allow_unsandboxed_exec():
+        #
+        # ``require_sandbox`` (policy) OVERRIDES the operator opt-in, because the
+        # opt-in lives in ``config.json`` — off the sensitive-path floor, so the
+        # agent can write it — while the policy lives in the trust root the agent
+        # can neither read nor write.  Without this term a pinned
+        # ``sandbox.min_level`` was defeatable by one config flag on any
+        # backend-less host (the floor clamps ``mode`` and gates the other two
+        # escapes, but never feeds into ``_allow_unsandboxed_exec``).
+        if require_sandbox or not _allow_unsandboxed_exec():
             # ONE read of the pair: a concurrent re-probe swaps the whole tuple,
             # so failure and remedy can never come from different probes.
             transient, probe_reason, probe_remedy = _last_unshare_failure or (
@@ -3165,15 +3213,17 @@ def wrap_argv(
             #     failure still raises (it self-heals on the next spawn and must
             #     not buy a bypass) and ``foreign_sandbox`` still raises (the
             #     host's sandbox is fine; the remedy is config, not bypass);
-            #   * no governance ``sandbox.min_level`` floor is active — reuses
-            #     the ONE floor read taken at the top of this call (the same
-            #     value the clamp used), so no second profile walk runs and the
-            #     two checks cannot disagree; a governed host keeps fail-closing
+            #   * no governance ``sandbox.min_level`` floor is active and
+            #     ``boot.require_sandbox`` is not pinned — reuses the ONE read of
+            #     each taken at the top of this call (the same values the clamp
+            #     and the gate used), so no second profile walk runs and the
+            #     checks cannot disagree; a governed host keeps fail-closing
             #     for first-party spawns too.
             if (
                 first_party_fixed_argv
                 and _classify_unavailable(transient) == "no_backend"
                 and not governance_floor
+                and not require_sandbox
             ):
                 return _first_party_no_backend_passthrough(
                     argv, sandbox_level, strip_python_env
@@ -3264,8 +3314,14 @@ def wrap_argv(
             except Exception:
                 logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
             raise SandboxUnavailableError(
-                "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
-                "No OS-level sandbox backend is available on this host, and the "
+                (
+                    "Sandbox backend unavailable and your organization's security "
+                    "policy pins boot.require_sandbox, which forbids the "
+                    "allow_unsandboxed_exec opt-out. "
+                    if require_sandbox
+                    else "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
+                )
+                + "No OS-level sandbox backend is available on this host, and the "
                 "agent subprocess cannot be safely isolated. "
                 f"Probe detail: {probe_reason}. " + guidance,
                 kind=_classify_unavailable(transient),

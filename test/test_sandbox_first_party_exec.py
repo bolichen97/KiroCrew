@@ -18,6 +18,10 @@ Matrix pinned here:
   config, not bypass);
 * governance ``sandbox.min_level`` floor + flag -> raises (the carve-out must
   not duck the floor);
+* governance ``boot.require_sandbox`` pin + flag -> raises, and it OVERRIDES the
+  ``sandbox_allow_unsandboxed_exec`` opt-in (the floor structurally cannot: it
+  clamps ``mode`` and gates the other two escapes, but never feeds into
+  ``_allow_unsandboxed_exec``, and the opt-in lives in an agent-writable file);
 * ``sandbox_allow_unsandboxed_exec=true``       -> identical with or without
   the flag (the opt-in remains a strict superset);
 * backend available + flag       -> normal sandbox wrap (flag is inert).
@@ -240,3 +244,112 @@ class TestChokepointThreading:
         assert seen["flag"] is True
         sandbox_mod.sandboxed_spawn_argv(_ARGV)
         assert seen["flag"] is False
+
+
+class TestBootRequireSandboxOverridesTheOptIn:
+    """``boot.require_sandbox`` closes the one escape the ordinal floor cannot.
+
+    ``sandbox.min_level`` blocks the ``mode="off"`` escape (the clamp rewrites
+    the mode) and the first-party carve-out (its condition reads the floor). It
+    is structurally blind to the third: ``_allow_unsandboxed_exec`` is a separate
+    boolean the floor never feeds into, so on a backend-less host a pinned floor
+    was defeatable by ``agent.sandbox_allow_unsandboxed_exec`` — and that flag
+    lives in ``config.json``, which is NOT on the sensitive-path floor, so the
+    agent can write it. ``boot.require_sandbox`` is the un-weakenable
+    counterpart, so these tests pin the OVERRIDE, not merely the deny.
+    """
+
+    @staticmethod
+    def _pin(monkeypatch, value):
+        """Stub the composed ceiling's ``boot.require_sandbox`` to *value*."""
+
+        class _Boot:
+            require_sandbox = value
+
+        class _Ceiling:
+            boot = _Boot()
+
+        class _Ctx:
+            governance = _Ceiling()
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context", lambda: _Ctx()
+        )
+
+    def test_pin_raises_even_though_the_opt_in_is_set(self, monkeypatch):
+        """The load-bearing case: opt-in ON, no backend, pin ON -> still raises.
+
+        Without the pin this exact configuration returns unconfined argv, which
+        is the hole. ``detect_backend`` is forced to "none" and the opt-in to
+        True so the only thing standing between the agent and an unconfined
+        subprocess is the policy.
+        """
+        monkeypatch.setattr(sandbox_mod, "detect_backend", lambda config_mode="auto": "none")
+        monkeypatch.setattr(sandbox_mod, "_allow_unsandboxed_exec", lambda: True)
+        self._pin(monkeypatch, True)
+        with patch("kiro_crew.sel.sel", return_value=MagicMock()):
+            with pytest.raises(SandboxUnavailableError) as exc:
+                wrap_argv(_ARGV, mode="standard")
+        # The message must name the policy, not the missing opt-in — the opt-in
+        # IS set, so the old wording would send the operator down a dead end.
+        assert "boot.require_sandbox" in str(exc.value)
+
+    def test_without_the_pin_the_opt_in_still_works(self, monkeypatch):
+        """REGRESSION GUARD. An unpinned policy must not change today's behavior.
+
+        This is the case that would break every governed host if an unwritten
+        ``require_sandbox`` bound its declared default of ``True``.
+        """
+        monkeypatch.setattr(sandbox_mod, "detect_backend", lambda config_mode="auto": "none")
+        monkeypatch.setattr(sandbox_mod, "_allow_unsandboxed_exec", lambda: True)
+        self._pin(monkeypatch, None)  # key absent from the policy
+        with patch("kiro_crew.sel.sel", return_value=MagicMock()):
+            wrapped, cleanup = wrap_argv(_ARGV, mode="standard")
+        assert wrapped == _ARGV
+        assert cleanup is None
+
+    def test_explicit_false_also_leaves_the_opt_in_working(self, monkeypatch):
+        monkeypatch.setattr(sandbox_mod, "detect_backend", lambda config_mode="auto": "none")
+        monkeypatch.setattr(sandbox_mod, "_allow_unsandboxed_exec", lambda: True)
+        self._pin(monkeypatch, False)
+        with patch("kiro_crew.sel.sel", return_value=MagicMock()):
+            wrapped, _ = wrap_argv(_ARGV, mode="standard")
+        assert wrapped == _ARGV
+
+    def test_pin_also_closes_the_first_party_carve_out(self, monkeypatch):
+        """The carve-out reads the pin on the same one-read discipline as the floor."""
+        monkeypatch.setattr(sandbox_mod, "detect_backend", lambda config_mode="auto": "none")
+        monkeypatch.setattr(sandbox_mod, "_allow_unsandboxed_exec", lambda: False)
+        self._pin(monkeypatch, True)
+        with patch("kiro_crew.sel.sel", return_value=MagicMock()):
+            with pytest.raises(SandboxUnavailableError):
+                wrap_argv(_ARGV, mode="standard", first_party_fixed_argv=True)
+
+    def test_ungoverned_host_reads_as_unpinned(self, monkeypatch):
+        """No ceiling at all (standalone) must behave exactly as before."""
+        monkeypatch.setattr(sandbox_mod, "detect_backend", lambda config_mode="auto": "none")
+        monkeypatch.setattr(sandbox_mod, "_allow_unsandboxed_exec", lambda: True)
+
+        class _Ctx:
+            governance = None
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.context.current_context", lambda: _Ctx()
+        )
+        with patch("kiro_crew.sel.sel", return_value=MagicMock()):
+            wrapped, _ = wrap_argv(_ARGV, mode="standard")
+        assert wrapped == _ARGV
+
+    def test_backend_available_makes_the_pin_inert(self, monkeypatch):
+        """The pin only governs the no-backend branch; a real sandbox still wraps."""
+        monkeypatch.setattr(
+            sandbox_mod, "detect_backend", lambda config_mode="auto": "sandbox-exec"
+        )
+        monkeypatch.setattr(sandbox_mod, "_allow_unsandboxed_exec", lambda: True)
+        self._pin(monkeypatch, True)
+        monkeypatch.setattr(
+            sandbox_mod, "sandbox_exec_argv", lambda *a, **k: (["/usr/bin/sandbox-exec"], None)
+        )
+        with patch("kiro_crew.sel.sel", return_value=MagicMock()):
+            wrapped, _ = wrap_argv(_ARGV, mode="standard")
+        assert wrapped == ["/usr/bin/sandbox-exec"]

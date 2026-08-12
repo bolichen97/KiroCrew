@@ -1194,9 +1194,17 @@ def _policy(args: argparse.Namespace) -> None:
         # can tell an established issuer from a decorative one.
         print(f"🛡️  Security policy v{ceiling.version}")
         print(f"   provenance: {ceiling.signature_summary()}")
+        # Distinguish "the policy wrote this" from "the policy left it alone":
+        # an unwritten boot key binds nothing, so printing its declared default
+        # would report a control that is not in force.
+
+        def _boot_state(value: object) -> str:
+            return "unset" if value is None else str(value)
+
         print(
-            f"   boot: require_sandbox={ceiling.boot.require_sandbox} "
-            f"allow_terminal={ceiling.boot.allow_terminal} fail_closed={ceiling.boot.fail_closed}"
+            f"   boot: require_sandbox={_boot_state(ceiling.boot.require_sandbox)} "
+            f"allow_terminal={_boot_state(ceiling.boot.allow_terminal)} "
+            f"fail_closed={ceiling.boot.fail_closed} (always enforced)"
         )
         if not ceiling.controls:
             print("   (no governed scopes)")

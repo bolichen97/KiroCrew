@@ -136,15 +136,62 @@ def _get_config(request: web.Request) -> dict:
         return {}
 
 
+def _governance_allows_terminal() -> bool:
+    """Read the governed ``boot.allow_terminal`` pin.
+
+    ``True`` unless a policy explicitly wrote ``allow_terminal: false``.  An
+    unwritten key is "no opinion" and must not disable the panel — the key
+    declared ``False`` as its default for its whole un-consumed life, so binding
+    that default would silently remove the terminal from every governed host
+    (see ``BootControls``).
+
+    Scope, stated honestly: this disables the SURFACE. It does not govern the
+    PTY — a permitted terminal still spawns an intentionally unsandboxed shell
+    with no per-command governance call.
+
+    Error posture is split, mirroring :func:`sandbox._governance_require_sandbox`.
+    A ``PlatformCompositionError`` means the host resolves to a governed edition
+    but no context was installed, so the policy overlay is absent — exactly the
+    state ``current_context`` raises on to stop "a future swallowing caller"
+    reintroducing a silent fail-open, and it re-raises on EVERY call rather than
+    caching, so it is not transient.  Returning ``True`` there would hand the
+    fleet an open terminal on the one host whose governance is known broken, so
+    it returns ``False``: the surface is not offered, and ``api_terminal_list``
+    reports ``enabled: false`` so the panel degrades instead of erroring.  Any
+    OTHER exception is a genuine transient on a host that never claimed to be
+    governed, and keeps the availability posture of the config read below.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    try:
+        from kiro_crew.platform.context import current_context
+
+        boot = getattr(getattr(current_context(), "governance", None), "boot", None)
+        return getattr(boot, "allow_terminal", None) is not False
+    except PlatformCompositionError:
+        return False
+    except Exception:
+        # Availability posture matches the config read below: a transient
+        # context error must not take the panel down on an ungoverned host.
+        return True
+
+
 def _is_enabled(request: web.Request) -> bool:
     """Terminal panel is enabled by default. Disable via config.json:
     {"dashboard": {"terminal": {"enabled": false}}}
+    ...or fleet-wide via an enterprise policy pinning ``boot.allow_terminal:
+    false``, which the running app cannot re-enable.
     Cached for 30s to avoid disk I/O per request.
+
+    Every terminal route gates on this one function, so a deny here disables the
+    whole feature — and ``api_terminal_list`` already reports ``enabled: false``,
+    which the frontend uses to hide the Terminal entry entirely rather than
+    leaving a dead panel.
     """
     now = time.monotonic()
     if now - _enabled_cache[1] < 30:
         return _enabled_cache[0]
-    result = bool(_get_config(request).get("enabled", True))
+    result = bool(_get_config(request).get("enabled", True)) and _governance_allows_terminal()
     _enabled_cache[0] = result
     _enabled_cache[1] = now
     return result
