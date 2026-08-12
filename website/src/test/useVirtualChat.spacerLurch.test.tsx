@@ -324,9 +324,13 @@ describe('useVirtualChat: streamingIndex fix — the named row tracks live inste
     const nonStreamingNode = document.createElement('div')
     Object.defineProperty(nonStreamingNode, 'offsetHeight', { configurable: true, get: () => 100 })
     act(() => { view.result.current.measureRef(0)(nonStreamingNode) }) // pre-existing measured seed
-    // Resize a HISTORY row (index 0, not the streamingIndex = 20).
+    // Resize a HISTORY row (index 0, not the streamingIndex = 20). Selected by
+    // IDENTITY, not by position in the observed set: the set also contains the
+    // scroller element itself (the hook observes it to catch viewport-height
+    // changes), and in this harness the rows register after the observer is
+    // created, so the scroller can be first.
     const ro = FakeResizeObserver.instances[FakeResizeObserver.instances.length - 1]
-    const historyNode = [...ro.observed][0] as HTMLElement
+    const historyNode = nonStreamingNode
     Object.defineProperty(historyNode, 'offsetHeight', { configurable: true, get: () => 150 })
     act(() => { ro.fire([{ target: historyNode }]) })
     // Still within the debounce window — must NOT have committed yet.
