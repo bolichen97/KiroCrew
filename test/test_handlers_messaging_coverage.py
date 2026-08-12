@@ -1363,6 +1363,37 @@ class TestBrowserConfig:
         payload = _payload(resp)
         assert payload["sessions_reset"] == 0
 
+    def test_save_triggers_agent_config_rebuild(self, monkeypatch, tmp_path: Path) -> None:
+        # The toggle only rewrites kiro's mcp.json; rebuild_agent_config is the
+        # single lock-protected writer that reconciles @playwright-mcp into the
+        # owned agent config, so the save must trigger it (before the reset).
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        monkeypatch.setattr(mod, "register_playwright_proxy", lambda: (None, "registered"))
+        import kiro_crew.agent as agent_mod
+
+        calls: list[int] = []
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config", lambda *a, **k: calls.append(1))
+        resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": True, "extension_mode": False}))
+        assert _payload(resp)["ok"] is True
+        assert calls == [1]
+
+    def test_save_survives_rebuild_failure(self, monkeypatch, tmp_path: Path) -> None:
+        # Best-effort: the preferences already landed, so a rebuild failure is
+        # logged, not raised — the save still returns 200 (never a 500).
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        monkeypatch.setattr(mod, "register_playwright_proxy", lambda: (None, "registered"))
+        import kiro_crew.agent as agent_mod
+
+        def _boom(*a: Any, **k: Any) -> None:
+            raise RuntimeError("rebuild failed")
+
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config", _boom)
+        resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": True, "extension_mode": False}))
+        assert resp.status == 200
+        assert _payload(resp)["ok"] is True
+
 
 # ── small helpers ──
 

@@ -19,6 +19,9 @@ test/test_acp_provider.py::TestStartKiroRuntimeResume::test_resume_loads_full_tr
 test/test_acp_runtime.py::test_periodic_sweep_skips_protected_runtime_pid
 test/test_agent.py::TestAtomicJsonWrite::test_new_file_gets_0o644
 test/test_agent.py::TestAtomicJsonWrite::test_preserves_existing_permissions
+test/test_agent.py::TestAtomicJsonWrite::test_env_bearing_spec_forced_to_0o600
+test/test_agent.py::TestAtomicJsonWrite::test_env_bearing_tightens_loose_existing_perms
+test/test_agent.py::TestBrowserModeReconcileOnRebuild::test_rebuilt_config_with_token_bearing_proxy_is_0600
 test/test_agent.py::TestKiroHooksAutoimport::test_kiro_hooks_autoimport_honors_custom_dir
 test/test_agent.py::TestKiroHooksAutoimport::test_kiro_hooks_autoimport_non_executable_emits_sel_audit
 test/test_agent.py::TestKiroHooksAutoimport::test_kiro_hooks_autoimport_skips_non_executable

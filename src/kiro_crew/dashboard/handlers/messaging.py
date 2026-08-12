@@ -2478,6 +2478,29 @@ async def _browser_config_finalize(
         ),
     )
 
+    # The single lock-protected writer of the owned agent configs is
+    # ``rebuild_agent_config`` (it runs ``reconcile_playwright_in_config`` to make
+    # Browser Mode the source of truth for ``@playwright-mcp``). The Settings
+    # toggle only rewrote kiro's mcp.json above, so trigger a rebuild here — before
+    # the session reset below — so the regenerated agent config reflects the new
+    # mode and the reset serves the correct tool surface. Best-effort: the
+    # preferences already landed, so a rebuild failure is logged, not raised (a
+    # 500 would wrongly tell the user nothing was saved). Mirrors mcp_custom.py.
+    try:
+        # circular import: kiro_crew.agent imports dashboard handlers.
+        from kiro_crew.agent import rebuild_agent_config
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        # Hold the shared config-writer lock ACROSS the rebuild so a concurrent
+        # locked config mutation (e.g. an MCP toggle persisting under the same
+        # lock) cannot straddle this read-modify-write and be lost. Bounded
+        # critical section; rebuild_agent_config does not re-acquire this lock,
+        # so there is no re-entrancy/deadlock.
+        async with _get_config_lock():
+            await asyncio.to_thread(rebuild_agent_config)
+    except Exception:
+        logger.warning("browser config saved, but agent-config rebuild failed", exc_info=True)
+
     # Flipping the enable changes the agent's tool surface (register mounts the
     # browser_* tools, deregister removes them), and kiro-cli caches ``tools/list``
     # for the LIFETIME of a session — ACP has no ``tools/list_changed`` push. Reset

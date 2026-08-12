@@ -48,7 +48,11 @@ from kiro_crew.agent_files import (
     REQUIRED_KIRO_AGENT_FILES,
 )
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
-from kiro_crew.browser.setup import converge_playwright_servers
+from kiro_crew.browser.setup import (
+    browser_mode_enabled,
+    converge_playwright_servers,
+    reconcile_playwright_in_config,
+)
 from kiro_crew.config import config_dir
 from kiro_crew.config import config_path as _mc_config_path
 from kiro_crew.config.paths import (
@@ -77,6 +81,17 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
 logger = logging.getLogger(__name__)
 
 
+def _config_has_server_env(data: dict) -> bool:
+    """True when ``data`` carries any MCP server spec with a non-empty ``env``
+    block — i.e. token/credential material (e.g. a Playwright proxy spec) that
+    must stay owner-only on disk rather than inherit a world-readable default.
+    """
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return False
+    return any(isinstance(spec, dict) and spec.get("env") for spec in servers.values())
+
+
 def _atomic_json_write(path: Path, data: dict) -> None:
     """Write JSON atomically via tmp+rename to prevent read-of-partial-file.
 
@@ -95,6 +110,14 @@ def _atomic_json_write(path: Path, data: dict) -> None:
                 mode = stat.S_IMODE(path.stat().st_mode)
             except FileNotFoundError:
                 mode = 0o644
+            # Security: an agent config that carries an MCP server ``env`` block
+            # (e.g. the token-bearing Playwright proxy spec) must never be group/
+            # other-readable. The default umask perms above (commonly 0644), or a
+            # looser mode carried over from an existing file, would expose those
+            # secrets to other local users — so force owner-only 0600 whenever the
+            # emitted config holds any env-bearing server spec.
+            if _config_has_server_env(data):
+                mode = 0o600
             platform_compat.fchmod_safe(f.fileno(), mode)
             json.dump(data, f, indent=2)
             f.write("\n")
@@ -2515,6 +2538,30 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     # slash-containing keys), so this launch-target-keyed pass closes the
     # duplicate for them.
     converge_playwright_servers(config)
+
+    # Browser Mode is the SINGLE SOURCE OF TRUTH for the Playwright proxy on the
+    # primary agent, enforced on EVERY rebuild (not just a Settings toggle):
+    #   * Mode ON  + proxy registered -> ensure ``@playwright-mcp`` is mounted in
+    #     ``tools`` (an existing resolved spec is left as-is; tools-only, so the
+    #     PreToolUse gate governs approval — matching the shared-server sync
+    #     below);
+    #   * Mode OFF -> scrub the proxy server + its ``@`` refs so a stale ON-era
+    #     entry carried over from an existing config can never regress into a
+    #     mounted ``browser_*`` tool set ("off means off").
+    # The shared-server sync below independently mounts a registered proxy while
+    # Mode is on; this call is what makes the OFF direction and the ON invariant
+    # hold regardless of whether the proxy happens to be in the shared scopes.
+    if reconcile_playwright_in_config(config):
+        sel().log_api_access(
+            caller="system",
+            operation=("mcp_tools_added" if browser_mode_enabled() else "mcp_tools_removed"),
+            outcome="ok",
+            source="install_agent",
+            resources=(
+                f"@playwright-mcp browser-mode reconcile "
+                f"(browser_mode_enabled={browser_mode_enabled()})"
+            ),
+        )
 
     # Sync shared (user-installed) servers to tools/allowedTools.
     # These are explicitly installed by the user via `aim mcp install` or

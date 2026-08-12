@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import unittest.mock
 from contextlib import ExitStack
@@ -475,6 +476,40 @@ class TestAtomicJsonWrite:
 
         assert stat.S_IMODE(target.stat().st_mode) == 0o644
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
+
+    def test_env_bearing_spec_forced_to_0o600(self, tmp_path: Path):
+        # Security (GPT finding): a config carrying an MCP server ``env`` block
+        # (token/credential material) must be written owner-only, not the 0644
+        # umask default a new file would otherwise get.
+        from kiro_crew.agent import _atomic_json_write
+
+        target = tmp_path / "with_env.json"
+        _atomic_json_write(
+            target,
+            {"mcpServers": {"playwright-mcp": {"command": "x", "env": {"TOKEN": "secret"}}}},
+        )
+
+        import stat
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    def test_env_bearing_tightens_loose_existing_perms(self, tmp_path: Path):
+        # Even an existing world-readable file (e.g. a 0644 kirocrew.json) is
+        # tightened to 0600 once it carries an env-bearing spec — the preserve
+        # path must not keep secrets group/other-readable.
+        from kiro_crew.agent import _atomic_json_write
+
+        target = tmp_path / "loose.json"
+        target.write_text("{}")
+        target.chmod(0o644)
+        _atomic_json_write(
+            target,
+            {"mcpServers": {"srv": {"command": "x", "env": {"TOKEN": "secret"}}}},
+        )
+
+        import stat
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
     def test_no_temp_file_left_on_success(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
@@ -4375,3 +4410,82 @@ def test_ensure_agent_materialized_swallows_errors(tmp_path, monkeypatch):
 
     managed = Path(agent_mod.AGENT_FILENAME).stem
     assert agent_mod.ensure_agent_materialized(managed) is False
+
+
+class TestBrowserModeReconcileOnRebuild:
+    """rebuild_agent_config makes browser_mode_enabled() the single source of
+    truth for the Playwright proxy on the primary agent."""
+
+    _PROXY = {"command": "/usr/bin/kirocrew", "args": ["mcp-playwright-proxy", "--config", "x"]}
+
+    def test_mode_on_mounts_playwright_ref(self, tmp_path: Path):
+        cfg_dir = _bundled_defaults(tmp_path)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("kiro_crew.browser.setup.browser_mode_enabled", return_value=True)
+            )
+            stack.enter_context(patch("kiro_crew.agent.browser_mode_enabled", return_value=True))
+            stack.enter_context(
+                patch(
+                    "kiro_crew.browser.setup._registered_playwright_spec",
+                    return_value=dict(self._PROXY),
+                )
+            )
+            path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert "playwright-mcp" in config["mcpServers"]
+        assert "@playwright-mcp" in config["tools"]
+        # tools-only mount — never auto-approved.
+        assert "@playwright-mcp" not in config.get("allowedTools", [])
+
+    def test_mode_off_scrubs_carried_over_proxy(self, tmp_path: Path):
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        # Existing config carries a stale ON-era proxy + its refs.
+        existing = {
+            "model": "claude-user-custom",
+            "tools": ["@playwright-mcp", "ReadFile"],
+            "allowedTools": ["@playwright-mcp"],
+            "mcpServers": {"playwright-mcp": dict(self._PROXY)},
+            "toolsSettings": {"execute_bash": {"deniedCommands": []}},
+            "hooks": {},
+        }
+        (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("kiro_crew.browser.setup.browser_mode_enabled", return_value=False)
+            )
+            stack.enter_context(patch("kiro_crew.agent.browser_mode_enabled", return_value=False))
+            path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert "playwright-mcp" not in config["mcpServers"]
+        assert "@playwright-mcp" not in config["tools"]
+        assert "@playwright-mcp" not in config.get("allowedTools", [])
+
+    def test_rebuilt_config_with_token_bearing_proxy_is_0600(self, tmp_path: Path):
+        # End-to-end: with Browser Mode ON the reconcile mounts the registered
+        # proxy spec into the primary agent config; when that spec carries an
+        # ``env`` token block the written file must be owner-only 0600 (GPT
+        # finding: a token-bearing spec must never land in a 0644 file).
+        cfg_dir = _bundled_defaults(tmp_path)
+        proxy_with_env = {
+            "command": "/usr/bin/kirocrew",
+            "args": ["mcp-playwright-proxy", "--config", "x"],
+            "env": {"PLAYWRIGHT_PROXY_TOKEN": "secret-token-value"},
+        }
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("kiro_crew.browser.setup.browser_mode_enabled", return_value=True)
+            )
+            stack.enter_context(patch("kiro_crew.agent.browser_mode_enabled", return_value=True))
+            stack.enter_context(
+                patch(
+                    "kiro_crew.browser.setup._registered_playwright_spec",
+                    return_value=dict(proxy_with_env),
+                )
+            )
+            path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert config["mcpServers"]["playwright-mcp"].get("env")  # env survived the write
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600

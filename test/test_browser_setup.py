@@ -2130,3 +2130,142 @@ class TestConvergeForensics:
 
         assert agent_mod.AGENT_FILENAME == agent_files.AGENT_FILENAME
         assert agent_mod.AGENT_FILENAME in agent_files.OWNED_KIRO_AGENT_FILES
+
+
+# ── TestAddPlaywrightServers ─────────────────────────────────────────────────
+
+
+_PROXY = {"command": "kirocrew", "args": ["mcp-playwright-proxy", "--config", "x"]}
+
+
+class TestAddPlaywrightServers:
+    """ON-side counterpart of remove_playwright_servers: mount the canonical
+    proxy + its @playwright-mcp tools ref when Browser Mode is on and the proxy
+    is registered. Symmetric security property to the OFF scrub."""
+
+    def test_mounts_server_and_tools_ref_when_registered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        _write_mcp_json(tmp_path, {_CANONICAL: dict(_PROXY)})
+        cfg: dict = {"mcpServers": {}, "tools": ["@other"], "allowedTools": []}
+        assert setup_mod.add_playwright_servers(cfg) is True
+        assert setup_mod._spec_is_proxy(cfg["mcpServers"][_CANONICAL])
+        assert f"@{_CANONICAL}" in cfg["tools"]
+        # tools-only mount: never auto-approved (PreToolUse gate governs it).
+        assert f"@{_CANONICAL}" not in cfg["allowedTools"]
+
+    def test_noop_when_mode_off(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # "off means off": even with a registered proxy, add mounts nothing.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: False)
+        _write_mcp_json(tmp_path, {_CANONICAL: dict(_PROXY)})
+        cfg: dict = {"mcpServers": {}, "tools": []}
+        assert setup_mod.add_playwright_servers(cfg) is False
+        assert _CANONICAL not in cfg["mcpServers"]
+        assert cfg["tools"] == []
+
+    def test_noop_when_proxy_not_registered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Mode on but the proxy is not registered/resolvable in kiro's mcp.json
+        # → nothing to mount (the invariant is mode-on AND registered).
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        _write_mcp_json(tmp_path, {"some-user-mcp": {"command": "foo"}})
+        cfg: dict = {"mcpServers": {}, "tools": []}
+        assert setup_mod.add_playwright_servers(cfg) is False
+        assert _CANONICAL not in cfg["mcpServers"]
+
+    def test_existing_proxy_spec_not_clobbered_only_ref_ensured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A rebuild-resolved proxy spec (absolute command) must survive: add only
+        # ensures the @ref, never overwrites the present spec back to mcp.json's.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        _write_mcp_json(tmp_path, {_CANONICAL: dict(_PROXY)})
+        resolved = {"command": "/abs/kirocrew", "args": ["mcp-playwright-proxy", "--config", "x"]}
+        cfg: dict = {"mcpServers": {_CANONICAL: dict(resolved)}, "tools": []}
+        assert setup_mod.add_playwright_servers(cfg) is True
+        assert cfg["mcpServers"][_CANONICAL] == resolved  # untouched
+        assert cfg["tools"] == [f"@{_CANONICAL}"]
+        # Idempotent: a second pass with the ref already present is a no-op.
+        assert setup_mod.add_playwright_servers(cfg) is False
+
+    def test_user_direct_server_under_canonical_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        _write_mcp_json(tmp_path, {_CANONICAL: dict(_PROXY)})
+        direct = {"command": "npx", "args": ["@playwright/mcp@latest"]}
+        cfg: dict = {"mcpServers": {_CANONICAL: dict(direct)}, "tools": []}
+        assert setup_mod.add_playwright_servers(cfg) is False
+        assert cfg["mcpServers"][_CANONICAL] == direct
+        assert cfg["tools"] == []
+
+
+class TestReconcilePlaywrightInConfig:
+    """browser_mode_enabled() is the single source of truth: ON → add, OFF →
+    remove (scrub)."""
+
+    def test_on_mounts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: True)
+        _write_mcp_json(tmp_path, {_CANONICAL: dict(_PROXY)})
+        cfg: dict = {"mcpServers": {}, "tools": []}
+        assert setup_mod.reconcile_playwright_in_config(cfg) is True
+        assert f"@{_CANONICAL}" in cfg["tools"]
+
+    def test_off_scrubs_stale_entry(self, monkeypatch: pytest.MonkeyPatch):
+        # A stale ON-era proxy carried over in an existing config must be scrubbed
+        # when Mode is off — a rebuild can never regress "off" into mounted tools.
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: False)
+        cfg: dict = {
+            "mcpServers": {_CANONICAL: dict(_PROXY)},
+            "tools": [f"@{_CANONICAL}", "@other"],
+            "allowedTools": [f"@{_CANONICAL}"],
+        }
+        assert setup_mod.reconcile_playwright_in_config(cfg) is True
+        assert _CANONICAL not in cfg["mcpServers"]
+        assert cfg["tools"] == ["@other"]
+        assert cfg["allowedTools"] == []
+
+
+class TestMigrateOffScrubsAgentFilesOnBoot:
+    """The gateway-boot migration with Browser Mode OFF must REMOVE any stale
+    proxy carried over in an owned agent config (security: off means off, don't
+    regress). The ON direction is now handled by rebuild_agent_config's boot
+    reconcile (single writer), covered in test_agent.py — not by this
+    migration."""
+
+    def test_boot_off_leaves_no_proxy_in_agent_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Mode OFF at boot: the proxy + its ref must be absent from the owned
+        # agent file (security: off means off, don't regress).
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: False)
+        kiro_dir = tmp_path / ".kiro" / "agents"
+        kiro_dir.mkdir(parents=True)
+        owned = kiro_dir / "kirocrew.json"
+        owned.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {_CANONICAL: dict(_PROXY)},
+                    "tools": [f"@{_CANONICAL}", "fs_read"],
+                    "allowedTools": [f"@{_CANONICAL}"],
+                }
+            )
+        )
+
+        migrate_owned_playwright_registration()
+
+        data = json.loads(owned.read_text(encoding="utf-8"))
+        assert _CANONICAL not in data["mcpServers"]
+        assert f"@{_CANONICAL}" not in data["tools"]
+        assert f"@{_CANONICAL}" not in data.get("allowedTools", [])
