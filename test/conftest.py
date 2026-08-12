@@ -20,7 +20,9 @@ from kiro_crew.slack.handler import _PHASE_EMOJIS, _build_phase_emojis
 # ── Hypothesis profiles ─────────────────────────────────────────────────
 # Default (CI): fast iteration.  Run ``HYPOTHESIS_PROFILE=thorough python -m pytest``
 # for deeper coverage.
-settings.register_profile("default", max_examples=20, suppress_health_check=[HealthCheck.too_slow], deadline=None)
+settings.register_profile(
+    "default", max_examples=20, suppress_health_check=[HealthCheck.too_slow], deadline=None
+)
 settings.register_profile("thorough", max_examples=100)
 settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "default"))
 
@@ -82,11 +84,7 @@ if platform_compat.IS_WINDOWS:
     # bypasses collect_ignore. One file, two readers, no drift.
     _ignore_listfile = os.path.join(os.path.dirname(__file__), "windows-collect-ignore.txt")
     with open(_ignore_listfile, encoding="utf-8") as _fh:
-        collect_ignore = [
-            name
-            for name in (ln.split("#", 1)[0].strip() for ln in _fh)
-            if name
-        ]
+        collect_ignore = [name for name in (ln.split("#", 1)[0].strip() for ln in _fh) if name]
 
 
 def make_escaping_link(inside: pathlib.Path, outside: pathlib.Path) -> str:
@@ -552,6 +550,14 @@ def _isolate_kirocrew_home(_isolation_dirs, monkeypatch):
     # would leak into every later test's port resolution. Clear it per test;
     # a test that wants it sets it via monkeypatch (which still wins).
     monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
+    # Match CI on a dev box for the off-loop-IO strictness knob too: a developer
+    # with KIROCREW_DEV_MODE=1 (or KIROCREW_STRICT_ON_LOOP_PERSIST=1) exported
+    # would otherwise flip history's _locked guard AND the auto_research
+    # campaigns-DB guard strict for the whole suite, failing tests that call
+    # sync helpers directly on the loop as harness convenience. Tests that
+    # exercise strict mode set the env themselves via monkeypatch (which wins).
+    monkeypatch.delenv("KIROCREW_DEV_MODE", raising=False)
+    monkeypatch.delenv("KIROCREW_STRICT_ON_LOOP_PERSIST", raising=False)
     monkeypatch.setattr("kiro_crew.config.paths._resolved_home", None)
 
 
@@ -860,16 +866,29 @@ class MockSlackClient(SlackClientOps):
         self._fetch_message_result: str | None = None
         self._fetch_thread_replies_result: list[dict] = []
 
-    async def post_message(self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None):
+    async def post_message(
+        self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ):
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
         self.actions.append(
-            ("post", {"channel": channel, "text": text, "thread_ts": thread_ts, "ts": ts,
-                      "unfurl_links": unfurl_links, "unfurl_media": unfurl_media})
+            (
+                "post",
+                {
+                    "channel": channel,
+                    "text": text,
+                    "thread_ts": thread_ts,
+                    "ts": ts,
+                    "unfurl_links": unfurl_links,
+                    "unfurl_media": unfurl_media,
+                },
+            )
         )
         return ts
 
-    async def post_blocks(self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None):
+    async def post_blocks(
+        self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ):
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
         self.actions.append(
@@ -905,7 +924,18 @@ class MockSlackClient(SlackClientOps):
         return f"D{user_id}"
 
     async def post_ephemeral(self, channel, user_id, text, blocks=None, thread_ts=None):
-        self.actions.append(("ephemeral", {"channel": channel, "user_id": user_id, "text": text, "blocks": blocks, "thread_ts": thread_ts}))
+        self.actions.append(
+            (
+                "ephemeral",
+                {
+                    "channel": channel,
+                    "user_id": user_id,
+                    "text": text,
+                    "blocks": blocks,
+                    "thread_ts": thread_ts,
+                },
+            )
+        )
 
     async def views_publish(self, user_id, view):
         self.actions.append(("views_publish", {"user_id": user_id, "view": view}))
@@ -931,7 +961,9 @@ class MockSlackClient(SlackClientOps):
         )
 
     async def start_stream(self, channel, thread_ts, initial_text=None, team_id=None, user_id=None):
-        if not getattr(self, "_stream_enabled", False) or getattr(self, "_start_stream_fails", False):
+        if not getattr(self, "_stream_enabled", False) or getattr(
+            self, "_start_stream_fails", False
+        ):
             return None
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
@@ -986,8 +1018,20 @@ class MockSlackClient(SlackClientOps):
         self.actions.append(("fetch_message", {"channel": channel, "ts": ts}))
         return self._fetch_message_result
 
-    async def fetch_thread_replies(self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True) -> list[dict]:
-        self.actions.append(("fetch_thread_replies", {"channel": channel, "thread_ts": thread_ts, "limit": limit, "warn_on_pagination": warn_on_pagination}))
+    async def fetch_thread_replies(
+        self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True
+    ) -> list[dict]:
+        self.actions.append(
+            (
+                "fetch_thread_replies",
+                {
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "limit": limit,
+                    "warn_on_pagination": warn_on_pagination,
+                },
+            )
+        )
         return self._fetch_thread_replies_result
 
 

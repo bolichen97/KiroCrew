@@ -136,7 +136,9 @@ Details worth knowing:
   base side and be charged to every PR in that window.
 - **The e2e gateway boots with `KIROCREW_STRICT_ON_LOOP_PERSIST=1`**, so an
   un-offloaded session-JSONL mutator that enters the lock on the event loop raises
-  and fails the gate at PR time. `KIROCREW_E2E_REQUIRE=1` turns an
+  and fails the gate at PR time (the knob also arms the auto_research
+  campaigns-DB chokepoint — see [e2e-gate.md](e2e-gate.md)).
+  `KIROCREW_E2E_REQUIRE=1` turns an
   environment-resolution miss into a hard failure, since a skipped suite would
   otherwise count as a pass having run zero browser specs. Details:
   [e2e-gate.md](e2e-gate.md).

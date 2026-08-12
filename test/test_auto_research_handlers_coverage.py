@@ -295,6 +295,7 @@ class TestLaunchWorkflow:
     @pytest.mark.asyncio
     async def test_missing_workflow_service_fails_the_campaign(self, _isolate: Path, sse):
         cid = _campaign(execution_mode="workflow")
+        _running(cid)  # production launches only after the RUNNING transition
         await h._launch_workflow(_mk("PATCH", cid, app=_app(state=SimpleNamespace())), cid)
         assert _status(cid) == h.CampaignStatus.FAILED
         assert sse.types() == ["failed"]
@@ -303,6 +304,7 @@ class TestLaunchWorkflow:
     @pytest.mark.asyncio
     async def test_absent_state_fails_the_campaign(self, _isolate: Path, sse):
         cid = _campaign(execution_mode="workflow")
+        _running(cid)
         await h._launch_workflow(_mk("PATCH", cid, app=_app()), cid)
         assert _status(cid) == h.CampaignStatus.FAILED
 
@@ -331,6 +333,7 @@ class TestLaunchWorkflow:
     @pytest.mark.asyncio
     async def test_start_raising_fails_the_campaign(self, _isolate: Path, sse):
         cid = _campaign(execution_mode="workflow")
+        _running(cid)
         start = AsyncMock(side_effect=RuntimeError("engine down"))
         await h._launch_workflow(
             _mk("PATCH", cid, app=_app(state=_workflow_state(start=start))), cid
@@ -342,6 +345,7 @@ class TestLaunchWorkflow:
     @pytest.mark.asyncio
     async def test_start_without_a_run_id_fails_the_campaign(self, _isolate: Path, sse):
         cid = _campaign(execution_mode="workflow")
+        _running(cid)
         start = AsyncMock(return_value=None)
         await h._launch_workflow(
             _mk("PATCH", cid, app=_app(state=_workflow_state(start=start))), cid
@@ -625,9 +629,11 @@ class TestWatchdogLoop:
         _running(cid, started_at=time.time() - (h._TRUST_TTL_SECS + 60))
         slot = SimpleNamespace(_trust=True, running=False)
         state = SimpleNamespace(_slots={f"research-{cid}": slot})
-        assert await _drive_watchdog(
-            {"state": state}, lambda: _status(cid) == h.CampaignStatus.NEEDS_INPUT
-        )
+        # Wait on the SSE event, not the DB row: the status commits on a worker
+        # thread BEFORE the emit, so a status-based wait can cancel the watchdog
+        # at the await point and strand the emit.
+        assert await _drive_watchdog({"state": state}, lambda: "needs_input" in sse.types())
+        assert _status(cid) == h.CampaignStatus.NEEDS_INPUT
         assert slot._trust is False
         question = json.loads((h._campaign_dir(cid) / "questions.json").read_text())
         assert "24h" in question["question"]
@@ -657,9 +663,10 @@ class TestWatchdogLoop:
         cid = _campaign(auto_approve=False)
         _running(cid)
         (h._campaign_dir(cid) / "questions.json").write_text('{"question": "Which DB?"}')
-        assert await _drive_watchdog(
-            {"state": None}, lambda: _status(cid) == h.CampaignStatus.NEEDS_INPUT
-        )
+        # SSE is the last observable step (status commits on a worker thread
+        # first) — waiting on it avoids cancelling the watchdog mid-settle.
+        assert await _drive_watchdog({"state": None}, lambda: "needs_input" in sse.types())
+        assert _status(cid) == h.CampaignStatus.NEEDS_INPUT
         assert "needs_input" in sse.types()
 
     @pytest.mark.asyncio
@@ -677,7 +684,11 @@ class TestWatchdogLoop:
         try:
             assert await _await_until(lambda: polls["n"] >= 1)  # baseline count recorded
             _write_finding(cid, 2, verification={"passed": True})
-            assert await _await_until(lambda: _status(cid) == h.CampaignStatus.COMPLETE)
+            # The "complete" SSE is emitted after the settle thread persists the
+            # transition — waiting on it (not the row) keeps the cancel from
+            # landing between the commit and the emit.
+            assert await _await_until(lambda: "complete" in sse.types())
+            assert _status(cid) == h.CampaignStatus.COMPLETE
         finally:
             task.cancel()
             try:
@@ -700,7 +711,8 @@ class TestWatchdogLoop:
         try:
             assert await _await_until(lambda: polls["n"] >= 1)
             _write_finding(cid, 2)  # unverified, but hits max_cycles
-            assert await _await_until(lambda: _status(cid) == h.CampaignStatus.COMPLETE)
+            assert await _await_until(lambda: "complete" in sse.types())
+            assert _status(cid) == h.CampaignStatus.COMPLETE
         finally:
             task.cancel()
             try:
@@ -721,7 +733,8 @@ class TestWatchdogLoop:
         try:
             assert await _await_until(lambda: polls["n"] >= 1)
             _write_finding(cid, 6, new_findings_count=0)
-            assert await _await_until(lambda: _status(cid) == h.CampaignStatus.STAGNANT)
+            assert await _await_until(lambda: "stagnant" in sse.types())
+            assert _status(cid) == h.CampaignStatus.STAGNANT
         finally:
             task.cancel()
             try:
@@ -740,9 +753,11 @@ class TestWatchdogLoop:
         cid = _campaign(auto_approve=True)
         _running(cid)
         _write_finding(cid, 1)
-        assert await _drive_watchdog(
-            {"state": None}, lambda: _status(cid) == h.CampaignStatus.FAILED
-        )
+        # The "failed" SSE is the last observable in the stalled branch (status
+        # commits on a worker thread first) — waiting on it keeps the cancel
+        # from stranding the teardown + emit.
+        assert await _drive_watchdog({"state": None}, lambda: "failed" in sse.types())
+        assert _status(cid) == h.CampaignStatus.FAILED
         assert "stalled" in (h.get_campaign(cid) or {})["error_message"]
         stop_loop.assert_awaited_with(cid, remove=True)
         assert "failed" in sse.types()

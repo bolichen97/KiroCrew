@@ -239,7 +239,10 @@ no longer destroy older turns.
   call-site fails tests rather than losing data, or emits a **loud throttled
   warning** and proceeds via the single non-blocking safety-net acquire
   (default / production gateway, strict off — never a new hard failure in the
-  field). Strict is deliberately NOT auto-on under bare pytest (the suite's own
+  field). The strictness predicate is exported as `on_loop_persist_strict` and
+  shared by other off-loop-IO chokepoints (the auto_research campaigns-DB
+  guard raises its own `OnLoopDBError` under the same knob).
+  Strict is deliberately NOT auto-on under bare pytest (the suite's own
   async harness calls several mutators directly on the loop as a convenience, so
   auto-strict would flag harness code, not drift); the enforcement tests flip
   the env flag explicitly. Off the loop the check is a no-op (the sanctioned

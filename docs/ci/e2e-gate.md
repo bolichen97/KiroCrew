@@ -28,7 +28,10 @@ environment is not something a caller has to remember:
   discipline into an enforced invariant for the duration of the run. The harness
   gateway inherits this env, so any raw on-loop `ConversationLog._locked` entry
   that skipped the `*_off_loop` helpers raises `OnLoopPersistError` and fails the
-  gate instead of silently losing transcript data under real contention.
+  gate instead of silently losing transcript data under real contention. The same
+  knob also arms the auto_research campaigns-DB chokepoint (`_get_db()` raises
+  `OnLoopDBError` when entered on the event loop), so an un-offloaded DB call in
+  that app fails the gate too.
 - `-o addopts=` clears the `[tool:pytest]` defaults from `setup.cfg` (`-n auto`,
   `--dist loadgroup`, `--max-worker-restart=2`, `--timeout=120`). xdist would spawn
   one gateway per worker, and coverage of a subprocess gateway measures nothing, so

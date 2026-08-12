@@ -386,6 +386,13 @@ def _on_loop_persist_strict() -> bool:
 _ON_LOOP_TRUTHY = frozenset({"1", "true", "yes", "on"})
 _ON_LOOP_FALSY = frozenset({"0", "false", "no", "off"})
 
+# Public alias: other modules that enforce their own off-loop IO discipline
+# (e.g. the auto_research campaigns-DB chokepoint) share this single
+# strictness knob rather than growing per-module env vars that drift out of
+# dev/CI harnesses. Importing the public name keeps a rename of the private
+# implementation from breaking those modules at import time.
+on_loop_persist_strict = _on_loop_persist_strict
+
 
 def _check_on_loop_persist_discipline(key: str) -> None:
     """Enforce (strict) or diagnose (production) an on-loop ``_locked`` entry.
@@ -1815,9 +1822,7 @@ class ConversationLog:
                 )
                 return True
         except HistoryLockTimeout:
-            logger.warning(
-                "set_cached_intent_summary: lock timeout, not writing key=%s", key
-            )
+            logger.warning("set_cached_intent_summary: lock timeout, not writing key=%s", key)
             return False
 
     def append(
@@ -2307,9 +2312,7 @@ class ConversationLog:
             attempts = 0
         return max(0, attempts), retry_at
 
-    def _attempts_describe_current_span(
-        self, meta: dict, message_count: int | None
-    ) -> bool:
+    def _attempts_describe_current_span(self, meta: dict, message_count: int | None) -> bool:
         """True when the recorded attempts belong to the span in front of us now.
 
         A span is identified by where it starts AND how far it reaches: the
@@ -3053,8 +3056,7 @@ class ConversationLog:
                             continue
                         if (
                             d.get("_type") == "metadata"
-                            and str(d.get("memory_mode", "")).lower()
-                            in INCOGNITO_MEMORY_MODES
+                            and str(d.get("memory_mode", "")).lower() in INCOGNITO_MEMORY_MODES
                         ):
                             is_restricted = True
                             break
@@ -3223,9 +3225,7 @@ class ConversationLog:
         if "tab_id" in fields:
             self.invalidate_tab_id_cache()
 
-    def update_metadata_if(
-        self, key: str, fields: dict, guard: Callable[[dict], bool]
-    ) -> bool:
+    def update_metadata_if(self, key: str, fields: dict, guard: Callable[[dict], bool]) -> bool:
         """Merge *fields* only if *guard* still accepts the on-disk metadata.
 
         ``guard`` is evaluated INSIDE the cross-process lock, against the record
@@ -3839,11 +3839,7 @@ class ConversationLog:
                 # exactly like an undecodable one, so report it the same way --
                 # an empty dict that IS a genuine answer -- instead of throwing a
                 # non-OSError out of a read that callers treat as total.
-                meta = (
-                    data
-                    if isinstance(data, dict) and data.get("_type") == "metadata"
-                    else {}
-                )
+                meta = data if isinstance(data, dict) and data.get("_type") == "metadata" else {}
             except json.JSONDecodeError:
                 meta = {}
             self._meta_cache[key] = (mtime, meta)
@@ -4257,9 +4253,7 @@ class HistoryConsolidator:
             return False
         return (_time.time() if now is None else now) >= retry_at
 
-    async def _note_failed_attempt(
-        self, key: str, span: AttemptedSpan, reason: str
-    ) -> None:
+    async def _note_failed_attempt(self, key: str, span: AttemptedSpan, reason: str) -> None:
         """Charge one attempt for a billed turn that never reached the marker.
 
         Called only once the prompt has actually reached the provider, so a
@@ -4285,9 +4279,7 @@ class HistoryConsolidator:
         except Exception:
             # Without a persisted count the sweep cannot back off, so say so
             # loudly — but never let bookkeeping mask the original failure.
-            logger.warning(
-                "Could not persist consolidation retry state for %s", key, exc_info=True
-            )
+            logger.warning("Could not persist consolidation retry state for %s", key, exc_info=True)
             return
         if attempts < 1:
             # The session was deleted mid-consolidation, so nothing was recorded
@@ -4295,8 +4287,7 @@ class HistoryConsolidator:
             return
         if attempts < _CONSOLIDATION_MAX_ATTEMPTS:
             logger.warning(
-                "Consolidation attempt %d/%d failed for %s (%s); "
-                "next attempt in %.0fs",
+                "Consolidation attempt %d/%d failed for %s (%s); " "next attempt in %.0fs",
                 attempts,
                 _CONSOLIDATION_MAX_ATTEMPTS,
                 key,
@@ -4314,15 +4305,11 @@ class HistoryConsolidator:
             span.total,
         )
         try:
-            await asyncio.to_thread(
-                self._log.mark_consolidated, key, span.total, span.generation
-            )
+            await asyncio.to_thread(self._log.mark_consolidated, key, span.total, span.generation)
         except Exception:
             # The count stays at the cap, so retry_eligible() keeps refusing —
             # the span stops spending even though the marker is missing.
-            logger.warning(
-                "Could not mark abandoned consolidation for %s", key, exc_info=True
-            )
+            logger.warning("Could not mark abandoned consolidation for %s", key, exc_info=True)
 
     async def _note_environment_failure(self, key: str, reason: str) -> None:
         """Arm the backoff for a consolidation that never reached the provider.
@@ -4463,9 +4450,7 @@ class HistoryConsolidator:
         # expiry. Checked here (as well as inside _consolidate()) so the skip is
         # logged before a task is ever scheduled.
         if not self.retry_eligible(key, message_count=total):
-            logger.info(
-                "consolidate_session skipped for %s: consolidation retry backoff", key
-            )
+            logger.info("consolidate_session skipped for %s: consolidation retry backoff", key)
             return
         # Short-circuit sensitive sessions before scheduling a task
         messages = self._log._read_messages(key)
@@ -4575,9 +4560,7 @@ class HistoryConsolidator:
             # the sentinel lets those callbacks tell a refusal from a completed
             # pass and leave their bookkeeping untouched.
             if not self.retry_eligible(key, message_count=total):
-                logger.info(
-                    "_consolidate refused for %s: consolidation retry backoff", key
-                )
+                logger.info("_consolidate refused for %s: consolidation retry backoff", key)
                 return _CONSOLIDATION_REFUSED
             # Freeze the whole span identity from that one snapshot. The offset is
             # derived rather than returned because the snapshot slices at it
@@ -4728,9 +4711,7 @@ class HistoryConsolidator:
                 # unconsolidated: the span re-bills a full turn every idle window,
                 # and immediately after every restart. Charge the attempt.
                 if include_history:
-                    await self._note_failed_attempt(
-                        key, attempted, "empty LLM result"
-                    )
+                    await self._note_failed_attempt(key, attempted, "empty LLM result")
                 return None
 
             if entry := result.get("history_entry"):
@@ -4819,9 +4800,7 @@ class HistoryConsolidator:
             # skip conditions are false again on the next 60s tick. Charging the
             # attempt here is what converts that tight loop into backoff.
             if billed and include_history:
-                await self._note_failed_attempt(
-                    key, attempted, "exception after the LLM call"
-                )
+                await self._note_failed_attempt(key, attempted, "exception after the LLM call")
             raise
         finally:
             self._running.discard(key)
@@ -5683,9 +5662,7 @@ class HistoryConsolidator:
                     _time.monotonic() - t_start,
                     exc_info=True,
                 )
-                raise _ConsolidationNotDispatched(
-                    "background session unavailable"
-                ) from exc
+                raise _ConsolidationNotDispatched("background session unavailable") from exc
             t_acquired = _time.monotonic()
             wait_s = t_acquired - t_start
             # Reject all tools: this is a text/JSON-only generation turn. kiro
