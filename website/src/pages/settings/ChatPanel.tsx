@@ -156,6 +156,7 @@ export function ChatPanel() {
   // ── KiroCrew config (server-side) ──
   const mcQ = useQuery<{
     session?: { autocompact_pct?: number }
+    session_summary?: { enabled?: boolean }
     agent?: {
       model?: string
       role_models?: { background?: string; subagent?: string }
@@ -198,6 +199,14 @@ export function ChatPanel() {
     mutationFn: (v: boolean) => api.patchConfig('dashboard.prevent_sleep', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_dashboard_config')),
+  })
+
+  // ── Session summaries (server-side; spends tokens per changed turn) ──
+  const summaryEnabled = mcCfg?.session_summary?.enabled ?? false
+  const summaryMut = useMutation({
+    mutationFn: (v: boolean) => api.patchConfig('session_summary.enabled', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_session_summaries')),
   })
 
   // "Other" reveals a free-text role. Typed locally and committed on blur /
@@ -596,6 +605,7 @@ export function ChatPanel() {
           {dashCfg.restore_sessions && (
             <SettingsSelect label={i18nT('pages.settings.chatPanel.restore_window')} description={i18nT('pages.settings.chatPanel.time_window_for_session_restoration')} value={String(dashCfg.restore_window_minutes)} options={RESTORE_OPTIONS} optionLabels={restoreLabels()} onChange={v => setDash({ restore_window_minutes: Number(v) })} disabled={dashDisabled} />
           )}
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.session_summaries')} description={i18nT('pages.settings.chatPanel.summarize_each_session_by_intent_in_the_right_pa')} checked={summaryEnabled} onChange={v => summaryMut.mutate(v)} disabled={!mcQ.isSuccess || summaryMut.isPending} />
         </SettingsCard>
       </SettingsSection>
 

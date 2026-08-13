@@ -1427,6 +1427,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": 0, "max": 7200},
+    # Intent-level session summaries in the chat right panel. Only the boolean
+    # enable is editable here: it spends tokens on turns the user did not ask to
+    # pay for, so it is off by default and the Settings toggle is the single
+    # opt-in. The cadence/cap fields (min_user_turns, max_intents, …) stay
+    # config-file-only — they are power-user knobs, not first-run choices.
+    "session_summary.enabled": {"type": "bool"},
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {"type": "int", "min": 5, "max": 120},
     "dashboard.recent_tint_count": {"type": "int", "min": 0, "max": 10},

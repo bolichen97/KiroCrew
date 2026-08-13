@@ -605,6 +605,13 @@ Supports nested directories (e.g. `skills/utils/tiny-url/SKILL.md`). The skill n
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
+The bundled `session-summaries` skill is on-demand, guidance-only: it explains the
+chat session summary panel (see [session-summary](session-summary.md)) — what it
+shows, its token cost, and how to make a session summarize well — so the agent can
+help a user enable and interpret it. It does not enable the feature or trigger
+generation, and holds no runtime-written frontmatter, since a builtin skill is
+re-synced by `rmtree` + `copytree` on upgrade.
+
 **Loading:**
 1. **Always-on**: skills with `always: true` have full content injected every new session
 2. **On-demand**: skill summaries (name + description + dir path) in session context; LLM can `cat` the file when relevant
