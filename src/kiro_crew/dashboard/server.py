@@ -987,6 +987,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/crons/{job_id}/ack", handlers.api_cron_ack)
     app.router.add_get("/api/crons/{job_id}/history", handlers.api_cron_history)
     app.router.add_get("/api/crons/{job_id}/history/{run_id}", handlers.api_cron_history_detail)
+    app.router.add_get("/api/crons/{job_id}/script", handlers.api_cron_script_source)
     app.router.add_get("/api/cron-folders", handlers.api_cron_folders)
     app.router.add_post("/api/cron-folders", handlers.api_cron_folders_create)
     app.router.add_patch("/api/cron-folders/{folder_id}", handlers.api_cron_folders_update)

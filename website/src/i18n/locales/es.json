@@ -9778,7 +9778,11 @@
       "view_last_result": "Ver el último resultado",
       "writes_badge_tooltip": "El trabajo de esta plantilla sube ramas, abre PR o edita issues. Sus límites son instrucciones para el agente, no una política aplicada.",
       "writes_notice": "El trabajo de esta plantilla sube ramas, abre PR o edita issues en tus repositorios. Los límites del prompt (por ejemplo, «nunca subas cambios a la rama por defecto») son instrucciones para el agente, no una política aplicada — revisa el prompt antes de guardar.",
-      "writes_to_your_repos": "Escribe en tus repositorios"
+      "writes_to_your_repos": "Escribe en tus repositorios",
+      "script_source": "Código fuente del script",
+      "script_source_download": "Descargar script",
+      "script_source_failed": "No se pudo cargar el código fuente del script.",
+      "script_source_truncated": "Truncado: el script supera el límite de vista previa."
     },
     "servicesTab": {
       "connected": "Conectado",

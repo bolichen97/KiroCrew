@@ -9778,7 +9778,11 @@
       "view_last_result": "Afficher le dernier résultat",
       "writes_badge_tooltip": "La tâche de ce modèle pousse des branches, ouvre des PR ou modifie des tickets. Ses garde-fous sont des instructions données à l’agent, pas une politique appliquée.",
       "writes_notice": "La tâche de ce modèle pousse des branches, ouvre des PR ou modifie des tickets dans vos dépôts. Les limites énoncées dans le prompt (par exemple « ne jamais pousser sur la branche par défaut ») sont des instructions données à l’agent, pas une politique appliquée — relisez le prompt avant d’enregistrer.",
-      "writes_to_your_repos": "Écrit dans vos dépôts"
+      "writes_to_your_repos": "Écrit dans vos dépôts",
+      "script_source": "Code source du script",
+      "script_source_download": "Télécharger le script",
+      "script_source_failed": "Impossible de charger le code source du script.",
+      "script_source_truncated": "Tronqué — le script dépasse la limite d'aperçu."
     },
     "servicesTab": {
       "connected": "Connecté",

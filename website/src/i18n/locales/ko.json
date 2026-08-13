@@ -9544,7 +9544,11 @@
       "view_list": "목록",
       "writes_badge_tooltip": "이 템플릿의 작업은 브랜치를 푸시하고, PR을 열고, 이슈를 편집합니다. 그 가드레일은 에이전트에 대한 지시이며, 강제되는 정책이 아닙니다.",
       "writes_notice": "이 템플릿의 작업은 저장소에서 브랜치를 푸시하고, PR을 열고, 이슈를 편집합니다. 프롬프트의 제한(예: ‘기본 브랜치에는 절대 푸시하지 않기’)은 에이전트에 대한 지시이며, 강제되는 정책이 아닙니다 — 저장하기 전에 프롬프트를 검토하세요.",
-      "writes_to_your_repos": "저장소에 쓰기"
+      "writes_to_your_repos": "저장소에 쓰기",
+      "script_source": "스크립트 소스",
+      "script_source_download": "스크립트 다운로드",
+      "script_source_failed": "스크립트 소스를 불러오지 못했습니다.",
+      "script_source_truncated": "잘렸습니다 — 스크립트가 미리보기 한도를 초과합니다."
     },
     "servicesTab": {
       "connected": "연결됨",

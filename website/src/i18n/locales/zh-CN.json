@@ -9544,7 +9544,11 @@
       "view_last_result": "查看最近一次结果",
       "writes_badge_tooltip": "此模板的定时任务会推送分支、开 PR 或修改 issue。它的防护约束只是对代理的指示，并非强制策略。",
       "writes_notice": "此模板的定时任务会在你的仓库里推送分支、开 PR 或修改 issue。提示词里的限制（例如“绝不推送到默认分支”）只是对代理的指示，并非强制策略 — 保存前请先看一遍提示词。",
-      "writes_to_your_repos": "会写入你的仓库"
+      "writes_to_your_repos": "会写入你的仓库",
+      "script_source": "脚本源代码",
+      "script_source_download": "下载脚本",
+      "script_source_failed": "无法加载脚本源代码。",
+      "script_source_truncated": "已截断 — 脚本超出预览大小限制。"
     },
     "servicesTab": {
       "connected": "已连接",

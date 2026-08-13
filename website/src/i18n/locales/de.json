@@ -9661,7 +9661,11 @@
       "view_last_result": "Letztes Ergebnis ansehen",
       "writes_badge_tooltip": "Der Job dieser Vorlage pusht Branches, öffnet PRs oder bearbeitet Issues. Ihre Schutzmaßnahmen sind Anweisungen an den Agenten, keine erzwungene Richtlinie.",
       "writes_notice": "Der Job dieser Vorlage pusht Branches, öffnet PRs oder bearbeitet Issues in Ihren Repos. Die Grenzen im Prompt (zum Beispiel „niemals auf den Standardbranch pushen“) sind Anweisungen an den Agenten, keine erzwungene Richtlinie — prüfen Sie den Prompt, bevor Sie speichern.",
-      "writes_to_your_repos": "Schreibt in Ihre Repos"
+      "writes_to_your_repos": "Schreibt in Ihre Repos",
+      "script_source": "Skript-Quellcode",
+      "script_source_download": "Skript herunterladen",
+      "script_source_failed": "Der Skript-Quellcode konnte nicht geladen werden.",
+      "script_source_truncated": "Gekürzt — das Skript überschreitet das Vorschaulimit."
     },
     "servicesTab": {
       "connected": "Verbunden",

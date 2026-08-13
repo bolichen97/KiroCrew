@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -13,13 +14,17 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import model_registry
+from kiro_crew.config.loader import config_dir
 from kiro_crew.cron import CronStoreBusy, is_valid_timezone
+from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.dashboard.cron_inject import (
     hydrate_slot_from_history,
     inject_cron_result_to_dashboard,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.executors import discovery_executor
 from kiro_crew.history import INCOGNITO_MEMORY_MODES
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -637,6 +642,118 @@ async def api_cron_history_detail(request: web.Request) -> web.Response:
         if detail.get(key):
             detail[key] = redact_credentials(redact_exfiltration_urls(detail[key])[0])[0]
     return web.json_response(detail)
+
+
+# Ceiling on the script source returned by GET /api/crons/{id}/script. Cron
+# scripts are hand- or LLM-authored helpers of a few KB; anything near this
+# ceiling is not a cron script, so the view truncates rather than streaming an
+# unbounded file into the dashboard.
+_SCRIPT_SOURCE_MAX_BYTES = 256 * 1024
+
+# The read below traverses the O_NOFOLLOW + fd-real-path chokepoint in hooks
+# (safe_read_file_bytes_nolink), which has no Windows implementation
+# (_fd_real_path returns None there -> fail-closed on every read). Gate with an
+# honest 501 rather than an opaque refusal, mirroring the theme-pack routes.
+_SCRIPT_SOURCE_WIN_UNSUPPORTED = os.name == "nt"
+
+
+def _read_script_source_sync(script_spec: str) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
+    """Resolve a job's stored ``script`` spec and read its source (blocking).
+
+    Returns ``(payload, None)`` on success or ``(None, (message, code))`` on
+    refusal. Runs in a worker thread — resolution stats the filesystem and the
+    read is synchronous file IO, neither of which may run on the event loop.
+
+    The path is derived exclusively from the job's own stored ``script`` field
+    (never from the client), re-validated by ``resolve_script_path`` (existence,
+    sensitivity, containment under ``<config_dir>/crons/``), and then read
+    through ``safe_read_file_bytes_nolink`` pinned to that same root so a
+    symlink or hardlink swapped in after the by-name check is rejected, never
+    dereferenced.
+    """
+    try:
+        file_path, func_name = resolve_script_path(script_spec)
+    except FileNotFoundError:
+        return None, ("script file not found", "script_not_found")
+    except (PermissionError, ValueError, RuntimeError, OSError):
+        # Malformed spec, a path escaping the crons root, or a resolution
+        # failure (``Path.resolve`` raises RuntimeError on a symlink loop on
+        # some Python versions, OSError/ELOOP on others): refuse with a 4xx,
+        # never a 500, and without echoing the resolved path (the spec string
+        # is already visible on the job record; the resolution detail is not
+        # the client's business).
+        return None, ("script path refused", "script_path_refused")
+    crons_root = str((config_dir() / "crons").resolve())
+    truncated = False
+    try:
+        data = safe_read_file_bytes_nolink(
+            file_path, within_root=crons_root, max_bytes=_SCRIPT_SOURCE_MAX_BYTES
+        )
+    except FileTooLargeError:
+        data = safe_read_file_bytes_nolink(
+            file_path,
+            within_root=crons_root,
+            max_bytes=_SCRIPT_SOURCE_MAX_BYTES,
+            allow_truncate=True,
+        )
+        truncated = True
+    if data is None:
+        # Fail-closed refusal from the chokepoint (swapped symlink, hardlink,
+        # non-regular file, unverifiable containment). 4xx, never a 500.
+        return None, ("script unreadable", "script_read_refused")
+    # Scripts under crons/ are LLM-writeable by design, so treat their content
+    # like any other agent-influenced text shown in the dashboard: strip raw
+    # credential patterns and exfiltration URLs before it leaves the backend.
+    # The file and function names come from the same stored spec, so they get
+    # the identical treatment — a credential-shaped name must not ride out on
+    # the metadata fields either.
+    source = redact_credentials(redact_exfiltration_urls(data.decode("utf-8", errors="replace"))[0])[0]
+    file_name = redact_credentials(redact_exfiltration_urls(os.path.basename(file_path))[0])[0]
+    func = redact_credentials(redact_exfiltration_urls(func_name)[0])[0]
+    return {
+        "source": source,
+        "file": file_name,
+        "function": func,
+        "truncated": truncated,
+    }, None
+
+
+async def api_cron_script_source(request: web.Request) -> web.Response:
+    """GET /api/crons/{id}/script — read-only source of a script cron's callable.
+
+    The job id is the only caller-supplied input; the file path is derived
+    server-side from the stored job record (see ``_read_script_source_sync``).
+    """
+    state: DashboardState = request.app["state"]
+    job_id = request.match_info["job_id"]
+    # Freshness-guaranteed lookup, same rationale as api_cron_run: the job may
+    # have been minted by another process and not yet be in the cache snapshot.
+    job = await state.crons.get_job_async(job_id)
+    if not job:
+        return web.json_response({"error": "job not found", "code": "job_not_found"}, status=404)
+    if not job.script:
+        return web.json_response(
+            {"error": "job has no script", "code": "no_script"}, status=404
+        )
+    if _SCRIPT_SOURCE_WIN_UNSUPPORTED:
+        return web.json_response(
+            {
+                "error": "script source view is not yet supported on Windows",
+                "code": "unsupported_platform",
+            },
+            status=501,
+        )
+    payload, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _read_script_source_sync, job.script
+    )
+    if err is not None:
+        message, code = err
+        # Literal statuses per branch (not a computed ``status=`` expression) so
+        # the error-code contract ratchet can see each site is coded.
+        if code == "script_not_found":
+            return web.json_response({"error": message, "code": code}, status=404)
+        return web.json_response({"error": message, "code": code}, status=422)
+    return web.json_response(payload)
 
 
 async def api_cron_history_all(request: web.Request) -> web.Response:
