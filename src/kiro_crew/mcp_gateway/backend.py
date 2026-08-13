@@ -34,6 +34,7 @@ from kiro_crew.mcp_caller import (
     CallerContext,
     build_caller_meta,
 )
+from kiro_crew.mcp_gateway import hazards
 from kiro_crew.mcp_gateway.apps import (
     WithheldTools,
     append_marker,
@@ -1158,6 +1159,7 @@ class Backend:
                     "notification %r (not broadcast to avoid cross-tenant leak)",
                     self.pid, method,
                 )
+                self._record_hazard(hazards.HAZARD_UNATTRIBUTABLE_NOTIFICATION)
             return
         # Server-to-client request (has method AND id) — route ONLY when we can
         # attribute it unambiguously:
@@ -1201,10 +1203,38 @@ class Backend:
                     "cross-tenant leak — recycling"
                 )
                 logger.warning("backend pid=%s %s", self.pid, reason)
+                self._record_hazard(hazards.HAZARD_UNROUTABLE_SERVER_REQUEST)
                 self._dead_reason = self._dead_reason or reason
                 await self._broadcast_backend_gone(reason)
             return
         logger.debug("backend pid=%s emitted malformed JSON-RPC: %r", self.pid, msg)
+
+    def _record_hazard(self, code: str) -> None:
+        """Note that this server exhibited per-client behaviour while shared.
+
+        Only meaningful once MORE THAN ONE client is attached. A backend serving
+        a single client legitimately owns it, so an unattributable frame there
+        proves nothing: there is no second tenant it could have leaked to.
+        ``exclusive_token`` is not sufficient to express that — a pooled backend
+        also serves exactly one client from the moment it starts until a second
+        stub attaches, and recording during that window would disqualify a
+        server for behaviour that is correct.
+
+        Biased toward under-recording on purpose. A hazard is permanent and has
+        no redemption path, so a false one silently kills a server that is fine;
+        a missed one costs a withdrawal that the next observation makes again.
+
+        In-memory only — the flush is off-loop.
+        """
+        if self.exclusive_token or self.refcount <= 1:
+            return
+        name = self.pool_key.server_name
+        if name and hazards.record_observed(name, code):
+            logger.warning(
+                "hazard: server %r first exhibited %s while shared; the "
+                "MCP page will withdraw its recommendation",
+                name, code,
+            )
 
     async def _fail_init(self, reason: str) -> None:
         """Transition init to the terminal ``"failed"`` state and flush every

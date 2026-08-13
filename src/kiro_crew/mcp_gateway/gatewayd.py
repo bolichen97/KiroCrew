@@ -46,7 +46,7 @@ from kiro_crew.config.loader import config_dir as _config_dir
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
-from kiro_crew.mcp_gateway import credwatch, socketsec, transport
+from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, transport
 from kiro_crew.mcp_gateway.apps import sweep_spool as apps_sweep_spool
 from kiro_crew.mcp_gateway.backend import Backend, BackendGone, spawn_backend
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
@@ -69,6 +69,7 @@ from kiro_crew.mcp_gateway.rewriter import (
     env_sidecar_dir,
     env_sidecar_name,
     forward_declared_env_enabled,
+    records_dir,
     resolve_overlay_dir,
 )
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
@@ -365,6 +366,14 @@ async def run_gatewayd(
     hot_keys: Optional[HotKeyStore] = (
         HotKeyStore(default_hot_keys_path(socket_path)) if prewarm_count > 0 else None
     )
+
+    # Observed-hazard sink. Unconditional, unlike the hot-key store: this is
+    # how a server that misbehaves under sharing gets its recommendation
+    # withdrawn, and that must not depend on prewarming being enabled. Prior
+    # observations are loaded so a daemon restart does not forget them — and
+    # that read is offloaded, because a slow ledger store would otherwise delay
+    # socket readiness and every task already on this loop.
+    await asyncio.to_thread(hazards.install_sink, records_dir(socket_path))
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -1014,10 +1023,24 @@ async def _heartbeat_sweeper(
                     pids = "\n".join(str(p) for p in pool.live_backend_pids())
                     with contextlib.suppress(OSError):
                         await asyncio.to_thread(backends_pidfile.write_text, pids)
+                # Persist any per-client behaviour observed since the last
+                # sweep. Offloaded for the same reason as the pidfile write,
+                # and cheap when nothing was observed (the flush is a no-op
+                # unless the in-memory ledger is dirty).
+                await asyncio.to_thread(hazards.flush_sink)
             except Exception:  # pragma: no cover — defensive
                 logger.exception("heartbeat sweep failed; continuing")
     except asyncio.CancelledError:
         pass
+    finally:
+        # The periodic flush above only persists what was observed before the
+        # last tick. A clean shutdown cancels this task, so anything observed in
+        # the final interval would be lost — and a hazard is the strongest
+        # evidence the system has, so losing one means a server that misbehaved
+        # keeps its recommendation until it misbehaves again. Shutdown is the
+        # ordinary path here, not the exceptional one, so it flushes as well.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(hazards.flush_sink)
 
 
 #: Number of stub writers currently inside their write+drain critical section

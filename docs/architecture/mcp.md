@@ -188,6 +188,15 @@ Probes run from `POST /api/mcp/probe`:
   `_PROBE_TIMEOUT_SECS` is the fallback if config is not loaded yet). Results
   are cached for `_PROBE_TTL_SECS` (1800s), after which status reads as
   "outdated".
+- The handshake response is kept, not just the tool names: advertised
+  `capabilities`, the `protocolVersion` the server ANSWERED with, `serverInfo`,
+  and per-tool `annotations`. These feed the shareability verdict (below); the
+  probe already paid for the round-trip, so reading them costs nothing.
+- `client_info` overrides the identity sent in the handshake. The shareability
+  pre-flight uses it to ask one server under two identities; such a run is
+  excluded from the shared per-name probe cache, because a synthetic-identity
+  handshake is a diagnostic and not the canonical observation the dashboard
+  renders.
 - A probed stdio child that ignores a closed stdin costs
   `_PROBE_TEARDOWN_WAIT_SECS` twice (graceful wait, then again after SIGKILL)
   before the process-group reap, which is why that budget is a named constant
@@ -253,6 +262,19 @@ is not in the probe cache yet, so a freshly added server transitions from
 `list_servers()` call, because the stored absolute path goes stale after an
 update: first `agent._resolve_kirocrew_bin()`, then `shutil.which("kirocrew")`
 on the augmented PATH.
+
+## Shareability verdicts
+
+`GET /api/mcp-gateway/servers` returns a `recommendation` per row: whether the
+server looks safe to stub, and separately whether its backend looks safe to
+share. The verdict is derived on this host from evidence ranked
+observation > measurement > declaration, and a server the gateway has WATCHED
+behave per-client while shared is never offered again. Nothing about which
+servers a machine runs ships with Kiro Crew and nothing leaves the host.
+
+Full contracts — the two on-disk records, the reason-code vocabulary, what the
+pre-flight can and cannot decide, and the seed-once rule — live in
+[`docs/system-specs/modules/mcp-shareability.md`](../system-specs/modules/mcp-shareability.md).
 
 ## Dashboard MCP management
 

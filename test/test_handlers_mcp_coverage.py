@@ -1233,10 +1233,32 @@ def routed_allowlist(monkeypatch: pytest.MonkeyPatch):
     import kiro_crew.config.loader as loader
 
     def _set(names: list[str]) -> None:
-        cfg = SimpleNamespace(mcp_gateway=SimpleNamespace(stub_servers=list(names)))
+        # ``socket_path`` is part of the real ``McpGatewayConfig`` and the
+        # handler reads it to locate the observed-hazard ledger. A double that
+        # omitted it would make the row builder raise on a field production
+        # always has — empty is the honest stand-in for "no broker configured".
+        cfg = SimpleNamespace(
+            mcp_gateway=SimpleNamespace(stub_servers=list(names), socket_path="")
+        )
         monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(lambda: cfg))
 
     return _set
+
+
+def _seed_probe(monkeypatch, *names: str) -> None:
+    """Make ``probe_metadata`` report a probed server that declares caller identity.
+
+    Without this the verdict stops at "never probed" for every row, and a test of
+    the preflight gate would pass whether or not the gate works.
+    """
+    meta = SimpleNamespace(
+        status="ok",
+        capabilities={"experimental": {"kirocrew.caller-identity": {}}},
+        protocol_version="2024-11-05",
+        tool_annotations=[],
+        tools=[SimpleNamespace(name="t")],
+    )
+    monkeypatch.setattr(mcp_mod, "probe_metadata", lambda n: meta if n in names else None)
 
 
 class TestGatewayServers:
@@ -1319,6 +1341,77 @@ class TestGatewayServers:
         }
         assert rows["never-mcp"]["denylisted"] is True
         assert rows["never-mcp"]["stub"] is False
+
+    @pytest.mark.asyncio
+    async def test_two_agents_disagreeing_on_the_command_withhold_the_measurement(
+        self, agents_dir: Path, routed_allowlist, monkeypatch
+    ) -> None:
+        """A merged row must not inherit a measurement of one of its definitions.
+
+        Discovery merges by NAME before probing, so only the definition that wins
+        the merge is ever measured. If two agents disagree about the command, the
+        row covers something nobody ran — and reporting the measured one's verdict
+        would tell the operator it is safe to share a backend that was never
+        started.
+        """
+        routed_allowlist([])
+        (agents_dir / "alpha.json").write_text(
+            json.dumps({"name": "alpha", "mcpServers": {"two-faced": {"command": "/bin/a"}}}),
+            encoding="utf-8",
+        )
+        (agents_dir / "beta.json").write_text(
+            json.dumps({"name": "beta", "mcpServers": {"two-faced": {"command": "/bin/b"}}}),
+            encoding="utf-8",
+        )
+        # A clean, sharing-granting measurement exists under that name. The probe
+        # metadata declares caller-identity so that consuming the measurement
+        # WOULD grant sharing — without that, both branches look the same and the
+        # test would pass whether or not the gate works.
+        _seed_probe(monkeypatch, "two-faced")
+        monkeypatch.setattr(
+            mcp_mod, "_load_shareability_state", lambda: ({}, {"two-faced": (True, False)})
+        )
+
+        rows = {
+            r["name"]: r
+            for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
+        }
+
+        rec = rows["two-faced"]["recommendation"]
+        assert sorted(rows["two-faced"]["agents"]) == ["alpha", "beta"]
+        assert rec["recommendShare"] is False, rec
+        assert "preflight_not_run" in [r["code"] for r in rec["reasons"]], rec
+
+    @pytest.mark.asyncio
+    async def test_one_definition_in_two_agents_still_gets_its_measurement(
+        self, agents_dir: Path, routed_allowlist, monkeypatch
+    ) -> None:
+        """The ordinary case must keep working: same server, several agents.
+
+        Withholding on agent count instead of distinct launches would silently
+        drop the recommendation for most real configurations.
+        """
+        routed_allowlist([])
+        spec = {"mcpServers": {"shared-mcp": {"command": "/bin/a", "args": ["--x"]}}}
+        (agents_dir / "alpha.json").write_text(
+            json.dumps({"name": "alpha", **spec}), encoding="utf-8"
+        )
+        (agents_dir / "beta.json").write_text(
+            json.dumps({"name": "beta", **spec}), encoding="utf-8"
+        )
+        _seed_probe(monkeypatch, "shared-mcp")
+        monkeypatch.setattr(
+            mcp_mod, "_load_shareability_state", lambda: ({}, {"shared-mcp": (True, False)})
+        )
+
+        rows = {
+            r["name"]: r
+            for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
+        }
+
+        rec = rows["shared-mcp"]["recommendation"]
+        assert rec["recommendShare"] is True, rec
+        assert "preflight_passed" in [r["code"] for r in rec["reasons"]], rec
 
     @pytest.mark.asyncio
     async def test_unreadable_and_non_object_agent_files_are_skipped(

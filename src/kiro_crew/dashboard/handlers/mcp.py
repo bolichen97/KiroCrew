@@ -17,11 +17,20 @@ from aiohttp import web
 from kiro_crew import platform_compat
 from kiro_crew.agent import _atomic_json_write, kiro_agents_dir_path, rebuild_agent_config
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import _resolve_stub_servers
+from kiro_crew.config.loader import KiroCrewConfig, _resolve_stub_servers
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.mcp_discovery import redact_mcp_error, redact_mcp_headers
-from kiro_crew.mcp_gateway import is_gateway_supported
+from kiro_crew.mcp_discovery import (
+    _MANAGED_SERVER_NAMES,
+    probe_metadata,
+    redact_mcp_error,
+    redact_mcp_headers,
+)
+from kiro_crew.mcp_gateway import hazards, is_gateway_supported
+from kiro_crew.mcp_gateway.hashing import hash_command
+from kiro_crew.mcp_gateway.rewriter import records_dir
+from kiro_crew.mcp_gateway.shareability import ShareEvidence, ShareVerdict, assess
+from kiro_crew.mcp_gateway.verdict_cache import load_cache
 from kiro_crew.mcp_provenance import ABSENT, resolve_write, stamp
 from kiro_crew.mcp_utils import (
     INTERNAL_CLIENT_ID_KEY,
@@ -475,7 +484,7 @@ async def _bg_mcp_probe() -> None:
             pass
 
         # Route through probe_all() so the fan-out is bounded by its
-        # _PROBE_MAX_CONCURRENCY semaphore. An
+        # PROBE_MAX_CONCURRENCY semaphore. An
         # unbounded gather here floods the loop's default executor during a
         # network blip and can starve the heartbeat into a watchdog _exit.
         probed = await probe_all()
@@ -662,6 +671,14 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
     from kiro_crew.mcp_discovery import probe_all  # noqa: F811
 
     servers = await probe_all()
+    # The operator just asked us to spawn every configured server, which is the
+    # only moment the shareability pre-flight is affordable. Evaluate the ones
+    # whose execution identity has no cached measurement; failures here must not
+    # cost the probe its response, since status and tools are what was asked for.
+    try:
+        await _evaluate_shareability(servers)
+    except Exception:
+        logger.debug("shareability evaluation failed; probe result unaffected", exc_info=True)
     # Read global mcp.json for enabled/disabledTools state
     global_mcps: dict[str, Any] = {}
     try:
@@ -680,6 +697,27 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
     _mcp_probe_cache[:] = result
     _mcp_probe_ts = time.time()
     return web.json_response(result)
+
+
+async def _evaluate_shareability(servers: list[Any]) -> None:
+    """Pre-flight any server whose execution identity has no cached measurement.
+
+    Separated from the endpoint so the probe's own contract — status and tools —
+    cannot be changed by a shareability failure.
+    """
+    # Imported HERE, not at module scope, and not because of a cycle: this module
+    # is on the gateway's boot path, and ``evaluate`` pulls in ``preflight`` ->
+    # ``mcp_discovery`` and ``stub`` (the stub PROCESS entry point). Measured on
+    # this tree, hoisting it put 8 extra modules on that path — enough to push a
+    # startup loop-responsiveness ceiling over on Windows. Nothing needs it until
+    # an operator explicitly probes.
+    from kiro_crew.mcp_gateway.evaluate import evaluate_new_servers
+
+    # Deliberately NOT gated on a configured broker: a machine that has never
+    # enabled stubbing is exactly the one that needs to learn whether it could.
+    await evaluate_new_servers(
+        list(servers), records_dir(KiroCrewConfig.load().mcp_gateway.socket_path)
+    )
 
 
 async def api_mcp_probe_cached(request: web.Request) -> web.Response:
@@ -2249,11 +2287,38 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                         "agents": set(),
                         "transport": "stdio" if "command" in entry else "http",
                         "entry_poolable": False,
+                        # Env NAMES only. The recommendation needs to know
+                        # whether a per-session rotating credential is declared;
+                        # it must never touch the values.
+                        "env_names": set(),
+                        # One hash per DISTINCT launch seen under this name. A
+                        # measurement belongs to one execution identity, and the
+                        # probe only ever runs the definition that won the merge,
+                        # so a second distinct launch here means the row covers
+                        # something nobody measured. Hashing is pure — no file is
+                        # opened, which is what keeps this row builder IO-free.
+                        "launch_ids": set(),
                     }
                     rows[name] = row
                 row["agents"].add(str(agent_name))
+                command = entry.get("command")
+                if isinstance(command, str) and command:
+                    args = entry.get("args")
+                    row["launch_ids"].add(
+                        hash_command(command, [str(a) for a in args] if isinstance(args, list) else [])
+                    )
                 if entry.get("poolable") is True:
                     row["entry_poolable"] = True
+                declared_env = entry.get("env")
+                if isinstance(declared_env, dict):
+                    row["env_names"].update(str(k) for k in declared_env)
+
+    # Both shareability files are read ONCE, off the event loop, before the row
+    # loop — and the row builder does no IO at all. Reading per row would put N
+    # synchronous parses on the loop for an N-server config, stalling the
+    # dashboard and every chat sharing it, and would also let two rows in one
+    # payload disagree about the same file.
+    observed, preflights = await asyncio.to_thread(_load_shareability_state)
 
     result: list[dict[str, Any]] = []
     for name in sorted(rows):
@@ -2282,9 +2347,96 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                 "agents": sorted(row["agents"]),
                 "transport": row["transport"],
                 "denylisted": denylisted,
+                # Advisory only. Never auto-applied: the evidence is weaker
+                # than proof (the probe handshakes as a different client than
+                # the gateway does), so the operator decides.
+                "recommendation": _assess_server(
+                    name,
+                    is_stdio=is_stdio,
+                    env_names=tuple(sorted(row["env_names"])),
+                    observed_hazards=observed.get(name, ()),
+                    # A measurement describes ONE execution identity. When this
+                    # name merged more than one distinct launch, the probe
+                    # measured whichever definition won the merge, so serving that
+                    # result here would tell the operator it is safe to share a
+                    # backend nobody ran. Same invariant the cache-side check
+                    # applies, enforced at the other place the information exists.
+                    preflight=(
+                        preflights.get(name) if len(row["launch_ids"]) <= 1 else None
+                    ),
+                ).to_dict(),
             }
         )
     return web.json_response({"servers": result})
+
+
+def _load_shareability_state() -> tuple[
+    dict[str, tuple[str, ...]], dict[str, tuple[bool, bool]]
+]:
+    """Read both shareability records for one response. BLOCKING — call off-loop.
+
+    Returns ``(hazards_by_name, preflight_by_name)`` where the preflight value is
+    ``(ran, caller_sensitive)``.
+
+    Absence is not an error and not a claim of safety: an empty map means nothing
+    has been observed or measured yet, which is exactly how
+    ``shareability.assess`` treats it.
+
+    Preflight rows are keyed by server NAME — one server, one row — so this is a
+    direct lookup. Identity is a field inside the row and is not checked here: this
+    builder is deliberately IO-free and cannot resolve a binary fingerprint, so a
+    server whose command just changed shows its previous measurement until the next
+    probe overwrites the row. Ambiguity that DOES matter — one name covering two
+    different launches in the merged agent config — is decided in the row loop,
+    where those definitions are visible.
+    """
+    try:
+        rt = records_dir(KiroCrewConfig.load().mcp_gateway.socket_path)
+        observed = hazards.load_ledger(rt).as_dict()
+        cache = load_cache(rt)
+    except OSError:
+        return {}, {}
+    preflights: dict[str, tuple[bool, bool]] = {}
+    for name in cache.server_names():
+        row = cache.get_by_name(name)
+        if row is not None:
+            preflights[name] = (row.ran, row.caller_sensitive)
+    return observed, preflights
+
+
+def _assess_server(
+    name: str,
+    *,
+    is_stdio: bool,
+    env_names: tuple[str, ...],
+    observed_hazards: tuple[str, ...],
+    preflight: tuple[bool, bool] | None,
+) -> ShareVerdict:
+    """Build evidence for one row and hand it to the verdict engine.
+
+    Pure: no IO, no config read, no clock. All the judgement lives in
+    ``shareability``; this function only gathers what the caller already loaded.
+    Probe metadata comes from the in-memory discovery cache rather than a fresh
+    probe — starting a server to render a table would spawn every configured MCP
+    on every page load, and probing is deliberately an explicit user action.
+    """
+    meta = probe_metadata(name)
+    return assess(
+        ShareEvidence(
+            name=name,
+            is_stdio=is_stdio,
+            is_first_party=name in _MANAGED_SERVER_NAMES,
+            probe_ok=bool(meta and meta.status == "ok"),
+            capabilities=meta.capabilities if meta else None,
+            protocol_version=meta.protocol_version if meta else "",
+            tool_annotations=list(meta.tool_annotations) if meta else [],
+            has_tools=bool(meta and meta.tools),
+            declared_env_names=env_names,
+            observed_hazards=observed_hazards,
+            preflight_ran=preflight[0] if preflight else None,
+            preflight_caller_sensitive=preflight[1] if preflight else False,
+        )
+    )
 
 
 async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:

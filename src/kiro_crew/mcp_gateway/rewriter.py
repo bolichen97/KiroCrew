@@ -6,8 +6,10 @@ filesystem remains untouched — the broker stubs in these specs are injected
 into each kiro-cli session over ACP ``session/new``, which outranks the
 same-named entry in the agent spec (see ``session_servers.py``).
 
-Servers in :data:`UNPOOLABLE_SERVERS` are left unwrapped because they bind
-to ``KIROCREW_SESSION_KEY`` and cannot be safely shared across sessions.
+Servers in :data:`UNPOOLABLE_SERVERS` are left unwrapped. The set is empty, so
+nothing is excluded through it; the first-party servers that bind
+``KIROCREW_SESSION_KEY`` stay unwrapped only because nothing lists them in the
+stub allowlist.
 
 The rewrite is fingerprint-cached: a content-signature snapshot of every input is
 kept at ``<overlay_dir>/.rewrite-fingerprint``, and a boot whose inputs all
@@ -86,11 +88,15 @@ _WHICH_KEY_SEP = "\0"
 
 # Reserved for MCP servers that explicitly opt out of the broker even
 # when they could support it (e.g. dev/diagnostic servers that want the
-# operator to see one process per session). The preferred signalling path is
-# a backend NOT advertising ``kirocrew.caller-identity`` in its initialize
-# response — gatewayd then refuses to pool it. This hardcoded set exists
-# only for servers that cannot be changed in lockstep (e.g. third-party MCPs
-# shipped by teams that haven't adopted the caller-identity extension yet).
+# operator to see one process per session).
+#
+# Empty, and nothing is excluded through it today. The intended signalling path
+# — a backend that does not advertise ``kirocrew.caller-identity`` in its
+# initialize response being refused for pooling — is NOT implemented: gatewayd
+# parses that capability only to decide whether to inject caller identity, and
+# no code path declines to pool a backend for lacking it. So this set is the
+# only mechanism of its kind that exists, and it is the one to reach for while
+# that is true, not a fallback for servers that cannot adopt the extension.
 UNPOOLABLE_SERVERS: frozenset[str] = frozenset()
 
 # Marker field set on rewritten MCP entries so repeat runs are idempotent.
@@ -1503,8 +1509,44 @@ def forward_declared_env_enabled() -> bool:
         return False
 
 
-def default_socket_path() -> Path:
-    """Return the default gateway unix socket path."""
+def runtime_dir() -> Path:
+    """Directory holding the gateway's per-host runtime records.
+
+    Derived from the data home, NOT from ``mcp_gateway.socket_path``. That field
+    is empty until the broker has been configured, and the shareability records
+    have to exist BEFORE that: their whole purpose is to tell an operator who has
+    not enabled stubbing yet whether it is safe to. Keying off the socket made
+    the feature inert for exactly the audience it serves.
+
+    Same directory the socket itself defaults into, so when a broker does run its
+    files sit alongside these.
+    """
     home = os.environ.get("KIROCREW_HOME")
     base = Path(home) if home else config_dir()
-    return base / "mcp-gateway" / "gateway.sock"
+    return base / "mcp-gateway"
+
+
+def default_socket_path() -> Path:
+    """Return the default gateway unix socket path."""
+    return runtime_dir() / "gateway.sock"
+
+
+def records_dir(socket_path: str | Path = "") -> Path:
+    """Where per-host gateway records live, for BOTH the writer and the reader.
+
+    gatewayd writes next to its actual socket; the dashboard has to read the same
+    place, and it may run when no socket is configured at all. One resolver keeps
+    those two from diverging — a custom ``socket_path`` would otherwise have the
+    daemon writing the hazard ledger somewhere the page never looks.
+
+    Emptiness is tested on the STRING form, and a bare ``"."`` counts as unset:
+    ``Path("")`` constructs to ``PosixPath(".")``, so an empty Path is
+    indistinguishable from an explicit one and branching on truthiness alone
+    would resolve an unconfigured socket to the current working directory.
+    A real relative socket (``./gateway.sock``) is unaffected — its string form
+    is the filename, not ``"."``.
+    """
+    as_str = str(socket_path or "")
+    if not as_str or as_str == ".":
+        return runtime_dir()
+    return Path(as_str).parent
