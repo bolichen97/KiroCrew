@@ -743,6 +743,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "pod/runtime.py::recent_journal",
         "sandbox.py::_probe_sandbox_exec",
         "sandbox.py::_ssh_supports_accept_new",
+        # The aggregate slice-ceiling apply: `systemctl --user set-property
+        # --runtime kirocrew-agents.slice MemoryMax=<N>M MemorySwapMax=0
+        # TasksMax=<N>`. Argv is a fixed verb plus module-constant unit name;
+        # the only variable tokens are integers derived from config/sysconf
+        # (type-checked, junk falls back to defaults) — not agent-influenced.
+        # Runs once at gateway startup, not from an agent turn. Sandboxing it
+        # would be circular: it constructs the cgroup boundary agent spawns
+        # are confined by.
+        "sandbox.py::ensure_agents_slice_limits",
         # The chokepoint wrapper itself. It spawns whatever argv it is handed, so
         # it cannot route on its own behalf — its CALLERS are the ones this audit
         # holds to sandboxed_spawn_argv / wrap_argv, and they still appear here

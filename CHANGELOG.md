@@ -13,6 +13,15 @@ All notable changes to KiroCrew are documented in this file.
   gatewayd whose `--socket` path no longer exists on disk, TERM-first so
   pooled backends drain cleanly. (#3315)
 
+- **Aggregate memory ceiling across all concurrent agent spawns.** The cgroup
+  memory limit was per-spawn only (65% of RAM each), so many concurrent
+  subagents could collectively request several times host RAM without any
+  single limit breaching. The gateway now also caps their shared parent slice
+  (`kirocrew-agents.slice`) at 80% of RAM plus an aggregate task ceiling —
+  override via `resource_limits.max_total_memory_mb` /
+  `max_total_processes` — and logs which scopes were OOM-killed when the
+  aggregate ceiling engages. (#3316)
+
 - **Slack manifest: private channels now work out of the box.** The shipped app
   manifest adds the `groups:history` and `users:read` bot scopes and subscribes
   to the `message.groups` event, so a tracked private channel actually delivers

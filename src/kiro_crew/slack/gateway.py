@@ -188,7 +188,7 @@ from kiro_crew.platform.governance_profiles import (
 )
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import safety_override
-from kiro_crew.sandbox import warm_backend
+from kiro_crew.sandbox import ensure_agents_slice_limits, warm_backend
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
@@ -7240,6 +7240,12 @@ class GatewayOrchestrator:
         self._channel_handles = await registry.start_channels(self, descriptors, permitted)
 
 
+# Strong reference to the background slice-limit apply task: the event loop
+# holds tasks weakly, so a fire-and-forget create_task with no reference can
+# be garbage-collected mid-flight.
+_SLICE_LIMITS_TASK: "asyncio.Task[None] | None" = None
+
+
 async def run_gateway(
     cfg: KiroCrewConfig,
     *,
@@ -7263,6 +7269,31 @@ async def run_gateway(
     # Standalone composes the all-defaults context (identical to today); a
     # non-standalone profile that cannot compose its companion fails closed.
     boot_platform(cfg)
+
+    # ── Aggregate cgroup ceiling for all agent scopes ──
+    # The per-spawn scope wrapper (sandbox.cgroup_scope_argv) bounds ONE spawn
+    # tree; this bounds ALL of them together by putting MemoryMax/TasksMax on
+    # their shared parent slice. Scheduled as a contained background task —
+    # never awaited on the boot path, so a slow user manager (the systemctl
+    # call carries a 15s timeout) cannot delay dashboard binding. The module
+    # global keeps a strong reference (the loop holds tasks weakly). Skipped
+    # in test_mode: the offline E2E gate must not mutate the developer's real
+    # user manager. Failure is non-fatal — the function logs and the
+    # per-scope ceilings still apply.
+    global _SLICE_LIMITS_TASK
+    if not test_mode:
+
+        async def _apply_slice_limits() -> None:
+            try:
+                await asyncio.to_thread(ensure_agents_slice_limits)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "aggregate cgroup ceiling apply failed", exc_info=True
+                )
+
+        _SLICE_LIMITS_TASK = asyncio.create_task(
+            _apply_slice_limits(), name="agents-slice-limits"
+        )
 
     # ── Anonymous usage beacon (at most one HTTP GET per day) ──
     # Detached daemon thread, NOT awaited: ``beacon.send`` is blocking urllib
