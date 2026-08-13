@@ -548,7 +548,13 @@ class HookManager:
             if is_sensitive_path(target):
                 return ToolHookResult.deny(f"Blocked: access to sensitive path: {target}")
             # execute_bash (prefixed or bare) — check for reads of sensitive paths.
-            reason = is_sensitive_bash_command(target)
+            # session_key is passed so the perpetual-agent journal allowance can
+            # be scoped to the agent that OWNS that journal (GPT round-27): a
+            # journal is read back into its owner's next prompt, so a cross-agent
+            # write is a prompt-injection channel. Both real transports populate
+            # it (dashboard chat_runner and llm_helpers); a caller that does not
+            # gets no exemption rather than a shared one.
+            reason = is_sensitive_bash_command(target, session_key=session_key)
             if reason:
                 return ToolHookResult.deny(reason)
             # Data-exfiltration / reverse-shell command shapes.
@@ -595,7 +601,11 @@ class HookManager:
         # into a read regression, and the bash gate covers the shell surface.
         if tool_kind == _EDIT_TOOL_KIND and raw_params:
             wpath = raw_params.get("path") or raw_params.get("file_path")
-            if isinstance(wpath, str) and wpath and is_sensitive_write_path(wpath):
+            if (
+                isinstance(wpath, str)
+                and wpath
+                and is_sensitive_write_path(wpath, session_key=session_key)
+            ):
                 return ToolHookResult.deny(
                     f"Blocked: modification of write-protected config path: {wpath}"
                 )

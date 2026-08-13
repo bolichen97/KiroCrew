@@ -2237,7 +2237,17 @@ class GatewayOrchestrator:
             _prompt_dispatched = False
             # helper picks stable vs ephemeral session key and
             # decides whether to prepend last_result, based on job.persistent_session.
-            session_key, msg = build_cron_session_context(job)
+            # Offloaded: for kind="self" jobs the context assembly reads the
+            # LIFE.md/JOURNAL.md files (bounded, but still disk I/O), which
+            # must not run on the gateway event loop.
+            session_key, msg = await asyncio.to_thread(build_cron_session_context, job)
+            # NB: the perpetual-agent sleep record is NOT cleared here. Round 39
+            # cleared it right after assembly, which GPT round-41 showed is before
+            # the dispatch authorization gate (vet_job_at_fire_time) and before the
+            # concurrent-execution guard — so a wake that was DENIED dispatch
+            # destroyed the record for the next permitted wake. The clear now
+            # happens after the prompt is actually handed to the provider; see the
+            # call site below.
 
             # ── Concurrent execution guard ──
             if (job.script or job.command) and job.id in self._running_script_ids:
@@ -2717,6 +2727,21 @@ class GatewayOrchestrator:
                             interactive=False,
                             agent=agent,
                         )
+                        # GPT round-43: clear the TRANSIENT record now that the
+                        # prompt has been handed over. Round 42 moved the value off
+                        # the persisted field and I deleted round 41's clear as
+                        # "redundant" — it was not. Persistence and in-memory reuse
+                        # are two different leaks: the service CACHES CronJob
+                        # objects, so a dispatched turn that omitted agent_sleep
+                        # left the value on the cached object and the next fallback
+                        # wake was told it was "your record from last wake".
+                        #
+                        # GPT round-44: the clear now waits for the PROVIDER to
+                        # accept the prompt. Round 43 cleared it here, before
+                        # stream_and_collect — so an ACP outage that failed before
+                        # the turn ran destroyed the record for the next wake. The
+                        # record has done its job only once a turn has actually run
+                        # with it; see after the call below.
                         # Wall clock for the cron agent turn: acp never assigns
                         # TurnUsage.duration_ms, so the row falls back to this.
                         # Brackets only the model turn — session acquisition and
@@ -2742,6 +2767,12 @@ class GatewayOrchestrator:
                         if not result_text:
                             result_text = "_No response._"
                         logger.info("Cron '%s': agent '%s' completed", job.name, agent)
+                        # Round 44: the turn RAN with the record, so the record is
+                        # spent. Reached only on a successful return — a provider
+                        # failure above propagates and leaves the value on the
+                        # cached job for the next wake, which is the point.
+                        if job.consumed_sleep_record:
+                            job.consumed_sleep_record = ""
 
                         # ── Per-turn usage row: background spend. ──
                         try:
@@ -2845,6 +2876,8 @@ class GatewayOrchestrator:
                     provider_type=_provider,
                     minimal_context=job.minimal_context,
                 )
+                # Round 44: the clear for this path also waits for the provider to
+                # accept — see after stream_and_collect returns below.
 
                 # Wall clock for the cron agent turn — see the sequential site
                 # above. acp reports no duration, so this is the row's fallback.
@@ -2871,6 +2904,12 @@ class GatewayOrchestrator:
 
                 if _model_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
+
+                # Round 44: the turn ran with the record, so it is spent. Reached
+                # only on a successful return — a provider failure above leaves the
+                # value on the cached job for the next wake.
+                if job.consumed_sleep_record:
+                    job.consumed_sleep_record = ""
 
                 job.set_run_result(result_text)
 

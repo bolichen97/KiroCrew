@@ -2101,6 +2101,7 @@ CRON_ADD_SCHEMA = ToolSchema(
         FieldSpec("command", str, max_len=5000, pattern=re.compile(r"^[^\x00-\x1f\x7f]*$")),
         FieldSpec("timeout", int, min_val=0, max_val=3600),
         FieldSpec("timeout_secs", int, min_val=1, max_val=86400),
+        FieldSpec("perpetual", bool),
     ],
     custom_validator=_validate_cron_add_requires_message_or_script,
 )
@@ -2419,6 +2420,14 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
 MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
     "cron_list": CRON_LIST_SCHEMA,
     "cron_add": CRON_ADD_SCHEMA,
+    "agent_sleep": ToolSchema(
+        tool_name="agent_sleep",
+        fields=[
+            FieldSpec("next_wake_secs", int, required=True, min_val=1, max_val=86400 * 30),
+            FieldSpec("did", str, required=True, max_len=MAX_MEDIUM_STRING),
+            FieldSpec("next_intent", str, max_len=MAX_MEDIUM_STRING),
+        ],
+    ),
     "cron_update": ToolSchema(
         tool_name="cron_update",
         fields=[

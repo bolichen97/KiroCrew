@@ -37,8 +37,9 @@ from kiro_crew.cron import (
 )
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.cron_trigger import trigger_cron_job
-from kiro_crew.mcp_core import _resolve_session_key
+from kiro_crew.mcp_core import _resolve_session_key, _resolve_session_key_strict
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
+from kiro_crew.messaging.link import is_channel_session_key, is_legacy_slack_key
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.sandbox import _AGENT_DENIED_ENV_KEYS
@@ -1119,8 +1120,46 @@ def _list_tools() -> list[dict[str, Any]]:
                         "bounds only script/command subprocesses. Raise it for "
                         "agents whose single wake legitimately outgrows 30 min.",
                     },
+                    "perpetual": {
+                        "type": "boolean",
+                        "description": "Create a perpetual agent (schedule "
+                        "kind='self'): the agent names its own next wake via "
+                        "the agent_sleep tool, bounded above by 'every' (the "
+                        "operator ceiling). Requires 'every'; forces "
+                        "strict_schedule and persistent_session; refuses "
+                        "delete_after_run.",
+                    },
                 },
                 "required": ["name"],
+            },
+        },
+        {
+            "name": "agent_sleep",
+            "description": "Perpetual agents only (cron kind='self'): end your "
+            "wake by recording what this cycle did, what you intend next, and "
+            "when to wake you. You may wake EARLIER than your schedule ceiling "
+            "(to continue work or catch an event); you cannot sleep past it. "
+            "Call this exactly once, at the END of your wake.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "next_wake_secs": {
+                        "type": "integer",
+                        "description": "Seconds until your next wake. Clamped "
+                        "into [60, your schedule ceiling].",
+                    },
+                    "did": {
+                        "type": "string",
+                        "description": "One-line record of what this wake "
+                        "actually produced (or an honest 'idle — assessed X, "
+                        "largest standing gap is Y').",
+                    },
+                    "next_intent": {
+                        "type": "string",
+                        "description": "What you intend to do next wake.",
+                    },
+                },
+                "required": ["next_wake_secs", "did"],
             },
         },
         {
@@ -1566,6 +1605,32 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         strict_schedule = args.get("strict_schedule")
         timeout_val = args.get("timeout", 0)
         timeout_secs_val = args.get("timeout_secs", 0)
+        perpetual_val = args.get("perpetual")
+        if perpetual_val is True:
+            # RFC rev 3, Non-goals / S8: only a HUMAN creates a perpetual
+            # agent. POSITIVE allowlist, fail closed: a denylist on "cron:"
+            # fell open for subagent:/webhook:/heartbeat:/empty identities —
+            # any automation with cron_add could mint autonomous successors.
+            # GPT round-7: a hand-rolled 4-prefix list rejected human Webex/
+            # WeCom/Teams/Weixin/unified-DM and legacy bare-Slack sessions, so
+            # the operator surface is now the SHARED predicates — dashboard:
+            # plus every messaging-channel namespace (is_channel_session_key
+            # covers the full roster and stays current when channels are
+            # added) plus the legacy un-namespaced Slack thread_ts shape.
+            # Automation identities (cron:/subagent:/webhook:/heartbeat:/
+            # taskrunner:/unresolved) match none of these and stay refused.
+            # Strict identity, no ancestor fallback.
+            _caller = _resolve_session_key_strict()
+            _is_operator = bool(_caller) and (
+                _caller.startswith("dashboard:")
+                or is_channel_session_key(_caller)
+                or is_legacy_slack_key(_caller)
+            )
+            if not _is_operator:
+                return (
+                    "Error: perpetual agents can only be created from an "
+                    "operator session (dashboard/chat), not from automation"
+                )
         try:
             job = svc.add_job(
                 name=n,
@@ -1593,6 +1658,14 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 minimal_context=minimal_context if isinstance(minimal_context, bool) else False,
                 timeout=timeout_val or 0,
                 timeout_secs=timeout_secs_val or 0,
+                perpetual=perpetual_val if isinstance(perpetual_val, bool) else False,
+                # GPT round-42: pass the CLAIMED IDENTITY, not a boolean verdict —
+                # the persistence layer re-validates it against the same shared
+                # roster. Empty for a non-perpetual add, where ``_caller`` is not
+                # resolved at all: the allowlist block above runs only under
+                # ``perpetual_val is True``, and referencing it unconditionally
+                # raised NameError for every ordinary cron_add (38 tests).
+                operator_session_key=(_caller if perpetual_val is True else ""),
             )
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
@@ -1607,6 +1680,59 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             resources=f"job_id={job.id}",
         )
         return f"Added job: {job.id} ({job.name}) [{sched_str}]. Tell the user: scheduled for {sched_str}."
+
+    if name == "agent_sleep":
+        # Resolve the calling cron job from the session key the gateway
+        # injected (cron:{job_id} or cron:{job_id}:{suffix}) — the tool works
+        # only from inside a perpetual agent's own wake, so an agent can
+        # never sleep another agent's job.
+        sk = _resolve_session_key_strict()
+        if not sk:
+            return (
+                "Error: agent_sleep requires direct session identity (a cron "
+                "subagent cannot sleep its parent job)"
+            )
+        _sk_match = re.match(r"^cron:([0-9a-f]{8})(?::|$)", sk)
+        if not _sk_match:
+            return (
+                "Error: agent_sleep must be called from a perpetual agent's "
+                "cron session (no cron job id in this session)"
+            )
+        jid = _sk_match.group(1)
+        # GPT round-10: the capability gate belongs here too. Writing
+        # next_wake_ts IS a cron mutation, and an operator who disables
+        # capabilities.cron mid-wake expects no further scheduling state to be
+        # authored — the fire-time gate stops the job from RUNNING, but without
+        # this the agent still persists a deadline on a surface that is no
+        # longer permitted to schedule. Keyed cron:<job.id> like
+        # vet_job_at_fire_time so the SEL deny trail names the job.
+        cap_err = _vet_cron_capability_governance(session_key=f"cron:{jid}")
+        if cap_err:
+            _log_cron_denial("agent_sleep", cap_err)
+            return cap_err
+        try:
+            job = svc.record_agent_sleep(
+                jid,
+                int(args["next_wake_secs"]),
+                str(args.get("did", "")),
+                str(args.get("next_intent", "") or ""),
+            )
+        except CronStoreBusy:
+            return "Error: cron store busy, please retry"
+        except (ValueError, TypeError) as e:
+            return f"Error: {e}"
+        sel().log_api_access(
+            caller="mcp",
+            operation="cron.agent_sleep",
+            outcome="allowed",
+            source="mcp",
+            resources=f"job_id={jid} next_wake_ts={job.next_wake_ts}",
+        )
+        _when = datetime.utcfromtimestamp(job.next_wake_ts or 0).strftime("%H:%M:%S UTC")
+        return (
+            f"Recorded. Next wake at {_when}. Your did/next_intent are saved "
+            "and will be in your next wake's prompt. End your turn now."
+        )
 
     if name == "cron_update":
         jid = args["job_id"]

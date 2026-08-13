@@ -25,8 +25,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -35,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
 from zoneinfo import ZoneInfo
+
+from kiro_crew.messaging.link import is_channel_session_key, is_legacy_slack_key
 
 if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
@@ -110,6 +114,52 @@ def referenced_skill_names() -> set[str]:
 _STORE_VERSION = 2
 _MIN_INTERVAL_SECS = 60
 _JOB_TIMEOUT_SECS = 1800  # 30 min per job
+
+
+def is_operator_session_key(session_key: str) -> bool:
+    """True when ``session_key`` names a HUMAN operator surface.
+
+    GPT round-42: ``add_job`` previously took ``operator_authorized: bool`` — a
+    VERDICT computed by the caller. A boolean says nothing about provenance and any
+    in-process caller can pass ``True``, so the persistence layer was still
+    trusting its caller. It now takes the claimed session key and applies this
+    predicate ITSELF, using the same shared roster the MCP tool uses, so an
+    automation identity (``cron:``, ``subagent:``, ``webhook:``, ``heartbeat:``,
+    ``taskrunner:``, empty) is refused even when the caller claims it is fine.
+    GPT's prescription was to revert the parameter entirely; that would restore the
+    state its own round-23 finding called blocking (perpetual creation with NO gate
+    at this layer), so the answer is to make the layer verify rather than to remove
+    the check.
+
+    Stated plainly, because it is the honest limit: a caller running arbitrary
+    in-process Python can pass a forged operator key, and no check performed inside
+    that same process can prevent it. What this closes is the weaker hole — a
+    caller declaring its own authorization — and it puts the roster decision in the
+    layer that owns the write.
+    """
+    if not session_key:
+        return False
+    return bool(
+        session_key.startswith("dashboard:")
+        or is_channel_session_key(session_key)
+        or is_legacy_slack_key(session_key)
+    )
+
+
+#: Per-FIELD cap for an ``agent_sleep`` record. Applied to ``did`` and
+#: ``next_intent`` separately, and a caller exceeding it is refused rather than
+#: trimmed: the previous single 4,000-char cap on the JOINED string silently
+#: dropped ``next_intent`` whenever ``did`` filled the budget (GPT round-40).
+#: Half the old total each, so a well-behaved caller sees no change and the
+#: worst-case stored size is unchanged.
+_SLEEP_FIELD_MAX = 2000
+
+# §9 (RFC rev 3): perpetual agents get a separate, HIGHER auto-pause threshold.
+# Five failed wakes is an ordinary bad day for an agent mid-investigation
+# (Phase 0: throttling alone reached 2 in the first hour); silent death by
+# auto-pause is the exact failure the RFC names. A self job must never die
+# quietly — record_failure logs at the ordinary threshold and pauses only here.
+_AUTO_PAUSE_THRESHOLD_SELF = 10
 # Margin the per-wake budget must leave above a command/script subprocess
 # timeout: the wake deadline cancels only the executor FUTURE (threads are
 # not interruptible), so a budget shorter than the subprocess bound leaves
@@ -204,9 +254,17 @@ _JITTER_DAILY_MAX = 59 * 60  # 0–59 minutes for daily jobs
 
 @dataclass
 class CronSchedule:
-    """Schedule definition — ``every``, ``at``, or ``cron``."""
+    """Schedule definition — ``every``, ``at``, ``cron``, or ``self``.
 
-    kind: str  # "every" | "at" | "cron"
+    ``self`` is the perpetual-agent kind (RFC rev 3): the agent names its own
+    next deadline through the ``agent_sleep`` tool (persisted on the job as
+    ``next_wake_ts``), bounded above by the operator's ``every_secs`` ceiling —
+    a wake the agent did not choose falls back to that interval. Deadlines are
+    stored on disk, so a wake missed while the host was down fires on recovery
+    (the property that made cron the host over in-memory timers).
+    """
+
+    kind: str  # "every" | "at" | "cron" | "self"
     every_secs: int | None = None
     at_ts: float | None = None
     cron_expr: str | None = None  # "min hour dom month dow"
@@ -228,6 +286,23 @@ class CronJob:
         False  # True when paused by execution after repeated failures; cleared on re-enable/success
     )
     last_run_ts: float | None = None
+    # Perpetual agents (schedule.kind == "self") only: the agent-chosen next
+    # deadline, written by the agent_sleep tool and CONSUMED when the wake
+    # fires. None means "no choice made" — the operator's every_secs ceiling
+    # is the fallback. Persisted so an agent-chosen wake survives restarts.
+    next_wake_ts: float | None = None
+    # Perpetual agents only: the did/next_intent record written by agent_sleep.
+    # Deliberately NOT last_result — the turn-completion merge overwrites
+    # last_result with the turn's own text, which would clobber a record
+    # written mid-run. This field is never touched by _merge_job_result, so
+    # the agent's write survives (same ownership pattern as next_wake_ts).
+    last_sleep_record: str = ""
+    #: Runtime-only. GPT rounds 38/39/41/42 were all ONE consumed sleep record
+    #: being re-persisted from a different call site, so the value now lives here
+    #: instead of on ``last_sleep_record`` after consumption. ``_save`` serialises
+    #: an EXPLICIT field list, so this never reaches the store — a round-trip test
+    #: asserts that, rather than trusting the reader to notice.
+    consumed_sleep_record: str = ""
     last_status: str | None = None  # "ok" | "error"
     last_error: str | None = None
     created_ts: float = 0.0
@@ -343,7 +418,12 @@ class CronJob:
         """
         self.consecutive_failures += 1
         self.failure_recorded = True
-        if self.consecutive_failures >= _AUTO_PAUSE_THRESHOLD and not self.auto_paused:
+        _threshold = (
+            _AUTO_PAUSE_THRESHOLD_SELF
+            if self.schedule.kind == "self"
+            else _AUTO_PAUSE_THRESHOLD
+        )
+        if self.consecutive_failures >= _threshold and not self.auto_paused:
             self.enabled = False
             self.auto_paused = True
             self._audit_pause_change("auto_paused")
@@ -374,6 +454,247 @@ class CronJob:
 # ── Session-context helper ──
 
 
+# ── §7: perpetual-agent prompt assembly (kind == "self") ──
+
+# Caps keep an indefinitely-running agent's prompt bounded (§7: nothing in the
+# prompt may grow without a cap).
+_LIFE_MD_CAP_BYTES = 16_384
+_JOURNAL_TAIL_LINES = 20
+_JOURNAL_TAIL_CAP_BYTES = 6_144
+
+# The contract preamble is CODE-OWNED (not LIFE.md prose): Phase 0's strongest
+# result was that "what to do next" had no owner in either prompt or code, and
+# an operator-written delta trigger starved the goal for 8 straight cycles
+# (PHASE0-LOG Findings 14/15). The ranking step is therefore stated here, once,
+# for every perpetual agent. §7 also forbids claiming the agent will be
+# punished for an idle cycle — that instruction is what produces invented work.
+_SELF_CONTRACT_PREAMBLE = """[Perpetual agent contract]
+You are a perpetual agent: you hold a standing goal (LIFE.md below), and you
+own WHAT to do each wake. The scheduler owns WHEN.
+
+1. RANK FIRST. Assess your whole surface against the goal, name the largest
+   gap you can evidence, and work that. What changed since your last wake is
+   ONE INPUT to that assessment — never the trigger for it. A tool that only
+   reports changes will hide the largest static item; measure the whole.
+2. The assessment is never rate-limited; only filing is. If output is blocked
+   (e.g. a PR slot in review), the cycle's work is the next gap's evidence.
+3. Honest idle is a legitimate outcome, never punished: if the assessment
+   comes up empty, say what you assessed and what your largest standing gap
+   is, and sleep. Never invent work to fill a cycle.
+4. Escalate a permission wall immediately; a competence wall only after two
+   genuinely different attempts. If an escalation goes unanswered, file the
+   question publicly and return to the goal — do not wait politely forever.
+5. End the wake by calling the agent_sleep tool: report what you did (did),
+   what you intend next (next_intent), and when to wake you (next_wake_secs —
+   you may wake EARLIER than your schedule ceiling to continue work or catch
+   an event; you cannot sleep past it).
+[End of perpetual agent contract]"""
+
+
+def _agents_dir() -> Path:
+    """Root of per-agent life directories (~/.kiro/crew/agents by default)."""
+    return config_dir() / "agents"
+
+
+def _open_inside_nofollow(path: Path, root: Path) -> int | None:
+    """Open ``path`` read-only, refusing symlinks and escapes from ``root``.
+
+    Traverses from a pinned ``root`` descriptor and opens EVERY component with
+    ``O_NOFOLLOW``, so no symlink is ever followed and there is no window
+    between deciding a path is contained and using it. GPT round-15 found the
+    previous shape — ``realpath`` containment followed by a plain ``os.open`` —
+    raced: ``O_NOFOLLOW`` covers only the FINAL component, so swapping an
+    intermediate directory for a symlink between the two calls redirected the
+    read while the check had already passed. Walking component-by-component
+    removes the window rather than narrowing it: containment is now structural
+    (we start at the root fd and never traverse upward or through a link),
+    not a comparison that can go stale.
+
+    The relative segments are derived LEXICALLY from *root*; a path that is not
+    lexically under it, or that carries ``.``/``..``/empty segments, is refused
+    outright rather than normalised. Returns an fd, or None on any refusal.
+
+    Platforms without ``dir_fd`` support (Windows) fall back to the previous
+    ``realpath`` + ``O_NOFOLLOW`` form, whose residual race is documented there;
+    the perpetual-agent life directory is POSIX-only in practice because the
+    scheduler that reads it runs wherever the gateway runs.
+    """
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        logger.warning("life context refused: %s is not under the agents dir", path)
+        return None
+    segments = rel.parts
+    if not segments or any(s in ("", ".", "..") or "/" in s or "\\" in s for s in segments):
+        logger.warning("life context refused: %s has a non-literal segment", path)
+        return None
+
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    dir_flags = open_flags | getattr(os, "O_DIRECTORY", 0)
+    # O_NONBLOCK: a FIFO placed at this path must not block the open — with it
+    # the open returns immediately and the fstat check below refuses the
+    # non-regular file. Regular-file reads are unaffected by O_NONBLOCK.
+    leaf_flags = open_flags | getattr(os, "O_NONBLOCK", 0)
+
+    if os.open not in getattr(os, "supports_dir_fd", set()):
+        _life_context_unavailable_without_dirfd()
+        return None
+
+    root_fd: int | None = None
+    home_fd: int | None = None
+    cur: int | None = None
+    try:
+        # GPT round-18: the previous shape opened ``root`` (the AGENTS dir)
+        # without O_NOFOLLOW, on the claim that it is "product-created and not
+        # agent-writable". That claim was wrong — ``agents`` is not in the
+        # write-protected list, so an agent can move it aside and put a link
+        # there, and the walk then followed it and every component below was
+        # attacker-chosen. Split the two: the DATA HOME above it may
+        # legitimately be a link the operator made, so it is opened without
+        # O_NOFOLLOW; ``agents`` itself is opened FROM that descriptor WITH
+        # O_NOFOLLOW, so a replaced root is refused like any other component.
+        home_fd = os.open(root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        root_fd = os.open(root.name, dir_flags, dir_fd=home_fd)
+        cur = root_fd
+        for seg in segments[:-1]:
+            nxt = os.open(seg, dir_flags, dir_fd=cur)
+            if cur != root_fd:
+                os.close(cur)
+            cur = nxt
+        fd = os.open(segments[-1], leaf_flags, dir_fd=cur)
+    except OSError:
+        return None
+    finally:
+        if home_fd is not None:
+            os.close(home_fd)
+        if cur is not None and cur != root_fd:
+            os.close(cur)
+        if root_fd is not None:
+            os.close(root_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            logger.warning("life context refused: %s is not a regular file", path)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _life_context_unavailable_without_dirfd() -> None:
+    """Log the one-time reason life context is not ingested on this platform.
+
+    GPT round-19 retired the previous ``realpath``-containment fallback rather
+    than hardening it. That fallback could not refuse a link or junction whose
+    target resolves back INSIDE the agents root — the comparison passes, so one
+    agent's directory pointed at another's read the victim's goal file — and on
+    Windows a ``mklink /J`` junction reaches that state with no symlink
+    privilege at all. Round 16 pinned the gap as a documented residual; that was
+    the wrong call for a shipped default: silently ingesting a
+    possibly-attacker-chosen goal is worse than not ingesting one.
+
+    The alternative considered was a per-component reparse-point check before
+    the open. Rejected: it is still check-then-open, so it narrows the window
+    instead of closing it, and it adds platform-specific code to a security
+    path in exchange for a weaker guarantee than the ``openat`` walk gives
+    everywhere else.
+
+    Cost, stated plainly: on a platform without ``dir_fd`` a perpetual agent
+    gets its §7 contract preamble and its operator message but no LIFE.md or
+    JOURNAL.md section. The agent still runs; it runs without the goal file it
+    cannot be given safely.
+    """
+    logger.warning(
+        "life context not ingested: this platform has no dir_fd support, so the "
+        "per-component no-follow walk is unavailable and the reader fails closed"
+    )
+
+
+def _read_head_bytes(path: Path, cap: int, root: Path) -> str | None:
+    """Read at most ``cap`` bytes from the start of ``path`` (None if unreadable).
+
+    Bounded at the read() call itself — never a whole-file read_text — so a
+    pathologically large file cannot stall the caller for longer than the cap.
+    Opens via :func:`_open_inside_nofollow` (symlink + containment guards).
+    """
+    fd = _open_inside_nofollow(path, root)
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read(cap + 1)
+    except OSError:
+        return None
+    truncated = len(data) > cap
+    text = data[:cap].decode("utf-8", "replace")
+    return text + "\n[truncated at cap]" if truncated else text
+
+
+def _read_tail_bytes(path: Path, cap: int, root: Path) -> str | None:
+    """Read at most ``cap`` bytes from the END of ``path`` (None if unreadable).
+
+    Opens via :func:`_open_inside_nofollow` (symlink + containment guards).
+    """
+    fd = _open_inside_nofollow(path, root)
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - cap))
+            data = fh.read(cap)
+    except OSError:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def _load_life_context(job: CronJob) -> str:
+    """Read the §6 life directory (LIFE.md + JOURNAL.md tail), capped.
+
+    Missing files degrade to empty sections — a fresh agent with no LIFE.md
+    yet still gets the contract preamble and its operator message. Read
+    errors are swallowed for the same reason: prompt assembly must never be
+    the thing that kills a wake.
+
+    The directory is keyed by the generated ``job.id`` — never the free-text
+    name: a name is choosable (any caller of cron_add), so keying by it would
+    let a job named after an EXISTING agent pull that agent's LIFE/JOURNAL
+    into its own prompt, besides ordinary collisions. The id is
+    machine-generated at creation and unique. The containment check below is
+    defense in depth on top of that. Reads are byte-bounded at the syscall
+    (never whole-file), so a huge journal cannot stall the caller beyond the
+    caps.
+    """
+    root = _agents_dir()
+    # NOT resolved: ``.resolve()`` here FOLLOWED a symlinked ``<job.id>``
+    # directory and handed the reader its target, so the per-component
+    # no-follow walk never saw the link and a containment comparison on the
+    # already-resolved path could only ask "did we land somewhere allowed?"
+    # rather than "did we traverse a link?". A link whose target sits inside
+    # the agents root — another agent's directory — passed that comparison and
+    # pulled the victim's goal file into this job's prompt (GPT round-15).
+    # Containment is now enforced structurally inside
+    # :func:`_open_inside_nofollow`, which starts at ``root`` and refuses every
+    # symlink and every non-literal segment, so the lexical path is what must
+    # be passed down.
+    base = root / job.id
+    if not job.id:
+        return ""
+    parts: list[str] = []
+    life = _read_head_bytes(base / "LIFE.md", _LIFE_MD_CAP_BYTES, root)
+    if life is not None:
+        parts.append(
+            f"[LIFE.md — your goal; owner: the human; read-only]\n{life}\n[End of LIFE.md]"
+        )
+    raw_tail = _read_tail_bytes(base / "JOURNAL.md", _JOURNAL_TAIL_CAP_BYTES, root)
+    if raw_tail is not None:
+        tail = "\n".join(raw_tail.splitlines()[-_JOURNAL_TAIL_LINES:])
+        parts.append(f"[JOURNAL.md tail — your own record]\n{tail}\n[End of JOURNAL.md tail]")
+    return "\n\n".join(parts)
+
+
 def build_cron_session_context(job: CronJob) -> tuple[str, str]:
     """Compute (session_key, prompt) for one cron run.
 
@@ -396,6 +717,31 @@ def build_cron_session_context(job: CronJob) -> tuple[str, str]:
     """
     if job.persistent_session:
         msg = job.message
+        self_head: str | None = None
+        if job.schedule.kind == "self":
+            head = _SELF_CONTRACT_PREAMBLE
+            life = _load_life_context(job)
+            if life:
+                head = f"{head}\n\n{life}"
+            # Round 42: prefer the TRANSIENT record set by the deadline consume.
+            # It is not a dataclass field, so it cannot be persisted by any save —
+            # which is what finally stopped a consumed record from reaching the
+            # NEXT wake. ``last_sleep_record`` is still read for the case where the
+            # deadline was not consumed on this run (an every_secs fallback wake).
+            _sleep_rec = getattr(job, "consumed_sleep_record", "") or job.last_sleep_record
+            if _sleep_rec:
+                head = (
+                    f"{head}\n\n[Your agent_sleep record from last wake]\n"
+                    f"{_sleep_rec}\n[End of agent_sleep record]"
+                )
+            # GPT round-24: this used to be prepended HERE, and the last_result
+            # block below then prefixed the whole thing — so for any agent that
+            # had already run once (i.e. every established perpetual agent, the
+            # majority case) the previous-run result sat ABOVE the contract, and
+            # §7's "preamble first" plus its RANK FIRST step were not first at
+            # all. Hold the head and prepend it after the result block is
+            # composed, so the contract leads unconditionally.
+            self_head = head
         if job.last_result:
             last = job.last_result
             if job.minimal_context and len(last) > 2000:
@@ -406,6 +752,8 @@ def build_cron_session_context(job: CronJob) -> tuple[str, str]:
                 "[End of previous run result]\n\n"
                 f"{msg}"
             )
+        if self_head is not None:
+            msg = f"{self_head}\n\n{msg}"
         return f"cron:{job.id}", msg
 
     # Stateless: fresh key, bare message.
@@ -481,6 +829,10 @@ def format_schedule(schedule: CronSchedule, tz_name: str = "") -> str:
             pass
     if schedule.kind == "cron" and schedule.cron_expr:
         return _humanize_cron(schedule.cron_expr, tz_name)
+    if schedule.kind == "self" and schedule.every_secs:
+        secs = schedule.every_secs
+        span = f"{secs // 3600}h" if secs >= 3600 else f"{secs}s"
+        return f"self-scheduled (ceiling {span})"
     if schedule.kind == "every" and schedule.every_secs:
         secs = schedule.every_secs
         if secs >= 3600:
@@ -570,6 +922,17 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
             return None
         sched = job.schedule
         now = now if now is not None else time.time()
+        if sched.kind == "self" and sched.every_secs is not None:
+            # Agent-chosen deadline wins; past-due fires immediately (missed
+            # wake fires on recovery, never one interval later). Fallback is
+            # the operator ceiling, same shape as "every".
+            if job.next_wake_ts is not None:
+                return job.next_wake_ts if job.next_wake_ts > now else now
+            last = job.last_run_ts if job.last_run_ts is not None else job.created_ts
+            if last is None:
+                return None
+            nxt = last + sched.every_secs
+            return nxt if nxt > now else now
         if sched.kind == "every" and sched.every_secs is not None:
             last = job.last_run_ts if job.last_run_ts is not None else job.created_ts
             if last is None:
@@ -1184,6 +1547,9 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        perpetual: bool = False,
+        *,
+        operator_session_key: str = "",
     ) -> CronJob:
         """Add a new job. Provide one of ``every_secs``, ``at_ts``, or ``cron_expr``.
 
@@ -1243,6 +1609,8 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=timeout_secs,
+            perpetual=perpetual,
+            operator_session_key=operator_session_key,
         )
         self._persist_add_locked(job)
         self._arm_timer()
@@ -1338,6 +1706,9 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        perpetual: bool = False,
+        *,
+        operator_session_key: str = "",
     ) -> CronJob:
         """Validate inputs and construct the :class:`CronJob` (no I/O, no lock).
 
@@ -1379,7 +1750,55 @@ class CronService:
         for _d in skip_dates:
             if not is_valid_skip_date(_d):
                 raise ValueError(f"Invalid skip_date: {_d!r} (expected YYYY-MM-DD)")
-        if cron_expr:
+        if perpetual:
+            # §2/§9 (RFC rev 3): a perpetual agent is an "every"-shaped job
+            # whose deadline the agent may pull EARLIER via agent_sleep.
+            # every_secs is the operator ceiling (the fallback wake).
+            #
+            # GPT round-23: the operator-only rule (RFC Non-goals — only a human
+            # creates a perpetual agent) lived ONLY at the MCP tool. That left
+            # the invariant true by convention of a single caller rather than
+            # enforced by the owner of the write, so any other caller — a script,
+            # an app, a future code path — could author one silently. It is now
+            # checked HERE, where the job is built, and the MCP tool passes the
+            # flag after its own allowlist decides the caller is an operator
+            # surface. Keyword-only and default-false so every existing caller
+            # that does not opt in is refused rather than given legacy status.
+            #
+            # This does not pretend to stop an agent that can already execute
+            # arbitrary Python in-process; nothing at this layer can. What it
+            # stops is the invariant being enforced in exactly one place.
+            if not is_operator_session_key(operator_session_key):
+                raise ValueError(
+                    "perpetual=True requires an operator session key; it may only "
+                    "be created from an operator surface (RFC Non-goals). Got "
+                    f"{operator_session_key or '<empty>'!r}"
+                )
+            if not every_secs:
+                raise ValueError("perpetual=True requires every_secs (the operator ceiling)")
+            # GPT round-32: a command/script cron runs no model, so it can never
+            # call agent_sleep and never names its own next deadline — the whole
+            # point of kind="self". Accepting the combination produced a job
+            # LABELLED perpetual that behaved as a plain fixed interval, which is
+            # worse than refusing it: the §7 contract, the life context and the
+            # higher auto-pause threshold would all apply to something that
+            # cannot use them.
+            if command or script:
+                raise ValueError(
+                    "perpetual=True is exclusive with command/script jobs "
+                    "(they run no model and cannot call agent_sleep)"
+                )
+            if cron_expr or at_ts:
+                raise ValueError("perpetual=True is exclusive with cron_expr/at_ts")
+            if delete_after_run:
+                raise ValueError("delete_after_run is refused for perpetual jobs (§9)")
+            # Jitter off: the deadline is agent-chosen and often tied to an
+            # external event it reasoned about; noise corrupts the decision.
+            strict_schedule = True
+            # Continuity across wakes is load-bearing (Phase 0, need 3).
+            persistent_session = True
+            schedule = CronSchedule(kind="self", every_secs=max(every_secs, _MIN_INTERVAL_SECS))
+        elif cron_expr:
             if not validate_cron_expr(cron_expr):
                 raise ValueError(f"Invalid cron expression: {cron_expr}")
             schedule = CronSchedule(kind="cron", cron_expr=cron_expr)
@@ -1421,6 +1840,124 @@ class CronService:
             timeout=timeout,
             timeout_secs=int(timeout_secs) if timeout_secs else _JOB_TIMEOUT_SECS,
         )
+
+    def record_agent_sleep(
+        self,
+        job_id: str,
+        next_wake_secs: int,
+        did: str,
+        next_intent: str = "",
+    ) -> CronJob:
+        """Persist a perpetual agent's chosen next wake and its cycle record.
+
+        The agent_sleep MCP tool's disk core: under the cross-process
+        ``_file_lock``, validates the job is ``kind == "self"``, clamps the
+        requested wake into [_MIN_INTERVAL_SECS, every_secs] — the agent may
+        pull its wake EARLIER than the operator ceiling, never later (RFC rev
+        3: the sleep-longer half ships as §4 configuration, not agent-chosen
+        distant deadlines) — writes ``next_wake_ts``, and records ``did`` /
+        ``next_intent`` via :meth:`CronJob.set_run_result` so the §7 prompt
+        carries them into the next wake even if the turn's own result text is
+        lost. Raises ``ValueError`` on an unknown job or a non-self kind, and
+        :class:`CronStoreBusy` on sustained lock contention.
+
+        Runs in a genuinely loop-less process (the MCP server) per the
+        write-path audit table in :meth:`_save`; the gateway's scheduler picks
+        the new deadline up through the mtime+digest ``_sync`` on its next
+        tick, which is at most ``_TIMER_POLL_SECS`` away — the deadline is
+        disk-owned, so neither process needs the other alive at write time.
+        """
+        with self._file_lock():
+            self._sync()
+            for job in self._jobs:
+                if job.id != job_id:
+                    continue
+                if job.schedule.kind != "self":
+                    raise ValueError(
+                        f"agent_sleep is only valid for kind='self' jobs, got "
+                        f"{job.schedule.kind!r}"
+                    )
+                ceiling = job.schedule.every_secs or _MIN_INTERVAL_SECS
+                clamped = max(_MIN_INTERVAL_SECS, min(int(next_wake_secs), ceiling))
+                job.next_wake_ts = time.time() + clamped
+                # GPT round-40: a single ``record[:4000]`` truncation dropped the
+                # NEXT INTENT whenever ``did`` alone reached the cap — the agent's
+                # statement of what it plans to do next vanished with no error, and
+                # the next wake was simply never told. Silent loss of the more
+                # forward-looking half is the worst possible way to spend the
+                # budget.
+                #
+                # So the two fields are bounded SEPARATELY and an oversized record
+                # is REFUSED rather than trimmed. A caller that writes too much gets
+                # told; nothing is dropped behind its back.
+                _did = did.strip()
+                _intent = next_intent.strip()
+                if len(_did) > _SLEEP_FIELD_MAX or len(_intent) > _SLEEP_FIELD_MAX:
+                    raise ValueError(
+                        f"agent_sleep: 'did' and 'next_intent' are limited to "
+                        f"{_SLEEP_FIELD_MAX} characters each "
+                        f"(got {len(_did)} and {len(_intent)}); summarise instead"
+                    )
+                record = f"did: {_did}"
+                if _intent:
+                    record += f"\nnext: {_intent}"
+                job.last_sleep_record = record
+                self._save()
+                logger.info(
+                    "agent_sleep: job %s sleeping %ds (requested %ds, ceiling %ds)",
+                    job_id,
+                    clamped,
+                    next_wake_secs,
+                    ceiling,
+                )
+                return job
+        raise ValueError(f"Job not found: {job_id}")
+
+    def _consume_self_wake_locked(self, job: CronJob) -> None:
+        """Compare-and-clear the agent-chosen deadline at fire time.
+
+        Clears ``next_wake_ts`` on disk ONLY when it still equals the value
+        this fire consumed — an ``agent_sleep`` write landing during the run
+        (a NEWER choice) must survive. Degrades to the in-memory clear when
+        the store is contended; the next ``_sync`` reconciles.
+        """
+        fired = job.next_wake_ts
+        if fired is None:
+            return
+        # CronStoreBusy propagates: consuming only in memory while the disk
+        # keeps the past-due deadline would make every subsequent tick refire
+        # the job. The caller skips this wake and the next tick retries the
+        # locked consumption — contention is transient by construction.
+        with self._file_lock():
+            self._sync()
+            for j in self._jobs:
+                if j.id == job.id:
+                    # NB: when _sync did not reload, ``j`` IS ``job`` —
+                    # compare before any in-memory clear, or the guard
+                    # can never match its own object.
+                    if j.next_wake_ts == fired:
+                        j.next_wake_ts = None
+                        # GPT rounds 38/39/41/42 all landed on this one value, and
+                        # each of my fixes moved WHERE it was cleared instead of
+                        # removing the thing that kept re-persisting it. Round 42
+                        # ends the class: the consumed record is moved OFF the
+                        # persisted field and onto a TRANSIENT attribute.
+                        #
+                        # ``_save`` serialises an explicit field list (see the
+                        # ``data = {...}`` builder), so an attribute that is not a
+                        # dataclass field cannot reach the store by ANY path —
+                        # not the deadline consume, not ``_merge_job_result``, not
+                        # the run's own bookkeeping save, and not a future call
+                        # site nobody has written yet. That is what the three
+                        # previous placements could not guarantee.
+                        _consumed = j.last_sleep_record
+                        j.last_sleep_record = ""
+                        self._save()
+                        # the run about to start still needs it for its prompt
+                        job.last_sleep_record = ""
+                        job.consumed_sleep_record = _consumed
+                    break
+        job.next_wake_ts = None
 
     def _persist_add_locked(self, job: CronJob) -> None:
         """Lock/reload/append/save for a new job — the thread-safe disk core.
@@ -1465,6 +2002,9 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        perpetual: bool = False,
+        *,
+        operator_session_key: str = "",
     ) -> CronJob:
         """Event-loop-safe :meth:`add_job`: the lock+save runs off the loop.
 
@@ -1512,6 +2052,8 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=timeout_secs,
+            perpetual=perpetual,
+            operator_session_key=operator_session_key,
         )
         await asyncio.to_thread(self._persist_add_locked, job)
         self._arm_timer()
@@ -1584,6 +2126,59 @@ class CronService:
                         raise ValueError(f"Invalid interval: {kwargs['every_secs']}") from e
                     if val < _MIN_INTERVAL_SECS:
                         raise ValueError(f"Interval must be >= {_MIN_INTERVAL_SECS}s, got {val}")
+                # §9 invariants of a perpetual job, refused BEFORE any field is
+                # assigned so a rejected update leaves the job untouched (same
+                # posture as the timeout cross-field check below). GPT round-11:
+                # the generic path let an operator flip these off, and each one
+                # silently breaks the agent rather than erroring —
+                # persistent_session=False drops the cross-wake continuity that
+                # Phase 0 found load-bearing, strict_schedule=False re-enables
+                # the jitter §9 turns off (the deadline is agent-chosen and often
+                # tied to an external event), and delete_after_run removes the
+                # job on its first wake. Refuse instead of coercing: an operator
+                # who wants a plain job should create one, and a silent coercion
+                # would report success for an update that did not happen.
+                if job.schedule.kind == "self":
+                    # GPT round-12: cron_expr is the other route that converts
+                    # the job away from kind="self" — round-11 preserved the
+                    # kind across an INTERVAL change but the cron_expr branch
+                    # below still rebuilt it as kind="cron", with the same
+                    # consequence (contract context gone, agent_sleep refuses
+                    # it). A perpetual agent's cadence is a ceiling plus an
+                    # agent-chosen deadline; a calendar expression cannot
+                    # express that, so this is refused rather than coerced.
+                    if kwargs.get("cron_expr"):
+                        raise ValueError(
+                            "cron_expr cannot be set on a perpetual job (§9); "
+                            "adjust the every_secs ceiling instead"
+                        )
+                    # at_ts is refused for the same reason, and refused LOUDLY:
+                    # this path currently ignores it (verified — the schedule
+                    # section below has no at_ts branch, so update_job(at_ts=…)
+                    # reports success and changes nothing). A silent no-op on a
+                    # perpetual job is the same failure shape as a silent
+                    # conversion: the operator believes the cadence moved. A
+                    # one-shot deadline is also meaningless for a standing
+                    # condition that is never done. Raised by the Opus lane
+                    # alongside cron_expr; that half was already fixed in
+                    # round 12, this half was not.
+                    if kwargs.get("at_ts"):
+                        raise ValueError(
+                            "at_ts cannot be set on a perpetual job (§9); "
+                            "a perpetual agent has no one-shot deadline"
+                        )
+                    if "persistent_session" in kwargs and not kwargs["persistent_session"]:
+                        raise ValueError(
+                            "persistent_session cannot be disabled on a perpetual job (§9)"
+                        )
+                    if "strict_schedule" in kwargs and not kwargs["strict_schedule"]:
+                        raise ValueError(
+                            "strict_schedule cannot be disabled on a perpetual job (§9)"
+                        )
+                    if kwargs.get("delete_after_run"):
+                        raise ValueError(
+                            "delete_after_run is refused for perpetual jobs (§9)"
+                        )
                 # Calendar-validity of timezone / skip_dates, validated at the
                 # persistence owner so EVERY caller (MCP cron_add/cron_update,
                 # dashboard, CLI) is covered by one check rather than each
@@ -1693,7 +2288,32 @@ class CronService:
                 if "cron_expr" in kwargs and kwargs["cron_expr"]:
                     job.schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
                 elif "every_secs" in kwargs and kwargs["every_secs"]:
-                    job.schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
+                    # GPT round-11: a perpetual job keeps kind="self" across an
+                    # interval change. The generic path rebuilt the schedule as
+                    # kind="every", which silently retired the job's §7 contract
+                    # context and made agent_sleep reject it ("not a self job") —
+                    # an operator raising the wake ceiling would have un-made the
+                    # perpetual agent. The interval is still the operator's
+                    # ceiling either way. The floor is already enforced by the
+                    # pre-validation above; ``max`` here mirrors add_job so the
+                    # two construction sites read the same.
+                    _kind = "self" if job.schedule.kind == "self" else "every"
+                    _every = max(int(kwargs["every_secs"]), _MIN_INTERVAL_SECS)
+                    job.schedule = CronSchedule(kind=_kind, every_secs=_every)
+                    # GPT round-12: the agent-chosen deadline is bounded by the
+                    # operator's ceiling, so lowering the ceiling has to bound
+                    # an already-recorded deadline too. Without this, an agent
+                    # that slept 3500s under a 3600s ceiling kept waiting for
+                    # 3500s after the operator lowered the ceiling to 600s —
+                    # _is_due honours next_wake_ts first, so the lowered
+                    # ceiling had no effect until the stale deadline fired.
+                    # Clamped rather than cleared so a deadline EARLIER than the
+                    # new ceiling (the wake-sooner half this feature exists for)
+                    # survives an unrelated ceiling change.
+                    if _kind == "self" and job.next_wake_ts is not None:
+                        _cap = (job.last_run_ts or job.created_ts) + _every
+                        if job.next_wake_ts > _cap:
+                            job.next_wake_ts = _cap
                 self._save()
                 logger.info("Updated cron job %s", job_id)
                 return job
@@ -2424,6 +3044,37 @@ class CronService:
                 logger.debug("Cron: applying %.0fs jitter to job '%s'", jitter, job.name)
                 await asyncio.sleep(jitter)
             exec_started_at = time.time()
+            # Perpetual agents: consume the agent-chosen deadline NOW, on
+            # disk, so a crash mid-run cannot refire the same past-due wake
+            # forever. Offloaded — the compare-and-clear takes _file_lock.
+            #
+            # GPT round-35: the guard was only ``is not None``, so a run that did
+            # NOT arrive from that deadline — a manual cron_trigger, or a run_job
+            # call — consumed a deadline still in the FUTURE. The agent's choice
+            # was silently discarded, and if the manual run then failed before
+            # calling agent_sleep the next wake fell back to the every_secs
+            # ceiling: the agent asked for 20 minutes and got the fallback hours.
+            # Only a deadline this run actually reached is consumed.
+            if (
+                job.schedule.kind == "self"
+                and job.next_wake_ts is not None
+                and job.next_wake_ts <= exec_started_at
+            ):
+                try:
+                    await asyncio.to_thread(self._consume_self_wake_locked, job)
+                except CronStoreBusy:
+                    # Deadline not consumed on disk — running anyway would
+                    # let the persisted past-due value refire after this run.
+                    # Skip the wake; the next tick retries the consumption.
+                    # Marked CANCELLED so the finally block does not finalize
+                    # this non-run: without the marker it would advance
+                    # last_run_ts and record a phantom history row.
+                    self._cancelled_jobs.add(job.id)
+                    logger.warning(
+                        "Cron '%s': store busy consuming self deadline; skipping wake",
+                        job.name,
+                    )
+                    return
             # Notify dashboard that the job has started executing so the live
             # is_running badge appears without a manual reload.
             try:
@@ -2450,7 +3101,7 @@ class CronService:
             except Exception:
                 logger.debug("push_refresh failed on job end", exc_info=True)
             # For 'every' jobs, use started_at to prevent cumulative drift
-            if not reaped and not cancelled and job.schedule.kind == "every":
+            if not reaped and not cancelled and job.schedule.kind in ("every", "self"):
                 job.last_run_ts = started_at
             if not reaped and not cancelled:
                 try:
@@ -2538,7 +3189,16 @@ class CronService:
 
     @staticmethod
     def _is_due(job: CronJob, now: float) -> bool:
-        if job.schedule.kind == "every" and job.schedule.every_secs:
+        if job.schedule.kind == "self" and job.schedule.every_secs:
+            # Agent-chosen deadline wins; fallback is the operator ceiling.
+            if job.next_wake_ts is not None:
+                if now < job.next_wake_ts:
+                    return False
+            else:
+                last = job.last_run_ts or job.created_ts
+                if now < last + job.schedule.every_secs:
+                    return False
+        elif job.schedule.kind == "every" and job.schedule.every_secs:
             last = job.last_run_ts or job.created_ts
             if now < last + job.schedule.every_secs:
                 return False
@@ -2947,6 +3607,8 @@ class CronService:
                     user_paused=j.get("user_paused", not j.get("enabled", True)),
                     auto_paused=j.get("auto_paused", False),
                     last_run_ts=j.get("last_run_ts"),
+                    next_wake_ts=j.get("next_wake_ts"),
+                    last_sleep_record=j.get("last_sleep_record", ""),
                     last_status=j.get("last_status"),
                     last_error=j.get("last_error"),
                     created_ts=j.get("created_ts", 0.0),
@@ -3052,6 +3714,8 @@ class CronService:
                     "user_paused": j.user_paused,
                     "auto_paused": j.auto_paused,
                     "last_run_ts": j.last_run_ts,
+                    "next_wake_ts": j.next_wake_ts,
+                    "last_sleep_record": j.last_sleep_record,
                     "last_status": j.last_status,
                     "last_error": j.last_error,
                     "created_ts": j.created_ts,
