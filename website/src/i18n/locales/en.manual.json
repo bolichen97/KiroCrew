@@ -2979,6 +2979,7 @@
         "graph_view": "Graph View",
         "list_view": "List View",
         "sources_tab": "Sources",
+        "settings_tab": "Settings",
         "status_active": "Active",
         "status_archived": "Archived"
       },
@@ -3036,6 +3037,31 @@
         "weeks_ago": "{{n}}w ago",
         "welcome_to_the_knowledge_library": "Welcome to the Knowledge Library",
         "your_centralized_knowledge_base_with_entity_extr": "Your centralized knowledge base with entity extraction, graph relationships, and full-text search."
+      },
+      "settings": {
+        "title": "Ingestion Settings",
+        "description": "Control how documents are extracted, indexed, and rate-limited. Changes take effect on the next watcher sweep unless noted otherwise.",
+        "save_failed": "Failed to save knowledge setting",
+        "chunk_limit_label": "Per-source chunk limit",
+        "chunk_limit_desc": "Maximum chunks a single source may ingest per scan cycle. Each chunk costs one LLM extraction call. 0 = no limit.",
+        "max_sources_label": "Max sources",
+        "max_sources_desc": "Maximum number of auto-discovered knowledge sources. Manually added sources are not capped. 0 = no limit.",
+        "embed_rate_label": "Embedding rate limit",
+        "embed_rate_desc": "How many embedding requests per minute when indexing documents into the vector store. Lower values reduce system load but slow down indexing. 0 = unlimited.",
+        "model_label": "Extraction model",
+        "model_desc": "LLM used for chunking & extracting document content. \"Auto\" inherits your default chat model. Set a cheaper model (e.g. claude-haiku-4.5) to control extraction cost.",
+        "model_auto": "auto (use chat model)",
+        "pool_size_label": "Extraction pool size",
+        "pool_size_desc": "Concurrent extraction workers. More workers = faster indexing, higher peak resource usage.",
+        "requires_restart": "restart required",
+        "auto_add_label": "Auto-add documents",
+        "auto_add_desc": "Let the agent add documents it reads during normal work to the Knowledge Library.",
+        "auto_project_label": "Auto-register project documents",
+        "auto_project_desc": "Register documents from each project you work in as a Knowledge source automatically.",
+        "auto_artifacts_label": "Auto-add saved artifacts",
+        "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
+        "load_failed": "Failed to load settings.",
+        "retry": "Retry"
       }
     },
     "logsPage": {

@@ -8590,7 +8590,8 @@
         "status_archived": "সংরক্ষণাগারে",
         "to_search_esc_to_back_to_page": "/ সার্চ করতে, Esc ফিরে যেতে, ←→ পৃষ্ঠা বদলাতে",
         "try_a_different_type_status_or_namespace": "অন্য কোনো ধরন, স্ট্যাটাস বা নেমস্পেস চেষ্টা করুন",
-        "try_different_keywords_or_filters": "অন্য কীওয়ার্ড বা ফিল্টার চেষ্টা করুন"
+        "try_different_keywords_or_filters": "অন্য কীওয়ার্ড বা ফিল্টার চেষ্টা করুন",
+        "settings_tab": "Settings"
       },
       "itemCard": {
         "copied": "কপি হয়েছে!",
@@ -8695,6 +8696,31 @@
         "watch_anyway": "তবুও নজরে রাখো",
         "watches_folder_recursively_supported_files_auto": "ফোল্ডার রিকার্সিভভাবে পর্যবেক্ষণ করে। সমর্থিত ফাইল স্বয়ংক্রিয়ভাবে ইনজেস্ট হয়। প্রতি সোর্সে সর্বোচ্চ 5,000 ফাইল।",
         "watching_folder": "ফোল্ডার নজরে রাখা হচ্ছে"
+      },
+      "settings": {
+        "title": "Ingestion Settings",
+        "description": "Control how documents are extracted, indexed, and rate-limited. Changes take effect on the next watcher sweep unless noted otherwise.",
+        "save_failed": "Failed to save knowledge setting",
+        "chunk_limit_label": "Per-source chunk limit",
+        "chunk_limit_desc": "Maximum chunks a single source may ingest per scan cycle. Each chunk costs one LLM extraction call. 0 = no limit.",
+        "max_sources_label": "Max sources",
+        "max_sources_desc": "Maximum number of auto-discovered knowledge sources. Manually added sources are not capped. 0 = no limit.",
+        "embed_rate_label": "Embedding rate limit",
+        "embed_rate_desc": "How many embedding requests per minute when indexing documents into the vector store. Lower values reduce system load but slow down indexing. 0 = unlimited.",
+        "model_label": "Extraction model",
+        "model_desc": "LLM used for chunking & extracting document content. \"Auto\" inherits your default chat model. Set a cheaper model (e.g. claude-haiku-4.5) to control extraction cost.",
+        "model_auto": "auto (use chat model)",
+        "pool_size_label": "Extraction pool size",
+        "pool_size_desc": "Concurrent extraction workers. More workers = faster indexing, higher peak resource usage.",
+        "requires_restart": "restart required",
+        "auto_add_label": "Auto-add documents",
+        "auto_add_desc": "Let the agent add documents it reads during normal work to the Knowledge Library.",
+        "auto_project_label": "Auto-register project documents",
+        "auto_project_desc": "Register documents from each project you work in as a Knowledge source automatically.",
+        "auto_artifacts_label": "Auto-add saved artifacts",
+        "auto_artifacts_desc": "Mirror documents you save as artifacts into the Knowledge Library.",
+        "load_failed": "Failed to load settings.",
+        "retry": "Retry"
       }
     },
     "localStorageDebug": {

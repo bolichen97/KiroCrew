@@ -23,6 +23,20 @@ process.on('unhandledRejection', (reason) => {
     typeof reason.stack === 'string' &&
     reason.stack.includes('onAsyncTaskManagerAbort')
   if (isTeardownAbort) return  // orphaned iframe fetch aborted during window teardown
+
+  // ECONNREFUSED from a stale happy-dom async fetch that fires AFTER msw's
+  // server.close() — the request escapes interception, dials the real TCP stack,
+  // and gets refused because no gateway is listening on the test-document origin
+  // (localhost:6776). Same teardown-timing race, different symptom: AggregateError
+  // wrapping ECONNREFUSED from node:net instead of AbortError from happy-dom.
+  // Scoped to port 6776 (the test document origin pinned in vite.config.ts) so a
+  // genuine test dial to an unexpected port still fails the run.
+  const isPostMswDial =
+    reason instanceof Error &&
+    (reason as NodeJS.ErrnoException).code === 'ECONNREFUSED' &&
+    String(reason).includes('6776')
+  if (isPostMswDial) return  // orphaned fetch hit real TCP after msw closed
+
   throw reason  // re-raise anything else so the run still fails on a real leak
 })
 
