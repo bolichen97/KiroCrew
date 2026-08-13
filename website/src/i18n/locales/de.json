@@ -3675,13 +3675,13 @@
     },
     "personalShopper": {
       "manifest": {
-        "description": "Ein persönlicher Berater, der sich Ihre Vorlieben merkt, echte Shops mit Ihrem Login durchsucht und Probleme löst, die nicht zwangsläufig in einem Kauf enden. Er kauft nie etwas – das tun Sie.",
+        "description": "Ein persönlicher Berater, der echte Shops recherchiert und Probleme löst, die nicht zwangsläufig in einem Kauf enden. Der Tab Vorlieben ist Ihre eigene Referenzliste – schreiben Sie das Wichtige in den Chat. Er kauft nie etwas – das tun Sie.",
         "display_name": "Personal Shopper",
         "highlight_1": "Analysiert das Problem, bevor er etwas empfiehlt – manchmal ist die Antwort gar kein Kauf",
-        "highlight_2": "Merkt sich Größen, Marken, Stil, Budget und Einschränkungen über alle Sitzungen hinweg",
-        "highlight_3": "Durchsucht die von Ihnen konfigurierten Shops mit Ihrem Login – echte Preise, echte Verfügbarkeit",
-        "highlight_4": "Sie verfolgen die Recherche im Browser-Panel, und er berührt niemals Warenkorb oder Kasse",
-        "highlight_5": "Ordnen Sie sein Wissen über Sie in eigene Gruppen, ohne den Abruf zu beeinflussen",
+        "highlight_2": "Schreiben Sie die wichtigen Vorlieben in den Chat – der Berater liest Ihre Nachrichten, nicht den Tab Vorlieben",
+        "highlight_3": "Recherchiert nur die Shops, die Sie nennen, und weist darauf hin, dass Preise von öffentlichen Seiten kommen und nicht aus Ihrem Konto",
+        "highlight_4": "Er kann Warenkorb und Kasse gar nicht erreichen",
+        "highlight_5": "Ordnen Sie Ihre gespeicherten Vorlieben im Tab Vorlieben in Gruppen",
         "page_label": "Personal Shopper"
       },
       "historyTab": {
@@ -3730,26 +3730,24 @@
         "delete_named_group": "Gruppe {{name}} löschen",
         "edit_named_preference": "Vorliebe „{{text}}“ bearbeiten",
         "delete_named_preference": "Vorliebe „{{text}}“ löschen",
-        "add_your_first_preference": "Füge oben eine hinzu."
+        "add_your_first_preference": "Füge oben eine hinzu.",
+        "the_advisor_cannot_read_this_list_paste_what_ma": "Der Berater kann diese Liste nicht lesen. Schreiben Sie das Wichtige in den Chat, wenn Sie fragen."
       },
       "sitesTab": {
         "add_shopping_site": "Shopping-Seite hinzufügen",
         "add_site": "Seite hinzufügen",
-        "add_your_shopping_sites_so_the_advisor_can_brows": "Füge deine Shopping-Seiten hinzu, damit der Berater sie für dich durchsuchen kann.",
+        "add_your_shopping_sites_so_the_advisor_can_brows": "Fügen Sie die Shops hinzu, die Sie im Blick behalten wollen.",
         "cancel": "Abbrechen",
-        "how_login_works": "So funktioniert die Anmeldung",
+        "how_login_works": "So funktioniert die Recherche",
         "loading_sites": "Seiten werden geladen…",
         "no_sites_configured": "Keine Seiten eingerichtet",
         "privacy": "Datenschutz",
         "remove_site": "Seite entfernen",
-        "shopping_sources_the_advisor_can_browse_login_en": "Shopping-Quellen, die der Berater durchsuchen kann. Mit Anmeldung gibt es Mitgliedspreise und personalisierte Ergebnisse.",
+        "shopping_sources_the_advisor_can_browse_login_en": "Der Berater kann diese Liste nicht lesen. Nennen Sie einen Shop im Chat, dann recherchiert er genau diesen – dies ist Ihre eigene Referenzliste.",
         "site_name_e_g_example_store": "Seitenname (z. B. Example Store)",
-        "the_advisor_only_visits_sites_you_ve_enabled_her": "Der Berater besucht nur Seiten, die du hier aktiviert hast. Deaktivierte Seiten werden nie durchsucht, auch wenn sie passende Ergebnisse hätten.",
-        "the_advisor_opens_sites_in_the_browser_panel_dur": "Der Berater öffnet Seiten im Browser-Panel während eines Shopping-Gesprächs. Du meldest dich einmal an, wenn du dazu aufgefordert wirst — das Session-Cookie bleibt lokal für spätere Suchen. Deine Anmeldedaten werden von der App nie gespeichert.",
+        "the_advisor_only_visits_sites_you_ve_enabled_her": "Nichts hiervon verlässt Ihren Rechner.",
+        "the_advisor_opens_sites_in_the_browser_panel_dur": "Der Berater liest nur öffentliche Shop-Seiten. Er kann sich nicht anmelden und Ihre Sitzung nicht nutzen, daher stammen Preise und Verfügbarkeit von der öffentlichen Seite.",
         "url_e_g_store_example_com": "URL (z. B. store.example.com)",
-        "logged_in": "Angemeldet",
-        "not_logged_in": "Nicht angemeldet",
-        "toggle_site": "{{name}} aktivieren",
         "remove_named_site": "{{name}} entfernen",
         "save_failed": "Speichern fehlgeschlagen. Fehlercode: {{code}}"
       }
