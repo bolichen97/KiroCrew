@@ -37,6 +37,8 @@ import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import { rehypeSanitize } from '../../../../components/MarkdownRenderer'
+import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
+import { electronPlatform } from '../../../../lib/electron'
 import type { ApprovalRequest, ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
 import { PINNED_PANEL_WIDTH } from '../shared/constants'
@@ -1690,6 +1692,16 @@ function isLocalFilePath(src: unknown): src is string {
 const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
   const parts = filePath.split('/')
   const short = parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : parts.slice(-2).join('/')
+  // The SHELL's platform, not the gateway's: `revealFile` is an IPC send Mochi's
+  // Electron main process handles, so that host owns which application opens. A
+  // browser tab has no shell to report one — and no shell to reveal anything
+  // either — so it takes the generic wording.
+  const hostPlatform = classifyPlatform(electronPlatform())
+  const revealLabel = hostPlatform === 'darwin'
+    ? i18nT('apps.mochi.chatPanel.open_in_finder')
+    : hostPlatform === 'windows'
+      ? i18nT('apps.mochi.chatPanel.open_in_file_explorer')
+      : i18nT('apps.mochi.chatPanel.show_in_file_manager')
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -1713,7 +1725,7 @@ const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
         onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
         onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
       ><Eye size={11} /></button>
-      <button onClick={() => api?.revealFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.reveal_in_finder')} aria-label={i18nT('apps.mochi.chatPanel.reveal_in_finder')} style={{
+      <button onClick={() => api?.revealFile?.(filePath)} title={revealLabel} aria-label={revealLabel} style={{
         background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
         color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
         transition: 'color 0.15s',
