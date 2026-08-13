@@ -46,7 +46,9 @@ copy-paste before a single test executes. Commands and layers:
 ## This is a public OSS fork: don't reintroduce internal couplings
 
 - **Build/infra:** no `npm-pretty-much`, Brazil, AIM, or CodeArtifact registries.
-  The public build is plain npm + Vite; `.npmrc` pins the public registry.
+  The public build is plain npm + Vite; `.npmrc` deliberately does not pin a
+  registry -- the system-configured registry applies (see
+  `docs/build/desktop-app.md`).
 - **Identity/telemetry:** no live Cognito pools or RUM app ids (`src/rum.ts` is an
   inert no-op stub, keep it inert), no `aws-rum-web`.
 - **Removed product surfaces:** internal feature-app pages, tabs, API-client
