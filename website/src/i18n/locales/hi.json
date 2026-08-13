@@ -3971,6 +3971,8 @@
           "close_esc": "बंद करें (Esc)",
           "close_review_view": "समीक्षा दृश्य बंद करें",
           "document_file_name": "{{name}}.md",
+          "drafting_design": "डिज़ाइन लिखा जा रहा है…",
+          "drafting_tasks": "कार्य लिखे जा रहे हैं…",
           "drag_or_use_to_resize": "आकार बदलने के लिए खींचें या ← → का उपयोग करें",
           "expand_document_for_review": "समीक्षा के लिए दस्तावेज़ बड़ा करो",
           "expand_for_review_esc_to_close": "समीक्षा के लिए बड़ा करो (Esc से बंद)",
@@ -3989,6 +3991,7 @@
           "tab_requirements": "आवश्यकताएं",
           "tab_tasks": "कार्य",
           "tells_the_agent_this_phase_is_approved_and_to_mo": "एजेंट को बताता है कि यह चरण स्वीकृत है और वह आगे बढ़ सकता है — चैट में लिखने के समान",
+          "the_agent_is_writing_the_next_document": "स्वीकृत — एजेंट अगला दस्तावेज़ लिख रहा है",
           "working": "काम चल रहा है…"
         },
         "specRail": {
@@ -4008,9 +4011,15 @@
         },
         "specStatePanel": {
           "answer_with": "“{{title}}” का उत्तर कैसे दिया जाए?",
+          "answered": "उत्तर दिया",
+          "blocking": "अवरोधक",
+          "context": "संदर्भ",
           "decision_title": "निर्णय — {{title}}",
+          "decisions": "निर्णय",
           "options_for": "{{title}} के विकल्प",
+          "pending": "लंबित",
           "recommended": "अनुशंसित",
+          "sending": "भेजा जा रहा है…",
           "template": "टेम्पलेट",
           "tool_calls": "टूल कॉल",
           "turns": "चक्र",

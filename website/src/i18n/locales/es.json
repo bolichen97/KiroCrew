@@ -4033,6 +4033,8 @@
           "close_esc": "Cerrar (Esc)",
           "close_review_view": "Cerrar la vista de revisión",
           "document_file_name": "{{name}}.md",
+          "drafting_design": "Redactando el diseño…",
+          "drafting_tasks": "Redactando las tareas…",
           "drag_or_use_to_resize": "Arrastra o usa ← → para redimensionar",
           "expand_document_for_review": "Ampliar el documento para revisarlo",
           "expand_for_review_esc_to_close": "Ampliar para revisar (Esc para cerrar)",
@@ -4052,6 +4054,7 @@
           "tab_requirements": "Requisitos",
           "tab_tasks": "Tareas",
           "tells_the_agent_this_phase_is_approved_and_to_mo": "Indica al agente que esta fase está aprobada y que puede continuar, igual que si lo escribieras en el chat",
+          "the_agent_is_writing_the_next_document": "Aprobado: el agente está escribiendo el siguiente documento",
           "working": "trabajando…"
         },
         "specRail": {
@@ -4071,9 +4074,15 @@
         },
         "specStatePanel": {
           "answer_with": "¿Cómo se debe responder a «{{title}}»?",
+          "answered": "respondida",
+          "blocking": "BLOQUEO",
+          "context": "CONTEXTO",
           "decision_title": "Decisión — {{title}}",
+          "decisions": "DECISIONES",
           "options_for": "Opciones para {{title}}",
+          "pending": "pendiente",
           "recommended": "RECOMENDADO",
+          "sending": "enviando…",
           "template": "Plantilla",
           "tool_calls": "Llamadas a herramientas",
           "turns": "Turnos",

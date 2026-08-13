@@ -3115,6 +3115,8 @@
           "close_esc": "Close (Esc)",
           "close_review_view": "Close review view",
           "document_file_name": "{{name}}.md",
+          "drafting_design": "Drafting design…",
+          "drafting_tasks": "Drafting tasks…",
           "drag_or_use_to_resize": "Drag or use ← → to resize",
           "expand_document_for_review": "Expand document for review",
           "expand_for_review_esc_to_close": "Expand for review (Esc to close)",
@@ -3133,6 +3135,7 @@
           "tab_requirements": "Requirements",
           "tab_tasks": "Tasks",
           "tells_the_agent_this_phase_is_approved_and_to_mo": "Tells the agent this phase is approved and to move on — same as typing it in the chat",
+          "the_agent_is_writing_the_next_document": "Approved — the agent is writing the next document",
           "working": "working…"
         },
         "specRail": {
@@ -3152,9 +3155,15 @@
         },
         "specStatePanel": {
           "answer_with": "How should “{{title}}” be answered?",
+          "answered": "answered",
+          "blocking": "BLOCKING",
+          "context": "CONTEXT",
           "decision_title": "Decision — {{title}}",
+          "decisions": "DECISIONS",
           "options_for": "Options for {{title}}",
+          "pending": "pending",
           "recommended": "RECOMMENDED",
+          "sending": "sending…",
           "template": "Template",
           "tool_calls": "Tool calls",
           "turns": "Turns",
