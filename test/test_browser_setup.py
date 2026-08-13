@@ -1612,6 +1612,39 @@ class TestMigrateOwnedPlaywrightRegistration:
         # No mcp.json, no agent dirs — must not raise.
         migrate_owned_playwright_registration()
 
+    def test_removal_says_how_to_restore_browsing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        # Installs predating the durable flag had the proxy written unconditionally
+        # by `kirocrew setup`, so the first start after an upgrade removes a browser
+        # that was working. The flag is deliberately not inferred from that
+        # registration, and the dashboard toggle is its only writer — so without a
+        # line naming the restore path the capability vanishes with no route back.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "_kirocrew_bin", lambda: "kirocrew")
+        monkeypatch.setattr(setup_mod, "has_playwright_extension", lambda: False)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: False)
+        _write_mcp_json(
+            tmp_path,
+            {_CANONICAL: {"command": "kirocrew", "args": ["mcp-playwright-proxy", "--config", "x"]}},
+        )
+        with caplog.at_level(logging.WARNING, logger=setup_mod.logger.name):
+            migrate_owned_playwright_registration()
+        assert "Settings -> Browser" in caplog.text
+
+    def test_removal_is_silent_when_there_was_nothing_registered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        # Browser Mode is off and no proxy exists — the steady state for everyone
+        # who never turned browsing on. Warning on every gateway start would train
+        # the reader to ignore the line that matters.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(setup_mod, "browser_mode_enabled", lambda: False)
+        _write_mcp_json(tmp_path, {"some-user-mcp": {"command": "foo"}})
+        with caplog.at_level(logging.WARNING, logger=setup_mod.logger.name):
+            migrate_owned_playwright_registration()
+        assert "Settings -> Browser" not in caplog.text
+
     def test_leaves_user_direct_playwright_server_untouched(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

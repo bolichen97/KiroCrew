@@ -1212,13 +1212,30 @@ def migrate_owned_playwright_registration() -> None:
     When Browser Mode is OFF, this instead REMOVES the proxy from every Kiro Crew
     surface: registration is the authorization, so a stale proxy left by a prior
     enable (or a pre-upgrade install) must not survive a restart into a mounted
-    ``browser_*`` tool set while the durable toggle is off.
+    ``browser_*`` tool set while the durable toggle is off. The flag is NOT
+    inferred from finding such a registration — installs predating the flag got
+    the proxy written unconditionally by ``kirocrew setup``, so its presence is a
+    default rather than a decision to let the agent drive a browser. Removal is
+    logged when it actually took an entry away, since the toggle is the only
+    writer of the flag and a silent removal leaves no route back.
     """
     if not browser_mode_enabled():
-        _remove_playwright_from_kirocrew_mcp_json()
+        removed_source = _remove_playwright_from_kirocrew_mcp_json()
         _remove_playwright_from_agent_files()
+        dereg_status = "absent"
         with contextlib.suppress(OSError):
-            deregister_playwright_proxy()
+            _, dereg_status = deregister_playwright_proxy()
+        # Only when something was actually taken away: Browser Mode off with no
+        # proxy present is the steady state for everyone who never turned browsing
+        # on, and warning on every start there would train the reader to ignore the
+        # line that matters. ``deregister_playwright_proxy`` reports
+        # "deregistered" for a removal anywhere, including the agent files.
+        if removed_source or dereg_status == "deregistered":
+            logger.warning(
+                "Browser Mode is off, so the Playwright registration was removed "
+                "(browser_* tools will not be available). Enable it at "
+                "Settings -> Browser to restore browsing; the CLI cannot turn it on."
+            )
         return
     _migrate_owned_kiro_registration()
     _converge_kirocrew_mcp_json()

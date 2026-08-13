@@ -29,6 +29,10 @@ from aiohttp import web
 import kiro_crew.config.loader as loader
 import kiro_crew.dashboard.handlers.messaging as mod
 
+#: The module's real rebuild wrapper, captured before any test stubs the name, so a
+#: test can exercise its error handling after the autouse noop replaces it.
+_REAL_REBUILD = mod._rebuild_agent_config
+
 
 class _Req:
     """Request double: ``app["state"]``, ``json()``, ``match_info``, ``query``."""
@@ -1231,6 +1235,21 @@ class TestBrowserConfig:
             mod, "ensure_playwright_installed", lambda engine: {"ok": True, "step": "done"}
         )
 
+    @pytest.fixture(autouse=True)
+    def _never_rebuild_the_real_agent_home(self, monkeypatch):
+        """Stub the rebuild for every test in this class.
+
+        The save path rebuilds the agent config so the browser tools actually reach
+        a session. That writes under the real ``~/.kiro/agents``, which no test may
+        touch, and ``data_home`` monkeypatching does not reach it. Tests that assert
+        ON the rebuild re-stub it locally with a recorder.
+        """
+
+        async def _noop() -> None:
+            return None
+
+        monkeypatch.setattr(mod, "_rebuild_agent_config", _noop)
+
     def test_save_enables_extension_mode_and_writes_the_token(
         self, monkeypatch, tmp_path: Path
     ) -> None:
@@ -1324,14 +1343,28 @@ class TestBrowserConfig:
         assert payload["ok"] is True
         assert payload["enabled"] is False
 
+    def _flag_double(self, monkeypatch, *, initially: bool) -> list[bool]:
+        """Model the durable enable flag in memory.
+
+        ``browser_mode_enabled`` resolves through ``config_dir()`` (KIROCREW_HOME),
+        which the ``data_home`` patch these tests use does not reach — so a real
+        flag file in ``tmp_path`` is invisible to it. Wiring the reader and the
+        writer to one cell keeps the contract that matters here honest: finalize
+        re-reads the flag AFTER persist wrote it, so the value it acts on is the
+        persisted one rather than the request's.
+        """
+        cell = [initially]
+        monkeypatch.setattr(mod, "browser_mode_enabled", lambda: cell[0])
+        monkeypatch.setattr(mod, "set_browser_mode_enabled", lambda v: cell.__setitem__(0, v))
+        return cell
+
     def test_disabling_revokes_active_sessions(self, monkeypatch, tmp_path: Path) -> None:
         # Disabling must reset live sessions, or the running ACP session keeps its
         # cached browser_* tools (kiro-cli caches tools/list for the session's
         # lifetime) and browsing works while Settings say "off". Fires because
         # this is a real enable->disable transition.
-        (tmp_path / "browser-mode-enabled").touch()  # currently ENABLED
         monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
-        monkeypatch.setattr(mod, "browser_mode_enabled", lambda: True)
+        self._flag_double(monkeypatch, initially=True)
         monkeypatch.setattr(mod, "deregister_playwright_proxy", lambda: (None, "deregistered"))
         import kiro_crew.dashboard.handlers.sessions as sessions_mod
 
@@ -1362,6 +1395,195 @@ class TestBrowserConfig:
         resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": False, "extension_mode": False}))
         payload = _payload(resp)
         assert payload["sessions_reset"] == 0
+
+    def test_enabling_rebuilds_the_agent_config(self, monkeypatch, tmp_path: Path) -> None:
+        # Registering the proxy in kiro's mcp.json is not enough to give a session
+        # browser tools: sessions launch with --agent and the generated spec pins
+        # includeMcpJson=False, so the agent config is the only source read and its
+        # `tools` list is a closed allowlist. Without this rebuild the toggle
+        # reports success and no session ever sees @playwright-mcp.
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        monkeypatch.setattr(mod, "register_playwright_proxy", lambda: (None, "registered"))
+        rebuilt: list[int] = []
+
+        async def _record() -> None:
+            rebuilt.append(1)
+
+        monkeypatch.setattr(mod, "_rebuild_agent_config", _record)
+        resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": True, "extension_mode": False}))
+        assert resp.status == 200
+        assert rebuilt == [1]
+
+    def test_rebuild_runs_after_registration_and_before_session_reset(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        # Ordering is load-bearing in both directions: the rebuild must merge the
+        # POST-registration mcp.json, and it must land BEFORE the session reset so
+        # the sessions that restart re-read the new spec rather than the old one.
+        (tmp_path / "browser-mode-enabled").touch()  # currently ENABLED -> real transition
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._flag_double(monkeypatch, initially=True)
+        order: list[str] = []
+
+        def _dereg() -> tuple[None, str]:
+            order.append("deregister")
+            return (None, "deregistered")
+
+        async def _rebuild() -> None:
+            order.append("rebuild")
+
+        async def _reset(_req: Any) -> int:
+            order.append("reset")
+            return 1
+
+        import kiro_crew.dashboard.handlers.sessions as sessions_mod
+
+        monkeypatch.setattr(mod, "deregister_playwright_proxy", _dereg)
+        monkeypatch.setattr(mod, "_rebuild_agent_config", _rebuild)
+        monkeypatch.setattr(sessions_mod, "_reset_all_sessions", _reset)
+        resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": False, "extension_mode": False}))
+        assert resp.status == 200
+        assert order == ["deregister", "rebuild", "reset"]
+
+    def test_enable_defers_to_a_concurrent_disable(self, monkeypatch, tmp_path: Path) -> None:
+        # Two saves persist their flags under a different lock than finalize holds,
+        # so they can reach finalize in either order. Finalize must act on the
+        # PERSISTED flag, not the value this request carried: otherwise an enable
+        # arriving after a disable re-registers the proxy and rebuilds the spec with
+        # @playwright-mcp while Browser Mode is off — tools mounted with the toggle
+        # saying off, the fail-open direction.
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        cell = self._flag_double(monkeypatch, initially=False)
+        # This request writes True, then a concurrent disable lands the last write.
+        monkeypatch.setattr(mod, "set_browser_mode_enabled", lambda _v: cell.__setitem__(0, False))
+        acted: list[str] = []
+        monkeypatch.setattr(
+            mod, "register_playwright_proxy",
+            lambda: (acted.append("register"), (None, "registered"))[1],
+        )
+        monkeypatch.setattr(
+            mod, "deregister_playwright_proxy",
+            lambda: (acted.append("deregister"), (None, "deregistered"))[1],
+        )
+        resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": True, "extension_mode": False}))
+        assert resp.status == 200
+        assert acted == ["deregister"], "finalize must follow the persisted flag"
+        assert _payload(resp)["enabled"] is False, "payload must report the effective state"
+
+    def test_concurrent_saves_do_not_overlap_finalization(self, monkeypatch, tmp_path: Path) -> None:
+        # The registration + rebuild + reset sequence is a read-modify-write on the
+        # agent spec. Two overlapping runs let a stale merge write last, which is how
+        # a disabled Browser Mode can end up with the tools still mounted. Assert the
+        # critical sections are strictly serialized rather than interleaved.
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        self._flag_double(monkeypatch, initially=False)
+        monkeypatch.setattr(mod, "register_playwright_proxy", lambda: (None, "registered"))
+        monkeypatch.setattr(mod, "deregister_playwright_proxy", lambda: (None, "deregistered"))
+        live = [0]
+        max_live = [0]
+
+        async def _slow_rebuild() -> None:
+            live[0] += 1
+            max_live[0] = max(max_live[0], live[0])
+            # Long enough that an unserialized peer reaches its own rebuild while
+            # this one is still inside it. sleep(0) is a single yield and is NOT
+            # enough — the peer is several await hops behind, so the test would
+            # pass with the lock removed.
+            await asyncio.sleep(0.05)
+            live[0] -= 1
+
+        monkeypatch.setattr(mod, "_rebuild_agent_config", _slow_rebuild)
+
+        async def _both() -> None:
+            await asyncio.gather(
+                mod.api_browser_config_save(_Req(_state(), {"enabled": True, "extension_mode": False})),
+                mod.api_browser_config_save(_Req(_state(), {"enabled": False, "extension_mode": False})),
+            )
+
+        asyncio.run(_both())
+        assert max_live[0] == 1, f"finalization overlapped: {max_live[0]} concurrent rebuilds"
+
+    def test_rebuild_runs_under_the_shared_config_lock(self, monkeypatch, tmp_path: Path) -> None:
+        # The rebuild is a read-modify-write of the agent spec's tools/allowedTools,
+        # and POST /api/mcp/toggle mutates the same grant under _get_config_lock via
+        # _sync_mcp_to_agent. Unserialized, a browser save that snapshotted an enabled
+        # server writes last and restores a grant the toggle just revoked — a
+        # privilege the operator explicitly removed comes back.
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        self._flag_double(monkeypatch, initially=False)
+        monkeypatch.setattr(mod, "register_playwright_proxy", lambda: (None, "registered"))
+        monkeypatch.setattr(mod, "_rebuild_agent_config", _REAL_REBUILD)
+        held: list[bool] = []
+
+        async def _drive() -> Any:
+            # Resolve the lock ON the loop: _get_config_lock calls get_running_loop,
+            # so it cannot be called from the to_thread worker. Lock.locked() is a
+            # plain attribute read and is safe to call there.
+            lock = _get_config_lock()
+            monkeypatch.setattr(
+                agent_mod, "rebuild_agent_config", lambda **_k: held.append(lock.locked())
+            )
+            return await mod.api_browser_config_save(
+                _Req(_state(), {"enabled": True, "extension_mode": False})
+            )
+
+        resp = asyncio.run(_drive())
+        assert resp.status == 200
+        assert held == [True], "rebuild must hold the shared config lock"
+
+    def test_registration_does_not_hold_the_config_lock(self, monkeypatch, tmp_path: Path) -> None:
+        # The inverse invariant, and it is load-bearing: (de)registration blocks on the
+        # inter-process mcp.lock file lock. Holding an asyncio lock across that wait
+        # couples the two, so one wedged mcp.lock would stall every config.json writer
+        # dashboard-wide. Widening the config lock to cover registration is therefore
+        # not an acceptable way to serialize this path.
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        self._flag_double(monkeypatch, initially=False)
+        held: list[bool] = []
+
+        async def _drive() -> Any:
+            lock = _get_config_lock()
+            monkeypatch.setattr(
+                mod, "register_playwright_proxy",
+                lambda: (held.append(lock.locked()), (None, "registered"))[1],
+            )
+            return await mod.api_browser_config_save(
+                _Req(_state(), {"enabled": True, "extension_mode": False})
+            )
+
+        resp = asyncio.run(_drive())
+        assert resp.status == 200
+        assert held == [False], "registration must not run under the config lock"
+
+    def test_rebuild_failure_does_not_fail_the_save(self, monkeypatch, tmp_path: Path) -> None:
+        # The preference files and mcp.json already landed by the time the rebuild
+        # runs, so a rebuild error must not surface as a failed save — it degrades
+        # to "the new surface applies after the next restart". Exercised against the
+        # real wrapper (the autouse fixture stubs it for every other test here).
+        import kiro_crew.agent as agent_mod
+
+        def _boom(**_kwargs: Any) -> None:
+            raise RuntimeError("agent home declined")
+
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config", _boom)
+        monkeypatch.setattr(loader, "data_home", lambda: tmp_path)
+        self._stub_enable_side_effects(monkeypatch)
+        monkeypatch.setattr(mod, "register_playwright_proxy", lambda: (None, "registered"))
+        # Undo the autouse noop so the module's own implementation runs.
+        monkeypatch.setattr(mod, "_rebuild_agent_config", _REAL_REBUILD)
+        resp = _run(mod.api_browser_config_save, _Req(_state(), {"enabled": True, "extension_mode": False}))
+        assert resp.status == 200
+        assert _payload(resp)["ok"] is True
 
 
 # ── small helpers ──

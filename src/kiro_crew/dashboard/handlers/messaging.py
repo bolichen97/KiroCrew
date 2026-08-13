@@ -2411,6 +2411,57 @@ def _persist_browser_preferences(
         generate_playwright_config(engine)
 
 
+_browser_finalize_lock: asyncio.Lock | None = None
+_browser_finalize_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_browser_finalize_lock() -> asyncio.Lock:
+    """Return the browser-finalize lock bound to the current loop (Python 3.10 compat).
+
+    Its own lock rather than the shared config lock: the register/deregister step
+    blocks on the inter-process ``mcp.lock`` file lock, and holding the config lock
+    across that wait would couple the two, so a wedged ``mcp.lock`` would freeze
+    every config.json writer dashboard-wide. This one only ever serializes browser
+    saves against each other.
+    """
+    global _browser_finalize_lock, _browser_finalize_lock_loop
+    loop = asyncio.get_running_loop()
+    if _browser_finalize_lock is None or _browser_finalize_lock_loop is not loop:
+        _browser_finalize_lock = asyncio.Lock()
+        _browser_finalize_lock_loop = loop
+    return _browser_finalize_lock
+
+
+async def _rebuild_agent_config() -> None:
+    """Best-effort agent-config rebuild so the new tool surface loads on the next session.
+
+    Held under the shared config lock, because the rebuild is a read-modify-write of
+    the agent spec's ``tools``/``allowedTools`` and it is not the only writer:
+    ``POST /api/mcp/toggle`` mutates the same grant through ``_sync_mcp_to_agent``
+    under that lock. Unserialized, a browser save that snapshotted an enabled MCP
+    server can write last and restore a grant a concurrent toggle just revoked.
+
+    The lock is taken HERE rather than around the caller's whole critical section on
+    purpose: the (de)registration step blocks on the inter-process ``mcp.lock`` file
+    lock, and holding an asyncio lock across that wait couples the two, so a wedged
+    ``mcp.lock`` would stall every ``config.json`` writer dashboard-wide.
+
+    Failure is reported, not raised: by the time this runs the preference files and
+    kiro's ``mcp.json`` have already been written, so a rebuild error must not make
+    the save look like it did nothing. Degrades to the prior behavior — the surface
+    applies after the next gateway restart, which rebuilds on init.
+    """
+    try:
+        # Local import: kiro_crew.agent imports dashboard handlers.
+        from kiro_crew.agent import rebuild_agent_config
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        async with _get_config_lock():
+            await asyncio.to_thread(rebuild_agent_config)
+    except Exception:
+        logger.warning("browser config saved, but agent config rebuild failed", exc_info=True)
+
+
 async def _browser_config_finalize(
     request: web.Request,
     *,
@@ -2446,66 +2497,100 @@ async def _browser_config_finalize(
                 "engine": engine,
             }
 
-    # Tool availability is the gate (there is no per-message marker): enabling
-    # REGISTERS the proxy so the browser_* tools appear in the agent's tool list;
-    # disabling DEREGISTERS it so they disappear and "off" actually prevents
-    # browser operation. Both go through the setup helpers, which hold the shared
-    # mcp.json lock (so a concurrent app-bridge or dashboard MCP write is not
-    # clobbered), refuse to touch a user-authored non-proxy entry under the
-    # canonical key, and create/rewrite the file safely. Blocking (file lock +
-    # disk I/O), so off the event loop.
+    # Serialize the whole authorization-changing sequence — (de)register, rebuild,
+    # session reset — against other browser saves. Two saves racing here can
+    # otherwise land fail-OPEN: an enable whose rebuild is mid-flight when a disable
+    # deregisters and rebuilds writes its stale merge last, leaving Browser Mode off
+    # while restarted sessions still carry the browser_* tools.
     #
-    # The preferences above are already persisted, so an mcp.json-level failure is
-    # reported in the payload rather than raised — a 500 here would tell the user
-    # nothing was saved when the flag/engine files were in fact written.
-    try:
-        if enabled:
-            _, mcp_status = await asyncio.to_thread(register_playwright_proxy)
-        else:
-            _, mcp_status = await asyncio.to_thread(deregister_playwright_proxy)
-    except OSError as exc:
-        logger.warning("browser config: MCP registration failed: %s", exc)
-        mcp_status = "registration-failed"
+    # Serialization alone is not enough, because the two saves persisted their flags
+    # under a DIFFERENT lock and may arrive here in either order. So the effective
+    # enable is re-read from the durable flag inside the critical section and drives
+    # the registration, instead of the value captured when this request was parsed.
+    # Whichever save wrote the flag last then determines the final state, and the
+    # registration plus the agent spec always agree with what is persisted.
+    async with _get_browser_finalize_lock():
+        effective_enabled = await asyncio.to_thread(browser_mode_enabled)
 
-    _sel().log_tool_invocation(
-        session_key="dashboard",
-        tool_name="browser_config_save",
-        outcome="completed",
-        downstream_service="browser",
-        resources=(
-            f"enabled={enabled} engine={engine} extension_mode={extension_mode} "
-            f"mcp={mcp_status}"
-        ),
-    )
-
-    # Flipping the enable changes the agent's tool surface (register mounts the
-    # browser_* tools, deregister removes them), and kiro-cli caches ``tools/list``
-    # for the LIFETIME of a session — ACP has no ``tools/list_changed`` push. Reset
-    # active sessions on the transition, the same primitive ``POST /api/mcp/sync``
-    # and the computer-use keystone use. Without this, DISABLING leaves the live
-    # session holding browser tools (the security-relevant direction: settings say
-    # off while browsing still works), and enabling shows "0 browser tools" until
-    # some later cold session. Only on a real change: a re-save with the same value
-    # must not tear down the user's session.
-    sessions_reset = 0
-    if enabled != enabled_before:
-        from kiro_crew.dashboard.handlers.sessions import _reset_all_sessions
-
+        # Tool availability is the gate (there is no per-message marker): enabling
+        # REGISTERS the proxy so the browser_* tools appear in the agent's tool
+        # list; disabling DEREGISTERS it so they disappear and "off" actually
+        # prevents browser operation. Both go through the setup helpers, which hold
+        # the shared mcp.json lock (so a concurrent app-bridge or dashboard MCP
+        # write is not clobbered), refuse to touch a user-authored non-proxy entry
+        # under the canonical key, and create/rewrite the file safely. Blocking
+        # (file lock + disk I/O), so off the event loop.
+        #
+        # The preferences above are already persisted, so an mcp.json-level failure
+        # is reported in the payload rather than raised — a 500 here would tell the
+        # user nothing was saved when the flag/engine files were in fact written.
         try:
-            sessions_reset = await _reset_all_sessions(request)
-        except Exception:
-            # The preferences already landed and were audited; a reset failure must
-            # not report the SAVE as failed. Worst case is the prior behavior — the
-            # new tool surface applies on the next cold session.
-            logger.exception("browser config saved, but session reset failed")
+            if effective_enabled:
+                _, mcp_status = await asyncio.to_thread(register_playwright_proxy)
+            else:
+                _, mcp_status = await asyncio.to_thread(deregister_playwright_proxy)
+        except OSError as exc:
+            logger.warning("browser config: MCP registration failed: %s", exc)
+            mcp_status = "registration-failed"
+
+        # Writing kiro's mcp.json is necessary but NOT sufficient: sessions launch
+        # with ``--agent`` and the generated spec pins ``includeMcpJson: False``, so
+        # the agent config — not kiro's mcp.json — is the only source a session
+        # reads, and its ``tools`` list is a closed allowlist with no wildcard.
+        # Without a rebuild the proxy sits in mcp.json while every session (cold
+        # ones included) keeps reading a spec that carries no ``@playwright-mcp``,
+        # so enabling reports success and delivers no browser tools until some later
+        # unrelated rebuild. The same rebuild is what the custom-MCP write path
+        # already does after changing a server. Runs AFTER the (de)registration so
+        # it merges the final mcp.json, and BEFORE the session reset so restarted
+        # sessions pick up the new surface.
+        await _rebuild_agent_config()
+
+        _sel().log_tool_invocation(
+            session_key="dashboard",
+            tool_name="browser_config_save",
+            outcome="completed",
+            downstream_service="browser",
+            resources=(
+                f"enabled={effective_enabled} engine={engine} "
+                f"extension_mode={extension_mode} mcp={mcp_status}"
+            ),
+        )
+
+        # Flipping the enable changes the agent's tool surface (register mounts the
+        # browser_* tools, deregister removes them), and kiro-cli caches
+        # ``tools/list`` for the LIFETIME of a session — ACP has no
+        # ``tools/list_changed`` push. Reset active sessions on the transition, the
+        # same primitive ``POST /api/mcp/sync`` and the computer-use keystone use.
+        # Without this, DISABLING leaves the live session holding browser tools (the
+        # security-relevant direction: settings say off while browsing still works),
+        # and enabling shows "0 browser tools" until some later cold session. Only
+        # on a real change: a re-save with the same value must not tear down the
+        # user's session.
+        sessions_reset = 0
+        if effective_enabled != enabled_before:
+            from kiro_crew.dashboard.handlers.sessions import _reset_all_sessions
+
+            try:
+                sessions_reset = await _reset_all_sessions(request)
+            except Exception:
+                # The preferences already landed and were audited; a reset failure
+                # must not report the SAVE as failed. Worst case is the prior
+                # behavior — the new surface applies on the next cold session.
+                logger.exception("browser config saved, but session reset failed")
 
     # ``mcp_status`` is "kept-user-entry" when the caller's own hand-authored
     # Playwright server was left in place — the preferences were still saved,
     # but KiroCrew's proxy was deliberately NOT written over their config.
+    #
+    # ``enabled`` reports the EFFECTIVE state the registration was driven from, not
+    # the value this request asked for: under a concurrent save the two can differ,
+    # and echoing the request would tell this caller their value won when the other
+    # save's flag is what is persisted and mounted.
     payload: dict[str, Any] = {
         "ok": True,
         "mcp_status": mcp_status,
-        "enabled": enabled,
+        "enabled": effective_enabled,
         "engine": engine,
         "sessions_reset": sessions_reset,
     }
