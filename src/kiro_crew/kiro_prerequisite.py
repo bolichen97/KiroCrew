@@ -111,6 +111,23 @@ def legacy_idle_operation() -> dict[str, str]:
 _MAX_CAPTURED_OUTPUT = 64 * 1024
 _MAX_VISIBLE_DETAIL = 4_000
 _PROBE_TIMEOUT_SECS = 10
+#: Marker identifying a kiro-cli agent-spec REJECTION in the probe's captured
+#: output, as opposed to any other reason the probe produced text.
+#:
+#: ``kiro-cli agent validate`` exits 0 whether or not it accepted the file — the
+#: verdict is carried only in the message it writes — so the exit status cannot
+#: be used and this match is the whole signal. On acceptance it writes nothing at
+#: all; on rejection it writes ``Error: Json supplied at <path> is invalid:
+#: <reason>``.
+#:
+#: Matching the schema-rejection wording rather than "the probe printed
+#: something" is deliberate and load-bearing in BOTH directions. A probe that
+#: could not read the file (a sandbox denial, a deleted spec) also writes to the
+#: captured stream, and reporting that as "kiro-cli rejects your spec" would send
+#: the user to rewrite a spec that is fine. Anything unrecognized is therefore
+#: treated as acceptance: this module's rule is to report nothing rather than
+#: block a working install behind a repair card it cannot clear.
+_SPEC_REJECTION_MARKER = "is invalid"
 # The identity probe's own budget, deliberately separate from
 # _PROBE_TIMEOUT_SECS. ``whoami`` is not a local read: when the cached token has
 # expired, Kiro CLI refreshes an OIDC token against the organization's IdP —
@@ -358,6 +375,22 @@ class PrerequisiteStatus:
     # succeeded. Shown verbatim, untranslated: it names the failing install step,
     # which is the one thing a support conversation actually needs.
     agent_spec_repair_error: str = ""
+    # Kiro Crew's own specs that are PRESENT but which kiro-cli refuses to load.
+    # Presence and acceptance are different questions: a spec on disk that the
+    # installed kiro-cli rejects is dropped from its agent table entirely, so
+    # ``--agent kirocrew`` resolves to the default agent with only a line on
+    # stderr — every Kiro Crew MCP server silently absent from the session. That
+    # is indistinguishable from a working install to anything that only stats the
+    # file, which is why ``missing_agent_specs`` cannot cover it.
+    #
+    # The oracle is the binary, never a schema mirrored here: kiro-cli is asked
+    # whether it accepts each spec, so a future release that changes the spec
+    # schema is reported rather than guessed at.
+    rejected_agent_specs: list[str] = field(default_factory=list)
+    # kiro-cli's own reason for the first rejection above, sanitized. Its message
+    # names the offending file and construct, which is the only thing that turns
+    # "my agents stopped working" into an actionable report.
+    agent_spec_rejection_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -1443,6 +1476,17 @@ def _established_installation(data_home: Path) -> bool:
     return False
 
 
+def _default_spec_lister() -> list[tuple[str, Path]]:
+    """Production enumerator for :class:`KiroPrerequisiteService`'s spec probe.
+
+    Delegates so path resolution and the ownership guard stay in ``agent.py``
+    (see ``present_required_agent_specs``).
+    """
+    from kiro_crew.agent import present_required_agent_specs  # circular import
+
+    return present_required_agent_specs()
+
+
 class KiroPrerequisiteService:
     """Single-gateway coordinator for prerequisite probes and setup operations."""
 
@@ -1456,6 +1500,7 @@ class KiroPrerequisiteService:
         process_runner: ProcessRunner | None = None,
         audit_writer: AuditWriter | None = None,
         clock: Callable[[], float] | None = None,
+        spec_lister: Callable[[], list[tuple[str, Path]]] | None = None,
         assume_ready: bool = False,
         warm_up_delay: float = _WARM_UP_DELAY_SECS,
     ) -> None:
@@ -1509,6 +1554,10 @@ class KiroPrerequisiteService:
         self._probe_environment: dict[str, str] = {}
         self._run = process_runner or _run_process
         self._audit = audit_writer or _write_audit
+        # Injected like the runner and clock above so a test states which specs
+        # exist instead of inheriting whatever is in the developer's real agents
+        # dir — otherwise spawn-count assertions vary by machine.
+        self._spec_lister = spec_lister or _default_spec_lister
         self._clock = clock or time.monotonic
         self._assume_ready = assume_ready
         # `assume_ready` must hold from CONSTRUCTION, not from the first probe:
@@ -1676,13 +1725,48 @@ class KiroPrerequisiteService:
         async with self._repair_lock:
             before = await self._agent_spec_overlay(self._snapshot_dict())
             missing_before = before.get("missing_agent_specs") or []
-            if AGENT_FILENAME not in missing_before:
+            # Read off the latched probe result because acceptance costs a
+            # subprocess and the overlay above is deliberately stat-only.
+            rejected_before = before.get("rejected_agent_specs") or []
+            # A REJECTED spec is deliberately NOT rebuilt. The file exists, so a
+            # regenerate would drop a concurrent api_mcp_toggle edit to the
+            # tools/allowedTools half that rebuild_agent_config does not re-merge
+            # (see _repair_agent_specs). Losing a user's tool grants to clear a
+            # rejection is a worse outcome than the rejection, and the rebuild
+            # cannot be made safe here: it already takes bridges._mcp_lock
+            # internally, so wrapping this call in the same lock would deadlock.
+            # Re-asking the binary is the honest action for the state, and it is
+            # what the card's button offers.
+            repairable = AGENT_FILENAME in missing_before
+            if not repairable:
+                if rejected_before:
+                    # Not a no-op: acceptance is only re-answerable by the binary,
+                    # and the stat-only overlay cannot ask it. force=True because
+                    # the cached snapshot inside _PROBE_CACHE_SECS would just echo
+                    # the rejection this is trying to re-test.
+                    try:
+                        await self._probe(force=True)
+                    except Exception:  # noqa: BLE001 — stale state beats a 500
+                        logger.warning("Re-probe of rejected agent specs failed", exc_info=True)
+                    result = await self._agent_spec_overlay(self._snapshot_dict())
+                    result["agent_spec_repair_error"] = ""
+                    return result
                 # Nothing to repair, only an auxiliary spec is missing (which the
                 # main-spec gate deliberately excludes), or a concurrent repair
                 # already wrote it. Report, do not write.
                 before["agent_spec_repair_error"] = ""
                 return before
             error = await self._repair_agent_specs()
+            if not error and AGENT_FILENAME in rejected_before:
+                # Acceptance is only re-answerable by the binary, and the overlay
+                # cannot ask it. Re-probe so a rewrite that actually fixed the
+                # rejection clears the card instead of leaving stale state up.
+                # Affordable and in-policy here: this is the explicit-action half
+                # of the probe's boot-and-explicit-action budget.
+                try:
+                    await self._probe(force=True)
+                except Exception:  # noqa: BLE001 — a failed re-probe keeps stale state, not a 500
+                    logger.warning("Re-probe after agent-spec repair failed", exc_info=True)
             result = await self._agent_spec_overlay(self._snapshot_dict())
             if not error and (result.get("missing_agent_specs") or []):
                 error = (
@@ -1986,17 +2070,80 @@ class KiroPrerequisiteService:
             )
             if whoami.ok:
                 await asyncio.to_thread(self._mark_setup_complete)
+            # Acceptance is checked here, on the probe path, because it costs a
+            # spawn per spec — the every-read overlay stays stat-only. Gated on a
+            # successful identity probe so a broken or signed-out CLI is reported
+            # as exactly that: asking a CLI that cannot authenticate whether it
+            # likes our specs adds spawns and a second card for one fault, and its
+            # answer would not be actionable until sign-in is fixed anyway.
+            rejected: list[str] = []
+            rejection_detail = ""
+            if whoami.ok:
+                rejected, rejection_detail = await self._probe_spec_acceptance(
+                    self._viable_binary
+                )
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
                 installed=True,
                 authenticated=whoami.ok,
-                ready=whoami.ok,
-                repair_required=False,
+                # A required spec the CLI refuses fails every turn, exactly like
+                # one that is absent, so it narrows readiness the same way.
+                ready=whoami.ok and not rejected,
+                repair_required=bool(rejected),
                 initial_setup_complete=self._initial_setup_complete,
+                rejected_agent_specs=rejected,
+                agent_spec_rejection_detail=rejection_detail,
             )
             self._last_probe_at = self._clock()
             self._has_probed = True
             return self._status
+
+    async def _probe_spec_acceptance(self, executable: str) -> tuple[list[str], str]:
+        """Ask kiro-cli whether it accepts each required Kiro Crew spec on disk.
+
+        Returns ``(rejected filenames, first reason)`` — both empty when every
+        present spec is accepted.
+
+        Complements :meth:`_agent_spec_overlay`, which answers whether the specs
+        EXIST. A spec can be present and still be refused, and a refused spec is
+        dropped from kiro-cli's agent table, so the product's own agent resolves
+        to the default one with none of its MCP servers. Statting the file cannot
+        see that; only the binary can answer it.
+
+        Scoped to :data:`REQUIRED_KIRO_AGENT_FILES` because those are the specs
+        whose rejection fails EVERY turn rather than disabling one feature, and to
+        files that already exist because absence is ``missing_agent_specs``' job —
+        reporting one fault under two names would put two cards on one problem.
+
+        A spawn per spec, so it belongs to the probe's boot-and-explicit-action
+        budget and must not be folded into the every-read overlay.
+        """
+
+        def _present() -> list[tuple[str, Path]]:
+            return self._spec_lister()
+
+        # Enumeration is delegated so path resolution and the ownership guard live
+        # in one place (see present_required_agent_specs): an instance that may not
+        # own these specs gets an empty list and spawns nothing.
+        try:
+            specs = await asyncio.to_thread(_present)
+        except Exception:
+            logger.debug("Could not enumerate Kiro Crew agent specs", exc_info=True)
+            return [], ""
+        rejected: list[str] = []
+        detail = ""
+        for filename, spec_path in specs:
+            result = await self._audited_probe(
+                "probe_agent_spec",
+                executable,
+                ["agent", "validate", "--path", str(spec_path)],
+            )
+            if _SPEC_REJECTION_MARKER not in (result.output or ""):
+                continue
+            rejected.append(filename)
+            if not detail:
+                detail = _sanitize_detail((result.output or "").strip())
+        return rejected, detail
 
     async def _audited_probe(
         self,
