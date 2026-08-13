@@ -10138,13 +10138,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "Deine Chat-Sitzungen wurden neu gestartet, damit dies sofort wirkt — Kiro liest seine Werkzeugliste einmal pro Sitzung, ein offener Chat hätte sie sonst nicht übernommen. Deine Nachrichten sind weiterhin da; der Agent liest seinen Kontext bei deiner nächsten Nachricht erneut."
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "Optional. Verweisen Sie auf einen gebauten kiro-agent-Checkout oder ein entpacktes Eval-Bundle, um diesen Build anstelle des mitgelieferten auszuführen.",
+        "acp_backend": "ACP-Backend",
         "developer_mode": "Entwicklermodus",
         "developer_tools": "Entwicklerwerkzeuge",
+        "failed_to_save_acp_backend": "Die ACP-Backend-Einstellung konnte nicht gespeichert werden",
         "gateway": "Gateway",
+        "kas_build_path": "KAS-Build-Pfad",
+        "kiro_agent_server_direct": "Kiro Agent Server (v3)",
+        "kiro_cli_default": "kiro-cli (Standard)",
         "open_developer_page": "Entwicklerseite öffnen",
         "run_a_local_gateway": "Lokales Gateway ausführen",
         "show_developer_page_in_sidebar_with_logs_system": "Entwicklerseite in der Seitenleiste mit Protokollen, Systemmetriken und Erinnerungsinterna anzeigen",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Startet ein Gateway auf diesem Rechner. Deaktivieren, um Kiro Crew nur als Client zu verwenden: die Verbindung geht dann an das konfigurierte Gateway, anstatt hier eines zu starten. Wird beim nächsten Start der App wirksam."
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Startet ein Gateway auf diesem Rechner. Deaktivieren, um Kiro Crew nur als Client zu verwenden: die Verbindung geht dann an das konfigurierte Gateway, anstatt hier eines zu starten. Wird beim nächsten Start der App wirksam.",
+        "uses_the_kas_bundled_with_kiro_cli": "Verwendet das mit kiro-cli gelieferte KAS",
+        "which_acp_server_to_drive_both_are_the_same": "Welches Harness kiro-cli ausführt. Beide sind hauseigen; KAS ist die neuere Engine und benötigt keine Installation, da kiro-cli sie mitliefert."
       },
       "discordPanel": {
         "allowed_server_thread_ids": "Erlaubte Server-Thread-IDs",

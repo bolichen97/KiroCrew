@@ -10019,13 +10019,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "채팅 세션이 다시 시작되어 이 변경이 즉시 적용됩니다 — Kiro는 세션마다 도구 목록을 한 번만 읽으므로 열려 있던 채팅은 그렇지 않으면 변경을 반영하지 못합니다. 메시지는 그대로 남아 있으며, 에이전트는 다음 메시지에서 컨텍스트를 다시 읽습니다."
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "선택 사항입니다. 빌드된 kiro-agent 체크아웃이나 추출된 eval 번들을 지정하면 포함된 버전 대신 해당 빌드를 실행합니다.",
+        "acp_backend": "ACP 백엔드",
         "developer_mode": "개발자 모드",
         "developer_tools": "개발자 도구",
+        "failed_to_save_acp_backend": "ACP 백엔드 설정을 저장하지 못했습니다",
         "gateway": "게이트웨이",
+        "kas_build_path": "KAS 빌드 경로",
+        "kiro_agent_server_direct": "Kiro Agent Server(v3)",
+        "kiro_cli_default": "kiro-cli(기본값)",
         "open_developer_page": "개발자 페이지 열기",
         "run_a_local_gateway": "로컬 게이트웨이 실행",
         "show_developer_page_in_sidebar_with_logs_system": "사이드바에 로그, 시스템 지표, 메모리 내부 정보가 포함된 개발자 페이지 표시",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "이 컴퓨터에서 게이트웨이를 시작합니다. 끄면 Kiro Crew를 클라이언트로만 사용하며, 여기서 실행하는 대신 설정한 게이트웨이에 연결합니다. 다음에 앱을 열 때 적용됩니다."
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "이 컴퓨터에서 게이트웨이를 시작합니다. 끄면 Kiro Crew를 클라이언트로만 사용하며, 여기서 실행하는 대신 설정한 게이트웨이에 연결합니다. 다음에 앱을 열 때 적용됩니다.",
+        "uses_the_kas_bundled_with_kiro_cli": "kiro-cli에 포함된 KAS 사용",
+        "which_acp_server_to_drive_both_are_the_same": "kiro-cli가 실행할 harness입니다. 둘 다 자사 제품이며, KAS는 더 새로운 엔진으로 kiro-cli에 포함되어 있어 설치가 필요하지 않습니다."
       },
       "discordPanel": {
         "allowed_server_thread_ids": "허용된 서버 스레드 ID",

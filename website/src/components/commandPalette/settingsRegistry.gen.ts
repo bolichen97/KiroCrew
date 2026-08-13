@@ -470,12 +470,30 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.acp-backend",
+    "label": "ACP Backend",
+    "description": "Which harness kiro-cli runs. Both are first-party; KAS is the newer engine and needs no install, since kiro-cli ships it.",
+    "tab": "developer",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "agent.acp_backend"
+  },
+  {
     "id": "developer.developer-mode",
     "label": "Developer Mode",
     "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "developer.kas-build-path",
+    "label": "KAS build path",
+    "description": "Optional. Point at a built kiro-agent checkout or an extracted eval bundle to run that build instead of the shipped one.",
+    "tab": "developer",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "agent.kas_path"
   },
   {
     "id": "developer.run-a-local-gateway",

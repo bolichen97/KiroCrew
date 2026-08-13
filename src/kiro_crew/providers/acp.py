@@ -24,6 +24,7 @@ from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KAS,
     EVENT_COMPACTION_STATUS,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
@@ -238,6 +239,7 @@ class AcpProvider(LLMProvider):
         channel_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         acp_backend: str = "",
+        kas_path: str = "",
         effort_per_model: dict[str, str] | None = None,
         effort_defaults: object = None,
         tool_search: bool | None = None,
@@ -254,6 +256,7 @@ class AcpProvider(LLMProvider):
             "channel_id": channel_id,
             "extra_env": extra_env,
             "acp_backend": acp_backend,
+            "kas_path": kas_path,
             "mcp_gateway_overlay": mcp_gateway_overlay,
             "mcp_gateway_settings_mcp_json": mcp_gateway_settings_mcp_json,
             "mcp_gateway_socket": mcp_gateway_socket,
@@ -264,6 +267,8 @@ class AcpProvider(LLMProvider):
         }
         if agent:
             kwargs["agent"] = agent
+        # Read by is_kas_direct to decide runtime-vs-client routing.
+        self._kas_path = kas_path
         self._client = AcpClient(**kwargs)
         # F2 load-recovery: set True by _start_kiro_runtime_impl when a resume
         # falls back to a FRESH native session (the prior session's lock never
@@ -346,15 +351,27 @@ class AcpProvider(LLMProvider):
         return self._client.backend == ACP_BACKEND_CLAUDE
 
     @property
+    def is_kas_direct(self) -> bool:
+        """True when this provider must run a LOCAL KAS build, not the CLI's.
+
+        The multiplexed runtime spawns kiro-cli, so it cannot host a bare-Node
+        KAS process. Rather than silently running a DIFFERENT build than the
+        operator named, this routes to AcpClient — the same shape the claude
+        backend already uses (one process per session, no session sharing).
+        """
+        return bool(self._kas_path.strip()) and self._client.backend == ACP_BACKEND_KAS
+
+    @property
     def is_session_sharing_eligible(self) -> bool:
         """True when this provider can host multiplexed subagent sessions.
 
         Session sharing requires the kiro-cli backend (which supports N
         concurrent sessions per process via AcpRuntime demux). The Claude
         Code backend uses AcpClient (one process per session) and is never
-        eligible, so subagents fall back to the legacy per-process path.
+        eligible, so subagents fall back to the legacy per-process path. A
+        direct KAS spawn is excluded for the same reason.
         """
-        return not self.is_claude_backend
+        return not self.is_claude_backend and not self.is_kas_direct
 
     async def _start_kiro_runtime(self) -> None:
         """Spawn an AcpRuntime + session; time the kiro cold-start split.
@@ -566,6 +583,7 @@ class AcpProvider(LLMProvider):
         configured_model = getattr(self._client, "_model", "") or ""
 
         runtime = AcpRuntime(
+            acp_backend=self._client.backend,
             work_dir=work_dir,
             agent=agent or "kirocrew",
             sandbox_mode=sandbox_mode,
@@ -656,6 +674,7 @@ class AcpProvider(LLMProvider):
                     except Exception:
                         pass
                     runtime = AcpRuntime(
+                        acp_backend=self._client.backend,
                         work_dir=work_dir,
                         agent=agent or "kirocrew",
                         sandbox_mode=sandbox_mode,
@@ -982,7 +1001,7 @@ class AcpProvider(LLMProvider):
         self._apply_effort_overlay()
         self._apply_tool_search_overlay()
 
-        if not self.is_claude_backend:
+        if not self.is_claude_backend and not self.is_kas_direct:
             # ── Kiro unified path: AcpRuntime + AcpSessionHandle ──
             # Spawn a runtime, create/resume a session, wrap in
             # AcpSessionProvider. One process hosts parent + all subagent

@@ -45,6 +45,7 @@ from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOra
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KAS,
     ACP_CLIENT_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -104,7 +105,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
 )
-from kiro_crew.env import augmented_path, resolve_krb5_ccname
+from kiro_crew.env import augmented_path, find_node_tool, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import (
     HOOK_EVENT_POST_TOOL_USE,
@@ -135,10 +136,51 @@ _T = TypeVar("_T")
 # upstream ACP SDK (numeric integer, currently 1).  See acp.types.
 PROTOCOL_VERSION = "2025-08-22"
 PROTOCOL_VERSION_CLAUDE = 1
+# KAS is built on the same upstream ACP SDK as claude-agent-acp, so it takes the
+# numeric form. It also echoes back whatever the client sent rather than
+# validating or clamping, so this value is the semantically correct one rather
+# than a negotiated one — do not read the echo as agreement.
+PROTOCOL_VERSION_KAS = 1
 DEFAULT_MODEL = "auto"
 
 KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
+
+# ── KAS (Kiro Agent Server) backend ──
+#: kiro-cli embeds KAS and selects it with this flag, so the default KAS path
+#: needs no user install and is always version-matched to the installed CLI.
+#: kiro-cli owns the KAS spawn (entry discovery, the WASM flag, auth), and
+#: Kiro Crew keeps talking to kiro-cli — so this path keeps the CLI's date-string
+#: protocol version, NOT the numeric one KAS itself speaks.
+KIRO_CLI_KAS_ENGINE_ARG = "--agent-engine=v3"
+
+#: Entry script a KAS build exposes, relative to a checkout or extracted-bundle
+#: root (both layouts expose the same path). Only used for the optional
+#: direct-spawn override.
+_KAS_ENTRY_REL = Path("packages") / "kiro-agent" / "dist" / "server" / "acp-server.js"
+#: An extracted eval-bundle also carries its own pinned Node here. That
+#: interpreter is preferred over the host's because the bundle's native modules
+#: are prebuilt for one Node ABI, and a mismatched host Node fails at module
+#: import — far from the cause — rather than at spawn.
+_KAS_BUNDLED_NODE_REL = Path(".node") / "bin" / "node"
+#: Extensions the bundled interpreter may carry on Windows. Mirrors
+#: ``platform_compat._WINDOWS_BIN_SUFFIXES``: argv takes a bare name while the
+#: file on disk carries the extension, so the lookup must try both.
+_WINDOWS_NODE_SUFFIXES = ("", ".exe", ".cmd")
+#: Flags a direct KAS spawn requires, mirroring how kiro-cli launches it.
+#: ``--experimental-wasm-modules`` is load-bearing: the policy engine's Cedar and
+#: tree-sitter grammars are WASM modules, so without it shell parsing fails at
+#: import. ``--auth=acp-callback`` routes token refresh back over ACP instead of
+#: reading a cached token file.
+_KAS_NODE_FLAGS = ("--experimental-wasm-modules",)
+_KAS_SERVER_ARGS = ("--transport=stdio", "--auth=acp-callback")
+#: Explicit override pointing at the entry SCRIPT (not a root). kiro-cli's own
+#: variables are honoured first so one export drives both tools.
+_KAS_ENTRY_ENVS = ("KIRO_KAS_SERVER_PATH", "KIROCREW_KAS_ENTRY")
+#: Explicit override pointing at a checkout or extracted-bundle ROOT.
+_KAS_ROOT_ENV = "KIROCREW_KAS_ROOT"
+#: Interpreter override, matching kiro-cli's variable.
+_KAS_NODE_ENV = "KIRO_KAS_NODE_PATH"
 
 CLAUDE_ACP_BIN = "claude-agent-acp"
 # On-disk name of the Claude backend CLI.  The claude-agent-acp adapter
@@ -351,6 +393,82 @@ def _resolve_node_for_script(script_path: str) -> str | None:
 
 _UNRESOLVED: object = object()  # sentinel for "not yet resolved"
 _claude_acp_argv_cache: list[str] | None | object = _UNRESOLVED
+
+
+def _kas_node_for(root: Path) -> str | None:
+    """Interpreter to run a KAS entry under *root*, or None to use the host's.
+
+    An extracted eval-bundle ships its own pinned Node because its native
+    modules are prebuilt against one Node ABI; running them under a mismatched
+    host interpreter fails at module import, which is much harder to read than a
+    spawn failure. A plain source checkout has no bundled Node, so the caller
+    falls back to the host's.
+
+    Windows carries the extension on disk (``node.exe``) while POSIX does not,
+    and ``is_executable_file`` there accepts only known extensions — so a
+    suffix-blind lookup would miss the bundled interpreter on Windows and
+    silently fall through to the host's, reintroducing the very ABI mismatch
+    this function exists to prevent.
+    """
+    suffixes = _WINDOWS_NODE_SUFFIXES if platform_compat.IS_WINDOWS else ("",)
+    for suffix in suffixes:
+        bundled = root / _KAS_BUNDLED_NODE_REL.with_name(_KAS_BUNDLED_NODE_REL.name + suffix)
+        if platform_compat.is_executable_file(bundled):
+            return str(bundled)
+    return None
+
+
+def _resolve_kas_acp_bin(configured_root: str = "") -> list[str] | None:
+    """Find the KAS ACP server entry and return argv, or None.
+
+    Returns argv such as ``["/path/.node/bin/node", "/path/.../acp-server.js"]``.
+    Node is resolved explicitly rather than left to a shebang, which does not
+    resolve in non-interactive launchd/systemd contexts.
+
+    Resolution order (first hit wins):
+      1. ``KIROCREW_KAS_ENTRY`` — an explicit entry SCRIPT path.
+      2. *configured_root* (``agent.kas_path``) — a kiro-agent checkout or an
+         extracted eval-bundle root.
+      3. ``KIROCREW_KAS_ROOT`` — the same, from the environment.
+
+    Deliberately NOT searched: PATH. KAS ships no PATH-installed launcher, so a
+    PATH hit would be an unrelated binary; an operator points at a build.
+    """
+    for env_name in _KAS_ENTRY_ENVS:
+        entry_override = os.environ.get(env_name, "").strip()
+        if not entry_override:
+            continue
+        entry = Path(entry_override).expanduser()
+        if entry.is_file():
+            return _kas_argv(entry, _kas_node_for(entry.parent))
+        # Do NOT fall through to the configured root: running a DIFFERENT build
+        # than the operator explicitly named is worse than failing to start.
+        logger.warning("%s is set but not a file: %s", env_name, entry_override)
+        return None
+
+    for raw in (configured_root.strip(), os.environ.get(_KAS_ROOT_ENV, "").strip()):
+        if not raw:
+            continue
+        root = Path(raw).expanduser()
+        entry = root / _KAS_ENTRY_REL
+        if not entry.is_file():
+            continue
+        return _kas_argv(entry, _kas_node_for(root))
+    return None
+
+
+def _kas_argv(entry: Path, bundled_node: str | None) -> list[str] | None:
+    """Build the argv for a direct KAS spawn, or None when Node is unresolvable.
+
+    Mirrors kiro-cli's own launch shape — the WASM flag and the ACP-callback auth
+    mode are not optional, since the policy engine's Cedar and tree-sitter
+    grammars are WASM modules and token refresh is host-mediated.
+    """
+    node = bundled_node or os.environ.get(_KAS_NODE_ENV, "").strip() or find_node_tool("node")
+    if not node:
+        logger.warning("KAS entry found at %s but no node interpreter resolved", entry)
+        return None
+    return [node, *_KAS_NODE_FLAGS, str(entry), *_KAS_SERVER_ARGS]
 
 
 def _vendored_claude_acp_roots(pkg_dir: Path | None = None) -> list[Path]:
@@ -1788,6 +1906,7 @@ class AcpClient:
         channel_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         acp_backend: str = "",
+        kas_path: str = "",
         audit_source: str | None = None,
         mcp_gateway_overlay: str | Path | None = None,
         mcp_gateway_settings_mcp_json: str | Path | None = None,
@@ -1810,6 +1929,9 @@ class AcpClient:
         self._agent = agent
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
+        # Where to find the KAS build (checkout or extracted eval-bundle).
+        # Inert unless acp_backend is ACP_BACKEND_KAS.
+        self._kas_path = kas_path
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path and unused by the public core; a companion
         # that drives the _is_claude seam reads/writes it and wires the
@@ -1989,6 +2111,41 @@ class AcpClient:
     @property
     def _is_claude(self) -> bool:
         return self.backend == ACP_BACKEND_CLAUDE
+
+    @property
+    def _is_kas(self) -> bool:
+        """Whether this session runs Kiro Agent Server as its harness."""
+        return self.backend == ACP_BACKEND_KAS
+
+    @property
+    def _is_kas_direct(self) -> bool:
+        """Whether KAS is spawned directly rather than through kiro-cli.
+
+        Only true when the operator named a local build. The default KAS path
+        goes through ``kiro-cli acp --agent-engine=v3``, which needs no install
+        and stays version-matched to the CLI.
+        """
+        if not self._is_kas:
+            return False
+        if self._kas_path.strip():
+            return True
+        # Every env var the resolver accepts must also SELECT this path, or an
+        # operator who exports only the root var silently gets the CLI's
+        # embedded KAS instead of the build they named.
+        return any(
+            os.environ.get(name, "").strip()
+            for name in (*_KAS_ENTRY_ENVS, _KAS_ROOT_ENV)
+        )
+
+    @property
+    def _is_kiro_cli(self) -> bool:
+        """Whether the subprocess is the kiro-cli launcher itself.
+
+        Distinct from "not claude": the sandbox wrapper keys kiro-cli-specific
+        behaviour off this. The default KAS path IS the CLI (it just selects a
+        different engine); only a direct KAS spawn is a bare Node process.
+        """
+        return not self._is_claude and not self._is_kas_direct
 
     def _pooled_mcp_servers(self) -> list[dict[str, Any]]:
         """Broker-stub ``mcpServers`` entries for this session's ``session/new``.
@@ -2417,6 +2574,25 @@ class AcpClient:
                     f"script."
                 )
             argv: list[str] = claude_argv
+        elif self._is_kas_direct:
+            # A LOCAL KAS build, spawned directly. Reached only when the operator
+            # named one (agent.kas_path or an entry env var), because that is the
+            # only way to run a harness build the installed CLI does not carry —
+            # the point being to A/B a KAS change without a CLI release.
+            # Resolution never consults PATH: KAS ships no PATH-installed
+            # launcher, so a PATH hit would be an unrelated binary. Not cached in
+            # a module global like the claude seam, because the root is
+            # per-session config and a cache would pin the first session's build
+            # for the process lifetime.
+            kas_argv = await asyncio.to_thread(_resolve_kas_acp_bin, self._kas_path)
+            if not kas_argv:
+                raise AcpError(
+                    "Kiro Agent Server (KAS) entry not found at the configured "
+                    "location. Point agent.kas_path at a built kiro-agent "
+                    "checkout or an extracted eval-bundle, or clear it to use "
+                    "the KAS that kiro-cli already ships."
+                )
+            argv = kas_argv
         else:
             try:
                 kiro_bin = await _resolve_kiro_bin_for_spawn()
@@ -2433,6 +2609,11 @@ class AcpClient:
             except Exception:
                 logger.warning("pre-spawn agent materialization failed", exc_info=True)
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
+            if self._is_kas:
+                # kiro-cli embeds KAS; this flag selects it. Nothing to install
+                # and nothing to resolve — and because Kiro Crew still speaks to
+                # kiro-cli, the handshake is unchanged from the default path.
+                argv.insert(2, KIRO_CLI_KAS_ENGINE_ARG)
 
         # OS-level sandbox: wrap the command to hide sensitive paths.
         # strip_python_env keeps the host PYTHONPATH/PYTHONHOME out of kiro-cli's
@@ -2441,7 +2622,7 @@ class AcpClient:
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            is_kiro_cli=not self._is_claude,
+            is_kiro_cli=self._is_kiro_cli,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
@@ -2930,7 +3111,9 @@ class AcpClient:
         """Handshake: initialize → session/load or session/new → set_mode → set_model."""
         # 1. Initialize
         protocol_version: int | str = (
-            PROTOCOL_VERSION_CLAUDE if self._is_claude else PROTOCOL_VERSION
+            PROTOCOL_VERSION_KAS
+            if self._is_kas_direct
+            else PROTOCOL_VERSION_CLAUDE if self._is_claude else PROTOCOL_VERSION
         )
         init_id = await self._send_request(
             METHOD_INITIALIZE,

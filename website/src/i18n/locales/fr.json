@@ -10258,13 +10258,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "Tes sessions de chat ont été redémarrées pour que cela prenne effet immédiatement — Kiro lit sa liste d’outils une seule fois par session, sinon un chat ouvert ne l’aurait pas prise en compte. Tes messages sont toujours là ; l’agent relit son contexte à ton prochain message."
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "Facultatif. Indiquez un checkout kiro-agent compilé ou un bundle eval extrait pour exécuter cette version au lieu de celle fournie.",
+        "acp_backend": "Backend ACP",
         "developer_mode": "Mode développeur",
         "developer_tools": "Outils de développement",
+        "failed_to_save_acp_backend": "Échec de l'enregistrement du paramètre de backend ACP",
         "gateway": "Passerelle",
+        "kas_build_path": "Chemin de build KAS",
+        "kiro_agent_server_direct": "Kiro Agent Server (v3)",
+        "kiro_cli_default": "kiro-cli (par défaut)",
         "open_developer_page": "Ouvrir la page Développeur",
         "run_a_local_gateway": "Exécuter une passerelle locale",
         "show_developer_page_in_sidebar_with_logs_system": "Afficher la page Développeur dans la barre latérale, avec les journaux, les métriques système et les détails internes de la mémoire",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Démarre une passerelle sur cette machine. Désactivez cette option pour utiliser Kiro Crew uniquement comme client : la connexion se fera vers la passerelle configurée au lieu d'en lancer une ici. Prend effet au prochain lancement de l'application."
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Démarre une passerelle sur cette machine. Désactivez cette option pour utiliser Kiro Crew uniquement comme client : la connexion se fera vers la passerelle configurée au lieu d'en lancer une ici. Prend effet au prochain lancement de l'application.",
+        "uses_the_kas_bundled_with_kiro_cli": "Utilise le KAS fourni avec kiro-cli",
+        "which_acp_server_to_drive_both_are_the_same": "Quel harness kiro-cli exécute. Les deux sont internes ; KAS est le moteur le plus récent et ne nécessite aucune installation, car kiro-cli le fournit."
       },
       "discordPanel": {
         "allowed_server_thread_ids": "ID de fils de serveur autorisés",

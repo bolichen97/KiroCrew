@@ -34,6 +34,7 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_RE,
+    KIRO_CLI_KAS_ENGINE_ARG,
     OversizeLineUnrecoverable,
     _drain_oversize_line,
     _get_start_time,
@@ -47,6 +48,7 @@ from kiro_crew.acp.session_handle import (
     AcpSessionHandle,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KAS,
     ACP_CLIENT_CAPABILITIES,
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_MCP_SERVER_INIT_FAILURE,
@@ -489,6 +491,7 @@ class AcpRuntime:
         max_age_secs: float = _DEFAULT_MAX_AGE_SECS,
         max_rss_mb: float = _DEFAULT_MAX_RSS_MB,
         model: str | None = None,
+        acp_backend: str = "",
         expect_mcp_reports: bool = True,
     ):
         if work_dir:
@@ -507,6 +510,11 @@ class AcpRuntime:
                     f"^[a-zA-Z0-9][a-zA-Z0-9._-]{{0,127}}$"
                 )
         self._model = model
+        # Which harness kiro-cli should run. Empty = its stable engine.
+        # Only the CLI-engine form reaches the runtime: a local KAS build is
+        # a bare Node process, which this multiplexed path cannot host, so
+        # AcpProvider routes that case to AcpClient instead.
+        self._acp_backend = acp_backend
         self._sandbox_mode = sandbox_mode
         self._extra_env = extra_env or {}
         self._mcp_gateway_overlay = str(mcp_gateway_overlay) if mcp_gateway_overlay else None
@@ -717,6 +725,11 @@ class AcpRuntime:
             logger.warning("pre-spawn agent materialization failed", exc_info=True)
 
         argv: list[str] = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
+        if self._acp_backend == ACP_BACKEND_KAS:
+            # kiro-cli embeds KAS and selects it with this flag. Nothing to
+            # install, and the process is still the CLI — so is_kiro_cli below
+            # stays correct and the handshake is unchanged.
+            argv.insert(2, KIRO_CLI_KAS_ENGINE_ARG)
         if self._model:
             # Pin the model at process start (mirrors `kiro-cli chat --model X`).
             # This is the ONLY reliable way to run a non-default provider model

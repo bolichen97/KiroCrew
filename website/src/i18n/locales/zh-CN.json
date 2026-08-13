@@ -10019,13 +10019,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "你的聊天会话已重启，所以改动立即生效 — Kiro 每个会话只读取一次工具列表，否则已经打开的聊天不会拾取到改动。你的消息都还在；代理会在你下一条消息时重新读取上下文。"
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "可选。指向已构建的 kiro-agent 检出目录或解压后的 eval bundle，即可运行该构建而非自带版本。",
+        "acp_backend": "ACP 后端",
         "developer_mode": "开发者模式",
         "developer_tools": "开发者工具",
+        "failed_to_save_acp_backend": "保存 ACP 后端设置失败",
         "gateway": "网关",
+        "kas_build_path": "KAS 构建路径",
+        "kiro_agent_server_direct": "Kiro Agent Server（v3）",
+        "kiro_cli_default": "kiro-cli（默认）",
         "open_developer_page": "打开开发者页面",
         "run_a_local_gateway": "运行本地网关",
         "show_developer_page_in_sidebar_with_logs_system": "在侧边栏显示开发者页面，包含日志、系统指标与记忆内部信息",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "在这台机器上启动网关。关闭后，Kiro Crew 仅作为客户端使用，连接到你已配置的网关，而不在本机运行网关。将在下次打开应用时生效。"
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "在这台机器上启动网关。关闭后，Kiro Crew 仅作为客户端使用，连接到你已配置的网关，而不在本机运行网关。将在下次打开应用时生效。",
+        "uses_the_kas_bundled_with_kiro_cli": "使用 kiro-cli 自带的 KAS",
+        "which_acp_server_to_drive_both_are_the_same": "kiro-cli 运行哪个 harness。两者都是第一方；KAS 是较新的引擎，无需安装——kiro-cli 自带。"
       },
       "discordPanel": {
         "allowed_server_thread_ids": "允许的服务器话题 ID",

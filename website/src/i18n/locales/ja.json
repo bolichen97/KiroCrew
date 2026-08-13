@@ -10019,13 +10019,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "チャットセッションが再起動されたため、すぐに反映されます。Kiro はセッションごとにツールリストを一度だけ読み取るため、オープンなチャットではそれを取得できなかったはずです。メッセージはまだそこにあります。エージェントは次のメッセージでコンテキストを再度読み取ります。"
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "任意。ビルド済みの kiro-agent チェックアウトまたは展開した eval バンドルを指定すると、同梱版の代わりにそのビルドを実行します。",
+        "acp_backend": "ACP バックエンド",
         "developer_mode": "開発者モード",
         "developer_tools": "開発者ツール",
+        "failed_to_save_acp_backend": "ACP バックエンド設定の保存に失敗しました",
         "gateway": "ゲートウェイ",
+        "kas_build_path": "KAS ビルドパス",
+        "kiro_agent_server_direct": "Kiro Agent Server（v3）",
+        "kiro_cli_default": "kiro-cli（デフォルト）",
         "open_developer_page": "開発者ページを開く",
         "run_a_local_gateway": "ローカルゲートウェイを実行する",
         "show_developer_page_in_sidebar_with_logs_system": "サイドバーに開発者ページを表示（ログ、システムメトリクス、メモリ内部情報を含む）",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "このマシンでゲートウェイを起動します。オフにすると Kiro Crew をクライアントとしてのみ使用し、ここで起動する代わりに設定済みのゲートウェイに接続します。次回アプリを開いたときに反映されます。"
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "このマシンでゲートウェイを起動します。オフにすると Kiro Crew をクライアントとしてのみ使用し、ここで起動する代わりに設定済みのゲートウェイに接続します。次回アプリを開いたときに反映されます。",
+        "uses_the_kas_bundled_with_kiro_cli": "kiro-cli 同梱の KAS を使用",
+        "which_acp_server_to_drive_both_are_the_same": "kiro-cli がどの harness を実行するか。どちらもファーストパーティです。KAS は新しいエンジンで、kiro-cli に同梱されているためインストールは不要です。"
       },
       "discordPanel": {
         "allowed_server_thread_ids": "許可されたサーバースレッド ID",

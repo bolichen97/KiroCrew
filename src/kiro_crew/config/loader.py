@@ -1084,6 +1084,32 @@ class AgentConfig:
         default="acp",
         metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
     )
+    acp_backend: str = field(
+        default="kiro-cli",
+        metadata=_meta(
+            "ACP Backend",
+            "Which harness kiro-cli runs. 'kiro-cli' (default) uses its stable "
+            "engine. 'kas' selects Kiro Agent Server via "
+            "`acp --agent-engine=v3` — no install needed, since kiro-cli ships "
+            "KAS and stays version-matched to it. Both are first-party, so this "
+            "is not a second vendor. Set agent.kas_path only to run a LOCAL KAS "
+            "build instead of the shipped one.",
+            enum=["kiro-cli", "kas"],
+        ),
+    )
+    kas_path: str = field(
+        default="",
+        metadata=_meta(
+            "KAS Path (optional)",
+            "Leave empty to use the Kiro Agent Server that kiro-cli already "
+            "ships. Set it to a built kiro-agent checkout or an extracted "
+            "eval-bundle to spawn that build DIRECTLY instead — the point being "
+            "to A/B a harness change without waiting for a CLI release. Only "
+            "read when agent.acp_backend is 'kas'. An extracted bundle's own "
+            "pinned Node is preferred over the host's, because the bundle's "
+            "native modules are prebuilt for one Node ABI.",
+        ),
+    )
     default_agent: str = field(
         default="",
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
@@ -5516,6 +5542,14 @@ class KiroCrewConfig:
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
+                # Literals, not acp.types constants: importing that module here
+                # would re-enter this one through acp/__init__ (see the factory).
+                # An unrecognized value falls back to the default rather than
+                # reaching the client, which only understands these two.
+                acp_backend=(
+                    "kas" if agent_data.get("acp_backend") == "kas" else "kiro-cli"
+                ),
+                kas_path=str(agent_data.get("kas_path", "") or ""),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
@@ -6458,6 +6492,9 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
+        # Both imports are function-local for the same reason: acp/__init__
+        # eagerly imports acp.client, which imports this module.
+        from kiro_crew.acp.types import ACP_BACKEND_KAS
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
@@ -6468,6 +6505,13 @@ class KiroCrewConfig:
 
         sandbox = self.agent.sandbox
         tool_search = self.agent.tool_search
+        # ACP backend selection. The default is carried to the client as "" —
+        # the client's seam contract treats empty as the CLI — so the explicit
+        # config token never leaks a new magic string into its branch
+        # conditions. kas_path is withheld unless KAS is selected, so an unused
+        # value cannot look load-bearing on the default path.
+        acp_backend = ACP_BACKEND_KAS if self.agent.acp_backend == ACP_BACKEND_KAS else ""
+        kas_path = self.agent.kas_path if acp_backend == ACP_BACKEND_KAS else ""
         # Global default effort for new sessions. A per-slot override always
         # wins; this only fills in when the slot carries none, so a session that
         # has never touched the effort control still starts at the user's
@@ -6565,6 +6609,8 @@ class KiroCrewConfig:
                 extra_env=extra_env,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
+                acp_backend=acp_backend,
+                kas_path=kas_path,
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,

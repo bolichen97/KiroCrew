@@ -20,7 +20,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
-from kiro_crew import beacon, platform_compat
+from kiro_crew import beacon, platform_compat, security
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
@@ -1362,6 +1362,29 @@ def _validate_role_model(value: str, request: web.Request) -> str | None:
     return None
 
 
+def _validate_kas_path(value: str, request: web.Request) -> str | None:
+    """Reject a KAS build path that must not be spawned; ``None`` = allow.
+
+    ``""`` always allows — that is the default, meaning "use the KAS kiro-cli
+    ships". A non-empty value is different in kind from every other editable
+    config value: it names a directory Kiro Crew will spawn a Node process out
+    of, so it gets the same sensitive-path refusal the agent's own file access
+    does. Existence is deliberately NOT required: an operator may point at a
+    build they are about to produce, and the spawn path already fails loudly
+    with a message naming the setting when the entry is absent.
+    """
+    if not value.strip():
+        return None
+    if "\x00" in value:
+        return "agent.kas_path must not contain a NUL byte."
+    if security.is_sensitive_path(value):
+        return (
+            "agent.kas_path names a protected location. Point it at a "
+            "kiro-agent build directory instead."
+        )
+    return None
+
+
 # Keys a caller may reasonably try to PATCH that have a dedicated endpoint whose
 # side effects the generic config write cannot reproduce. Naming the endpoint turns
 # a dead end ("field not editable") into a next step.
@@ -1377,6 +1400,23 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
+    # Which harness kiro-cli runs. "kiro-cli" is its stable engine; "kas" selects
+    # Kiro Agent Server via `acp --agent-engine=v3`, which needs no install
+    # because the CLI ships KAS.
+    # Literals rather than the acp.types constants: importing that module at
+    # module scope here re-enters config.loader through acp/__init__. Mirrors
+    # the "acp" literal on agent.provider above.
+    "agent.acp_backend": {"type": "enum", "values": ["kiro-cli", "kas"]},
+    # Optional local KAS build to run INSTEAD of the one kiro-cli ships. Unlike
+    # every other value here this one becomes a spawn target, so a grammar check
+    # is not sufficient: `validate_fn` additionally refuses a path under a
+    # sensitive directory, which a dashboard-editable executable location must
+    # not be allowed to name.
+    "agent.kas_path": {
+        "type": "str",
+        "max_len": 4096,
+        "validate_fn": _validate_kas_path,
+    },
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry

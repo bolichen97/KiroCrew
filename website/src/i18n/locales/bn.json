@@ -10139,13 +10139,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "তোমার চ্যাট সেশনগুলো আবার চালু করা হয়েছে যাতে এটা সঙ্গে সঙ্গেই কাজ করে — Kiro প্রতি সেশনে একবারই তার টুলের তালিকা পড়ে, তাই খোলা চ্যাট এটা টের পেত না। তোমার মেসেজ সবই আছে; পরের মেসেজেই এজেন্ট তার কনটেক্সট আবার পড়ে নেবে।"
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "ঐচ্ছিক। বিল্ড করা kiro-agent চেকআউট বা এক্সট্র্যাক্ট করা eval বান্ডেলের দিকে নির্দেশ করুন, যাতে সরবরাহ করা বিল্ডের বদলে সেটি চলে।",
+        "acp_backend": "ACP ব্যাকএন্ড",
         "developer_mode": "ডেভেলপার মোড",
         "developer_tools": "ডেভেলপার টুল",
+        "failed_to_save_acp_backend": "ACP ব্যাকএন্ড সেটিং সংরক্ষণ করা যায়নি",
         "gateway": "গেটওয়ে",
+        "kas_build_path": "KAS বিল্ড পাথ",
+        "kiro_agent_server_direct": "Kiro Agent Server (v3)",
+        "kiro_cli_default": "kiro-cli (ডিফল্ট)",
         "open_developer_page": "ডেভেলপার পেজ খুলুন",
         "run_a_local_gateway": "লোকাল গেটওয়ে চালান",
         "show_developer_page_in_sidebar_with_logs_system": "লগ, সিস্টেম মেট্রিক ও মেমরি ইন্টারনালসহ ডেভেলপার পেজ সাইডবারে দেখান",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "এই মেশিনে একটি গেটওয়ে চালু করে। বন্ধ করলে Kiro Crew শুধু ক্লায়েন্ট হিসেবে কাজ করবে এবং এখানে গেটওয়ে চালানোর বদলে আপনার কনফিগার করা গেটওয়েতে সংযুক্ত হবে। পরের বার অ্যাপ খুললে প্রযোজ্য হবে।"
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "এই মেশিনে একটি গেটওয়ে চালু করে। বন্ধ করলে Kiro Crew শুধু ক্লায়েন্ট হিসেবে কাজ করবে এবং এখানে গেটওয়ে চালানোর বদলে আপনার কনফিগার করা গেটওয়েতে সংযুক্ত হবে। পরের বার অ্যাপ খুললে প্রযোজ্য হবে।",
+        "uses_the_kas_bundled_with_kiro_cli": "kiro-cli-র সঙ্গে আসা KAS ব্যবহার করে",
+        "which_acp_server_to_drive_both_are_the_same": "kiro-cli কোন harness চালায়। দুটিই ফার্স্ট-পার্টি; KAS নতুন ইঞ্জিন এবং ইনস্টল করার প্রয়োজন নেই, কারণ kiro-cli এটি সঙ্গে দেয়।"
       },
       "discordPanel": {
         "allowed_server_thread_ids": "অনুমোদিত সার্ভার থ্রেড ID",

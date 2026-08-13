@@ -10257,13 +10257,21 @@
         "your_chat_sessions_were_restarted_so_this_takes": "As suas sessões de conversa foram reiniciadas para que isso tenha efeito imediato — o Kiro lê a lista de ferramentas uma vez por sessão, então uma conversa aberta não teria percebido a mudança. As suas mensagens continuam lá; o agente relê o contexto na sua próxima mensagem."
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "Opcional. Aponte para um checkout do kiro-agent compilado ou um pacote eval extraído para executar essa build em vez da incluída.",
+        "acp_backend": "Backend ACP",
         "developer_mode": "Modo desenvolvedor",
         "developer_tools": "Ferramentas de desenvolvedor",
+        "failed_to_save_acp_backend": "Falha ao salvar a configuração do backend ACP",
         "gateway": "Gateway",
+        "kas_build_path": "Caminho da build do KAS",
+        "kiro_agent_server_direct": "Kiro Agent Server (v3)",
+        "kiro_cli_default": "kiro-cli (padrão)",
         "open_developer_page": "Abrir a página Desenvolvedor",
         "run_a_local_gateway": "Executar um gateway local",
         "show_developer_page_in_sidebar_with_logs_system": "Mostrar a página Desenvolvedor na barra lateral, com Logs, Métricas do sistema e Detalhes internos da memória",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Inicia um gateway nesta máquina. Desative para usar o Kiro Crew apenas como cliente, conectando-se ao gateway que você configurou em vez de executar um aqui. Entra em vigor na próxima vez que você abrir o aplicativo."
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Inicia um gateway nesta máquina. Desative para usar o Kiro Crew apenas como cliente, conectando-se ao gateway que você configurou em vez de executar um aqui. Entra em vigor na próxima vez que você abrir o aplicativo.",
+        "uses_the_kas_bundled_with_kiro_cli": "Usa o KAS incluído no kiro-cli",
+        "which_acp_server_to_drive_both_are_the_same": "Qual harness o kiro-cli executa. Ambos são próprios; o KAS é o motor mais recente e não requer instalação, pois o kiro-cli o inclui."
       },
       "discordPanel": {
         "allowed_server_thread_ids": "IDs de threads de servidor permitidos",

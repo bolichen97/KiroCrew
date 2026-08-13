@@ -6862,13 +6862,21 @@
         "show_cursor_motion": "Show cursor motion"
       },
       "developerPanel": {
+        "a_built_kiro_agent_checkout_or_an_extracted": "Optional. Point at a built kiro-agent checkout or an extracted eval bundle to run that build instead of the shipped one.",
+        "acp_backend": "ACP Backend",
         "developer_mode": "Developer Mode",
         "developer_tools": "Developer Tools",
+        "failed_to_save_acp_backend": "Failed to save the ACP backend setting",
         "gateway": "Gateway",
+        "kas_build_path": "KAS build path",
+        "kiro_agent_server_direct": "Kiro Agent Server (v3)",
+        "kiro_cli_default": "kiro-cli (default)",
         "open_developer_page": "Open Developer page",
         "run_a_local_gateway": "Run a local gateway",
         "show_developer_page_in_sidebar_with_logs_system": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Start a gateway on this machine. Turn it off to use Kiro Crew as a client only, connecting to the gateway you have configured instead of running one here. Takes effect next time you open the app."
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Start a gateway on this machine. Turn it off to use Kiro Crew as a client only, connecting to the gateway you have configured instead of running one here. Takes effect next time you open the app.",
+        "uses_the_kas_bundled_with_kiro_cli": "Uses the KAS bundled with kiro-cli",
+        "which_acp_server_to_drive_both_are_the_same": "Which harness kiro-cli runs. Both are first-party; KAS is the newer engine and needs no install, since kiro-cli ships it."
       },
       "displayPanel": {
         "applying": "Applying…",

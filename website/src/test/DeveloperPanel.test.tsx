@@ -10,6 +10,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { DeveloperPanel } from '../pages/settings/DeveloperPanel'
 
 function LocationProbe() {
@@ -18,11 +19,17 @@ function LocationProbe() {
 }
 
 function renderPanel() {
+  // The panel reads agent.acp_backend / agent.kas_path through react-query, so
+  // it needs a client. Retries are off so a stubbed-out fetch fails fast instead
+  // of holding the test open.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
-    <MemoryRouter initialEntries={['/settings?tab=developer']}>
-      <DeveloperPanel />
-      <LocationProbe />
-    </MemoryRouter>
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={['/settings?tab=developer']}>
+        <DeveloperPanel />
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
   )
 }
 

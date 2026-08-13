@@ -96,6 +96,17 @@ ACP_CLIENT_CAPABILITIES: dict = {
 
 ACP_BACKEND_CLAUDE = "claude"
 
+#: Kiro Agent Server driven directly, instead of through the ``kiro-cli acp``
+#: wrapper that embeds it. Same first-party harness either way, so this is not
+#: a second vendor: it removes a process hop and pins the harness build
+#: independently of the CLI's release train. Selected by ``agent.acp_backend``.
+ACP_BACKEND_KAS = "kas"
+
+#: The ``agent.acp_backend`` value meaning "the default wrapper". Spelled out so
+#: the config enum, the client, and the UI share one token instead of each
+#: treating the empty string as a magic default.
+ACP_BACKEND_KIRO_CLI = "kiro-cli"
+
 # ── Claude backend permission modes ──
 # Values an edition writes into a per-session settings.local.json
 # ``permissions.defaultMode`` when it drives the dormant ``ACP_BACKEND_CLAUDE``
