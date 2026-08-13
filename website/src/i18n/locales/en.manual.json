@@ -1406,7 +1406,8 @@
       "tunnel_connected_token_valid_auto_refresh": "Tunnel connected. Token valid {{valid}}; auto-refresh {{refresh}}.",
       "tunnel_connecting": "Tunnel connecting…",
       "tunnel_error": "tunnel error",
-      "tunnel_state": "Tunnel {{state}}."
+      "tunnel_state": "Tunnel {{state}}.",
+      "stopped": "stopped"
     },
     "issuePanel": {
       "add_to_chat": "Add to chat",

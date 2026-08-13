@@ -3758,7 +3758,10 @@
     "instanceTabBar": {
       "instances": "Remote crews",
       "local": "Local",
-      "local_dashboard": "Local dashboard"
+      "local_dashboard": "Local dashboard",
+      "n_unread": "{{n}} unread",
+      "switch_crew_active": "Switch crew, currently {{name}}",
+      "switch_crew_active_unread": "Switch crew, currently {{name}}, {{n}} unread elsewhere"
     },
     "instancesViewport": {
       "loading_pane": "Loading pane…",
@@ -7362,7 +7365,6 @@
         "delete": "Delete…",
         "deleting": "Deleting…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete": "Confirm delete",
         "confirm_delete_of": "Confirm deleting {{name}}",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
@@ -7410,14 +7412,29 @@
         "launch_done": "Done — your new crew is ready and now appears in Your crews.",
         "runs_on_gateway": "This runs on the gateway, not in this tab — leave the page or switch crews and it keeps going. Keep Kiro Crew running until it finishes.",
         "unverified_cloud_note": "Kiro Crew cannot verify whether this machine has AWS resources",
-        "confirm_remove": "Confirm remove",
         "remove_warning": "Remove only takes it off this list. If this is a cloud crew, its EC2 instance keeps running and billing — delete it from the AWS console.",
         "checking_against": "Checked against profile {{profile}} in {{region}}.",
         "no_profile_set": "none set (AWS CLI default)",
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "More actions for {{name}}",
+        "edit_settings": "Edit settings",
+        "edit_crew": "Edit {{name}}",
+        "save_changes": "Save changes",
+        "saving": "Saving…",
+        "failed_to_save_crew": "Could not save this crew",
+        "edit_reconnect_note": "Changing the host, port, or connection method closes the current tunnel. Reconnect when you are ready.",
+        "remove": "Remove…",
+        "transport_locked_note": "Kiro Crew matches this crew to its AWS resources through its connection identity, so the connection method and target cannot be changed here.",
+        "port_must_be_in_range": "Enter a port between 1 and 65535.",
+        "ttl_must_be_hours_or_minutes": "Enter a lifetime like 20h or 30m.",
+        "finish_open_edit_first": "Save or cancel the open edit before editing another crew.",
+        "stopping": "Stopping…",
+        "starting": "Starting…",
+        "changed_outside_this_form": "This crew changed outside this form ({{fields}}). Check the row above — if it is not the crew you started editing, cancel.",
+        "use_my_edits_anyway": "Apply my edits to the crew as it is now"
       },
       "webhooksPanel": {
         "inbound_webhooks": "Inbound webhooks",
