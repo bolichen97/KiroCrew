@@ -1784,6 +1784,189 @@ def _alias_family_base(key: str) -> str:
     return base if base and tail.isdigit() else key
 
 
+def _connection_tool_aliases_enabled() -> bool:
+    """True when the Connections tool-alias pass may write ``toolAliases``.
+
+    Read raw from ``config.json`` (the ``kiro_hooks`` precedent) rather than
+    declared on the config dataclass: this is a dark-launch gate that retires
+    once the alias behaviour is the only behaviour, and an undeclared key costs
+    the schema nothing in the meantime.
+    """
+    connections = (_load_json(_mc_config_path()) or {}).get("connections")
+    if not isinstance(connections, dict):
+        return False
+    return connections.get("tool_aliases") is True
+
+
+def _apply_connection_tool_aliases(config: dict) -> frozenset[tuple[str, str, str]] | None:
+    """Resolve exposed-provider tool-name collisions into ``config['toolAliases']``.
+
+    Without this, two exposed providers that ship the same tool name leave one of
+    the two unreachable -- kiro-cli addresses a tool by bare name, so the later
+    mount shadows the earlier one silently.
+
+    :mod:`kiro_crew.connections.tool_aliases` owns invariants 1-6, which decide
+    WHICH aliases resolve (registry-sourced, collision-only, exposed-and-verified
+    providers). The THREE below are this function's, and govern how a resolution
+    is written into a spec that a user also edits:
+
+    * **Flag off => byte-identical emission.** The key is neither created nor
+      cleared, so a spec built with the gate off is indistinguishable from one
+      built before this pass existed. Nothing else here reads ``toolAliases``,
+      so leaving a stale key alone cannot mislead a later pass -- and clearing it
+      would make "off" a distinct third behaviour instead of a no-op. A no
+      collision resolution likewise writes nothing, so the common install (zero
+      or one exposed provider) gains no empty object.
+
+    * **The generated subset is read from a PERSISTED record, not inferred from a
+      pair's shape.** Cleanup deletes entries out of a file the user also edits, so
+      it needs proof of authorship, and no property of the NAME supplies one: a
+      ``<slug>_`` prefix test claims a hand-written ``linear_issues``, and
+      re-deriving ``<slug>_<tool>`` claims a hand-written ``notion_search`` for a
+      provider that declares nothing. So the pass records exactly what it emitted
+      and, on the next run, strips only pairs that record claims (whole triple,
+      so a user-edited generated alias no longer matches and survives). Merging
+      onto the previous output instead is what made "user-authored wins" preserve
+      the LAST rebuild's generated refs: the merge is idempotent, so a rename
+      survived the mount that justified it going away. Every pair the record does
+      not claim is by definition the user's and still wins over the registry
+      default. See :mod:`kiro_crew.connections.alias_record` for the ordering that
+      keeps the record understating -- it is written by the CALLER once the spec is
+      durable, which is why this function returns the emitted set instead of
+      persisting it itself.
+
+    * **A generated alias never lands on a name already in use.** The destination
+      is checked against surviving alias targets, the declared natural names of
+      exposed providers, every tool name named in a per-tool ``tools`` ref of ANY
+      exposed server (custom servers included), and the builtin names in
+      ``tools``; a conflict skips that one alias with a warning. Renaming onto an
+      occupied name would recreate the shadowing this pass exists to remove, so it
+      fails safe to shadowing rather than to a silent overwrite. A custom server
+      mounted WHOLE publishes its names only at runtime and is out of scope by
+      construction -- see the module docstring's OUT OF SCOPE note.
+
+    Mutates *config* in place. Idempotent: the resolution is a pure function of
+    the exposed provider set, so a rebuild that changes no mounts rewrites the
+    same map (or leaves the same absence).
+
+    Returns:
+        The ``(slug, tool, alias)`` triples this pass just emitted -- possibly
+        EMPTY, which the caller must still record so the pass relinquishes pairs
+        it no longer writes. ``None`` means the pass did not run (gate off, no
+        server map, unreadable registry) and the existing record must be left
+        exactly as it is: overwriting it with an empty set there would forget a
+        real emission and strand those aliases permanently.
+    """
+    if not _connection_tool_aliases_enabled():
+        return None
+
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return None
+
+    tools = config.get("tools")
+    tool_refs = tools if isinstance(tools, list) else []
+
+    try:
+        # Imported here, not at module scope: kiro_crew.connections.registry
+        # validates the committed registry at MODULE level, so a missing or
+        # malformed registry.json would raise on `import kiro_crew.agent` --
+        # before the guard below can run -- and take down the very module that
+        # installs and repairs the agent spec. Deferring the import keeps a data
+        # file from breaking the recovery path, and keeps a registry read off
+        # agent.py's import cost for every install that never enables this.
+        # Guarded by test_importing_agent_does_not_eagerly_load_the_registry.
+        from kiro_crew.connections.alias_record import (  # noqa: PLC0415
+            emitted_from_alias_map,
+            is_recorded_emission,
+            load_emitted_aliases,
+        )
+        from kiro_crew.connections.tool_aliases import (  # noqa: PLC0415
+            exposed_declared_tools,
+            natural_tool_names,
+            resolve_tool_aliases,
+            statically_visible_tool_names,
+        )
+
+        # Loaded BEFORE anything is emitted: cleanup is authorized by the OLD
+        # record, and the new one replaces it only once the spec is on disk.
+        previously_emitted = load_emitted_aliases()
+        exposed = exposed_declared_tools(servers, tool_refs)
+        aliases = resolve_tool_aliases(exposed)
+        reserved_natural = natural_tool_names(exposed)
+        reserved_visible = statically_visible_tool_names(tool_refs)
+    except Exception:  # noqa: BLE001 — a malformed registry must not fail a rebuild
+        logger.warning("Skipping Connections tool aliases: registry unavailable", exc_info=True)
+        return None
+
+    existing = config.get("toolAliases")
+    # A pre-existing non-dict value (hand-edited ``toolAliases: []``) is replaced
+    # rather than merged onto: kiro-cli rejects the whole spec over it, so
+    # self-healing costs nothing a working config would miss.
+    existing_map = existing if isinstance(existing, dict) else None
+
+    # Drop only the pairs the RECORD proves this pass wrote, and keep everything
+    # else, whose authorship is unproven and therefore the user's. Then recompute;
+    # see the staleness invariant above. The comparison is on the whole triple, so
+    # a generated alias the user has since edited no longer matches and stays. A
+    # non-string alias is dropped for the same reason a non-dict container is
+    # replaced: kiro-cli rejects the entire spec over it, so preserving it would
+    # protect a hand-edit by costing the user every tool.
+    retained = {
+        ref: alias
+        for ref, alias in (existing_map or {}).items()
+        if isinstance(ref, str)
+        and isinstance(alias, str)
+        and not is_recorded_emission(previously_emitted, ref, alias)
+    }
+
+    # Destination guard: everything a generated alias must not collide with.
+    occupied = set(retained.values())
+    occupied |= reserved_natural
+    occupied |= reserved_visible
+    occupied |= {ref for ref in tool_refs if isinstance(ref, str) and not ref.startswith("@")}
+
+    accepted: dict[str, str] = {}
+    for ref, alias in aliases.items():
+        if ref in retained:
+            # Hand-authored override for this exact ref: the user's alias stands
+            # and the generated one is not a second entry.
+            continue
+        if alias in occupied:
+            logger.warning(
+                "Skipping Connections tool alias %s -> %r: the name is already in use "
+                "by another alias or tool, so renaming onto it would shadow that tool",
+                ref,
+                alias,
+            )
+            continue
+        accepted[ref] = alias
+        occupied.add(alias)
+
+    emitted = emitted_from_alias_map(accepted)
+
+    merged = dict(sorted({**accepted, **retained}.items()))
+    if not merged:
+        # Nothing generated AND nothing hand-authored survived. Absent stays
+        # absent (gate-off parity); a key holding only this pass's now-stale
+        # output is REMOVED rather than emptied, so the spec returns to exactly
+        # the shape it had before any alias was ever written.
+        if existing is not None:
+            config.pop("toolAliases", None)
+            logger.debug("Cleared Connections tool aliases: no collisions among exposed providers")
+        return emitted
+
+    if merged != existing:
+        config["toolAliases"] = merged
+        logger.debug(
+            "Connections tool aliases written: %s generated, %s retained (%s)",
+            len(accepted),
+            len(retained),
+            ", ".join(f"{ref}->{alias}" for ref, alias in merged.items()),
+        )
+    return emitted
+
+
 def _normalize_mcp_server_keys(config: dict) -> None:
     """Rewrite any slash-containing ``mcpServers`` key to its slash-free alias.
 
@@ -2702,6 +2885,8 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     for key in ("tools", "allowedTools"):
         config[key] = list(dict.fromkeys(config.get(key, [])))
 
+    emitted_tool_aliases = _apply_connection_tool_aliases(config)
+
     # LAST governance pass over the auto-approve LIST itself. The writers above
     # apply the ceiling to entries THEY add, but a builtin auto-approve (fs_read,
     # execute_bash, …) arrives straight from the agent TEMPLATE into
@@ -2831,6 +3016,20 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     else:
         _finalize_and_write()
     logger.info("Installed agent config: %s", path)
+
+    # ONLY now, with the spec carrying those aliases durably on disk, record what
+    # was emitted. The record authorizes the NEXT pass to delete pairs, so it must
+    # never name a pair the spec does not have: writing it before the spec would
+    # let a crash here leave a claim on a name the user may later hand-write, and
+    # that user's entry would then be silently deleted. Crashing in THIS window
+    # instead leaves an emitted-but-unrecorded alias, which is unclaimable and is
+    # cleaned up one cycle later. ``None`` means the pass did not run, so the
+    # existing record stays untouched; an EMPTY set is written, because that is how
+    # the pass relinquishes pairs it no longer emits.
+    if emitted_tool_aliases is not None:
+        from kiro_crew.connections.alias_record import store_emitted_aliases  # noqa: PLC0415
+
+        store_emitted_aliases(emitted_tool_aliases)
 
     # Install KiroCrew AIM capabilities package (includes kirocrew-lite)
     _install_aim_capabilities()
