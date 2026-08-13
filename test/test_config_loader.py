@@ -3332,6 +3332,70 @@ class TestOrchestratorWatchdogThemeAreParsed:
         assert cfg.watchdog.tool_stall_hard_cap_secs == 61.0
         assert cfg.watchdog.check_after_secs == 5.0
 
+    def test_per_agent_watchdog_overrides_are_parsed(self) -> None:
+        """agents.*.watchdog_tool_stall_* overrides survive load(); read by
+        acp/session_handle._load_watchdog_settings for sessions on that agent."""
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "pr-reviewer": {
+                        "kiro_agent": "pr-reviewer-kiro",
+                        "watchdog_tool_stall_suspect_secs": 900.0,
+                        "watchdog_tool_stall_hard_cap_secs": 1800.0,
+                    }
+                }
+            }
+        )
+        assert cfg.agents["pr-reviewer"].watchdog_tool_stall_suspect_secs == 900.0
+        assert cfg.agents["pr-reviewer"].watchdog_tool_stall_hard_cap_secs == 1800.0
+
+    def test_per_agent_watchdog_overrides_default_to_inherit(self) -> None:
+        """An agent entry without overrides parses to 0 (inherit the global)."""
+        cfg = _load_from_dict({"agents": {"builder": {"kiro_agent": "kirocrew"}}})
+        assert cfg.agents["builder"].watchdog_tool_stall_suspect_secs == 0.0
+        assert cfg.agents["builder"].watchdog_tool_stall_hard_cap_secs == 0.0
+
+    def test_per_agent_watchdog_override_junk_and_negative_collapse_to_inherit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config.json is hand-editable: junk collapses to 0 (inherit) and a
+        negative value is clamped to 0 — never an instant-cancel window, never
+        a crashed load. jsonschema is disabled so the raw values reach the
+        _safe_float guards (with it enabled, validation strips them first)."""
+        import kiro_crew.config.validation as validation
+
+        monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "a": {
+                        "kiro_agent": "kirocrew",
+                        "watchdog_tool_stall_suspect_secs": "junk",
+                        "watchdog_tool_stall_hard_cap_secs": -5,
+                    }
+                }
+            }
+        )
+        assert cfg.agents["a"].watchdog_tool_stall_suspect_secs == 0.0
+        assert cfg.agents["a"].watchdog_tool_stall_hard_cap_secs == 0.0
+
+    def test_per_agent_watchdog_overrides_round_trip(self) -> None:
+        """to_dict() (what save() writes) carries the overrides, so a save
+        from any routine path does not silently drop a hand-written override."""
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "pr-reviewer": {
+                        "kiro_agent": "pr-reviewer-kiro",
+                        "watchdog_tool_stall_suspect_secs": 900.0,
+                    }
+                }
+            }
+        )
+        td = cfg.to_dict()
+        assert td["agents"]["pr-reviewer"]["watchdog_tool_stall_suspect_secs"] == 900.0
+
     def test_dashboard_theme_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
             {

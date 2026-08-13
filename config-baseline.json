@@ -5100,6 +5100,34 @@
       "defaultValue": "kirocrew"
     },
     {
+      "path": "agents.*.watchdog_tool_stall_suspect_secs",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Tool stall suspect override (s)",
+      "help": "Per-agent override for watchdog.tool_stall_suspect_secs on sessions running this agent. 0 inherits the global window (default 1h). Set low (e.g. 900) for a pure-LLM agent whose longest legitimate silent gap is minutes, not hours.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.0
+    },
+    {
+      "path": "agents.*.watchdog_tool_stall_hard_cap_secs",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Tool stall hard cap override (s)",
+      "help": "Per-agent override for watchdog.tool_stall_hard_cap_secs on sessions running this agent. 0 inherits the global cap (default 1h). Applies ONLY to UNKNOWN verdicts — a WORKING session is never acted on.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.0
+    },
+    {
       "path": "default_agent",
       "kind": "core",
       "type": "string",

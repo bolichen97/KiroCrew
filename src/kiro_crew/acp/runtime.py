@@ -1551,6 +1551,9 @@ class AcpRuntime:
             session_id=session_id,
             queue=queue,
             runtime=self,
+            # The session's agent (falling back to the runtime's spawn agent)
+            # keys the handle's per-agent watchdog-window overrides.
+            agent=agent or self._agent or "",
         )
 
         # Populate state from session/new response (configOptions, available models)
@@ -1687,6 +1690,9 @@ class AcpRuntime:
             session_id=resume_sid,
             queue=queue,
             runtime=self,
+            # Mirrors create_session: a resumed session gets the same
+            # per-agent watchdog-window overrides as a fresh one.
+            agent=agent or self._agent or "",
         )
         handle.store_session_config(resp)
 
