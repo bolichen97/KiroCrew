@@ -636,3 +636,50 @@ class TestFieldTypeResolution:
         ap = sc.get("additionalProperties", {})
         assert isinstance(ap, dict) and ap.get("type") == "object"
         assert "properties" in ap and len(ap["properties"]) > 0
+
+
+class TestOptionalFieldMapping:
+    """An ``X | None`` / ``Optional[X]`` dataclass field maps to a nullable
+    base type, not ``"string"``.
+
+    Locks in the field-level ``_optional_inner`` unwrap: without it the union
+    type itself reaches ``_python_type_to_json`` and falls through to the
+    catch-all ``"string"`` with ``nullable=False``, making "unset means
+    inherit the downstream default" unexpressible for numeric config fields.
+    This module uses ``from __future__ import annotations``, so the dataclass
+    below also exercises the string-annotation resolution path end to end.
+    """
+
+    def test_optional_int_field_maps_to_nullable_integer(self) -> None:
+        @dataclasses.dataclass
+        class _Demo:
+            pep604: int | None = None
+            classic: typing.Optional[int] = None
+
+        js = _schema_module.build_json_schema(_Demo)
+        assert js["properties"]["pep604"]["type"] == ["integer", "null"]
+        assert js["properties"]["classic"]["type"] == ["integer", "null"]
+
+        by_path = {e.path: e for e in _schema_module.flatten_to_entries(js, prefix="demo")}
+        for name in ("pep604", "classic"):
+            entry = by_path[f"demo.{name}"]
+            assert entry.type == "integer", (
+                f"{name}: resolved to {entry.type!r} — 'string' here means the "
+                f"Optional unwrap regressed and the union fell through the type map"
+            )
+            assert entry.nullable is True
+
+    def test_non_optional_field_stays_single_typed(self) -> None:
+        # The plain single-type form must survive: widening a non-optional
+        # integer to ["integer", "null"] would let jsonschema accept a null
+        # the loader strips, silently reverting the field to its default.
+        @dataclasses.dataclass
+        class _Demo:
+            plain: int = 3
+
+        js = _schema_module.build_json_schema(_Demo)
+        assert js["properties"]["plain"]["type"] == "integer"
+        by_path = {e.path: e for e in _schema_module.flatten_to_entries(js, prefix="demo")}
+        entry = by_path["demo.plain"]
+        assert entry.type == "integer"
+        assert entry.nullable is False
