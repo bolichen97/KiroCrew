@@ -39,9 +39,26 @@ def _kiro_mcp_json() -> Path:
 
 # Managed servers whose command is the kirocrew binary itself.
 # Only these are affected by install-method path changes.
-# Ordered tuple (not a set) so consumers that iterate — e.g. `kirocrew
+# Ordered tuples (not sets) so consumers that iterate — e.g. `kirocrew
 # doctor`'s MCP probe — get a deterministic order.
-KIROCREW_BIN_MCP_SERVERS = ("kirocrew-cron", "kirocrew-core", "kirocrew-computer")
+#
+# The split matters to every consumer that asks "should this server be in the
+# spec?". An ALWAYS_ON server missing from an agent spec is a broken install; an
+# OPT_IN one is an assignable set that most agents are simply not granted, so
+# demanding its presence — or minting an auto-approve grant for it — would undo
+# the assignment. Membership here must track the ``opt_in`` flags in
+# ``agent._MANAGED_MCP_SERVERS``; a ratchet test pins the two together.
+ALWAYS_ON_BIN_MCP_SERVERS = (
+    "kirocrew-cron",
+    "kirocrew-core",
+    "kirocrew-computer",
+)
+OPT_IN_BIN_MCP_SERVERS = ("kirocrew-dashboard",)
+
+# Every managed-binary server name, regardless of how it reaches a spec. This is
+# the cleanup view: KiroCrew never legitimately writes any of them into the
+# user's global mcp.json, so a stray entry is purgeable either way.
+KIROCREW_BIN_MCP_SERVERS = ALWAYS_ON_BIN_MCP_SERVERS + OPT_IN_BIN_MCP_SERVERS
 
 # MeshClaw was the predecessor of KiroCrew. The rename left these managed
 # server entries — pointing at now-dead MeshClaw build paths — behind in the
