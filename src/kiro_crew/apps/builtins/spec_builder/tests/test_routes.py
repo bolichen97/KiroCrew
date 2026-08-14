@@ -52,6 +52,10 @@ def _redirect_state(monkeypatch, tmp_path):
     # deletion tests wrote into the USER's live state and made their real deleted
     # specs discoverable again.
     monkeypatch.setattr(routes, "_DELETED_PATH", state_dir / "deleted.json")
+    # The decision ledger lives under the security keystone's trust root, OUTSIDE
+    # this dir, so it needs its own redirect -- and the autouse guard below watches
+    # the real one, which is what catches a test that forgets.
+    monkeypatch.setattr(routes, "_DECISIONS_PATH", state_dir / "decisions.json")
     monkeypatch.setattr(routes, "is_app_enabled", lambda name: True)
     return state_dir
 
@@ -87,13 +91,38 @@ def _never_touch_the_real_state(monkeypatch, tmp_path):
     tests rewrote the real deleted.json. The guard therefore compares the WHOLE
     directory (names + mtimes) rather than one known filename, so the next file
     this app learns to write is covered without anyone remembering to list it.
+
+    The decision ledger needs its own watch: it lives under the security keystone's
+    ``trust/`` root, OUTSIDE this app's state dir, so the directory comparison above
+    cannot see it -- and it holds the user's real recorded answers.
     """
     before = _live_state_snapshot()
+    before_ledger = _live_decisions_snapshot()
     _redirect_state(monkeypatch, tmp_path / "_autouse_state")
     yield
     assert _live_state_snapshot() == before, (
         f"a test wrote to the live state dir: {_REAL_STATE_DIR}"
     )
+    assert _live_decisions_snapshot() == before_ledger, (
+        "a test wrote to the live decision ledger"
+    )
+
+
+def _live_decisions_snapshot() -> tuple[bool, int]:
+    """(exists, size) of the REAL decision ledger, captured before redirection."""
+    global _REAL_DECISIONS_PATH
+    if _REAL_DECISIONS_PATH is None:
+        _REAL_DECISIONS_PATH = routes._decisions_path()
+    try:
+        return True, _REAL_DECISIONS_PATH.stat().st_size
+    except OSError:
+        return False, 0
+
+
+#: The un-redirected ledger path the autouse guard watches. ``None`` until first use
+#: fills it (same first-use rule as ``_REAL_STATE_DIR``: an import-time read would
+#: freeze whichever KIROCREW_HOME was active at collection).
+_REAL_DECISIONS_PATH: Path | None = None
 
 
 #: The un-redirected state dir the autouse guard watches. ``None`` until
@@ -531,7 +560,20 @@ def test_normalize_spec_state_redacts_keys_not_just_values():
     # Only the documented keys survive — arbitrary (possibly secret-bearing)
     # keys cannot reach the browser at all.
     assert set(out) == {"decisions", "blocking", "context"}
-    assert set(out["decisions"][0]) == {"id", "title", "options", "recommended", "answer"}
+    assert set(out["decisions"][0]) == {"id", "title", "options", "recommended", "answer", "locked"}
+    # `locked` is this backend's own field, never the agent's: normalization always
+    # reports False and only _apply_recorded_answers may set it.
+    assert out["decisions"][0]["locked"] is False
+
+
+def test_normalize_spec_state_ignores_an_agent_authored_lock():
+    """The agent must not be able to declare a decision locked (or unlock one it
+    answered) by writing the field itself."""
+    out = routes._normalize_spec_state(
+        {"decisions": [{"id": "a", "title": "t", "locked": True, "answer": "x"}]}
+    )
+    assert out is not None
+    assert out["decisions"][0]["locked"] is False
 
 
 def test_normalize_spec_state_rejects_non_dict():
@@ -781,7 +823,7 @@ def test_collect_spec_documents_returns_the_detail_triple(tmp_path):
     (spec_dir / "design.md").write_text("# design")
     (spec_dir / ".spec-state.json").write_text(json.dumps({"blocking": "waiting on you"}))
 
-    phase, files, state = routes._collect_spec_documents(spec_dir)
+    phase, files, state = routes._collect_spec_documents("s", spec_dir)
     assert phase == "design"                      # newest present phase file wins
     assert files["requirements.md"] == "# reqs"
     assert state is not None and state["blocking"] == "waiting on you"
@@ -1043,8 +1085,10 @@ def test_handoff_commits_before_dispatch_and_unwinds_on_deletion():
     assert claim < src.index("_ensure_worker_slot("), "the slot is created before the claim"
     assert claim < arm, "the loop is armed before the execution state is recorded"
     assert claim < dispatch, "handoff dispatches before claiming the run"
-    assert src[claim:dispatch].count("_release(") == 4, (
+    assert src[claim:dispatch].count("_release(") == 5, (
         "an abort arm does not release the loop, the recorded state and the slot"
+        " — every early return between the claim and the dispatch must release, including"
+        " the busy-alias refusal (the loop is already armed by the time it runs)"
     )
 
 
@@ -1752,11 +1796,17 @@ def test_no_handler_reads_the_index_on_the_event_loop():
         "_load_index",
         "_prepare_handoff",
         "_write_stop_sentinel_for_spec",
+        "_claim_decision_locked",
+        "_forget_decisions_locked",
+        "_alias_slots_locked",
     }
     for off_loop in (
         "_load_index_with_discovery",
         "_prepare_handoff",
         "_write_stop_sentinel_for_spec",
+        "_claim_decision_locked",
+        "_forget_decisions_locked",
+        "_alias_slots_locked",
     ):
         doc = inspect.getdoc(getattr(routes, off_loop)) or ""
         assert "BLOCKING" in doc, (
@@ -2414,12 +2464,12 @@ async def test_detail_refuses_when_the_spec_is_recreated_mid_request(tmp_path, m
 
     real_collect = routes._collect_spec_documents
 
-    def _collect_then_recreate(spec_dir):
+    def _collect_then_recreate(name, spec_dir):
         # Stand in for the concurrent delete+recreate landing during the hop.
         routes._save_index(
             {"moved": {"spec_dir": str(new_dir), "working_dir": str(tmp_path / "new")}}
         )
-        return real_collect(spec_dir)
+        return real_collect(name, spec_dir)
 
     monkeypatch.setattr(routes, "_collect_spec_documents", _collect_then_recreate)
 
@@ -6114,9 +6164,18 @@ def test_message_revalidates_between_slot_acquisition_and_dispatch():
         "no re-pin between slot acquisition and dispatch: a delete finishing in "
         "that window would have its turn dispatched anyway"
     )
-    # ...and nothing may await between that refusal and the synchronous dispatch.
+    # ...and after that refusal the only await permitted before the dispatch is the
+    # ledger claim, which is itself an identity-pinned refusal (it re-checks spec_dir,
+    # slot_key and the delete reservation inside its own transaction).
     tail = between[between.index("_touch_spec(") :]
-    assert "await " not in tail, f"an await slipped in before dispatch: {tail!r}"
+    awaits = [
+        ln.strip()
+        for ln in tail.splitlines()
+        if "await " in ln and not ln.strip().startswith("#")
+    ]
+    assert all("_claim_decision(" in ln for ln in awaits), (
+        f"a non-pinning await slipped in before dispatch: {awaits!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -7143,3 +7202,1823 @@ def test_every_handler_that_returns_settings_redacts_it():
         "these handlers return agent-writable settings without _redact, so a "
         f"credential in the file reaches the dashboard raw: {offenders}"
     )
+
+
+# ── recorded decisions are one-way ───────────────────────────────────────────
+#
+# The reported defect: a decision the user had already answered came back as a
+# clickable card and a second, different answer was sent for it. Two distinct
+# routes to that state -- the state file still reads pending while the answer is
+# on its way to the agent, and the agent can re-emit a settled decision id with
+# ``answer: null`` (a re-render, not a new question). Both are covered here, plus
+# the double-click race the client-side lock cannot close.
+
+
+async def _mark_reserved(name: str) -> bool:
+    """Stamp a delete reservation this process owns, as the delete handler does."""
+
+    def _apply(index: dict) -> bool:
+        index[name][routes._DELETING] = {"owner": routes._PROCESS_ID, "at": time.time()}
+        return True
+
+    return await routes._mutate_index(_apply)
+
+
+def _decision_spec(tmp_path, *, state: dict | None = None) -> tuple[str, str]:
+    """Index one spec named ``s`` and return ``(spec_dir, slot_key)``."""
+    spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "s"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    if state is not None:
+        (spec_dir / ".spec-state.json").write_text(json.dumps(state))
+    slot_key = routes._new_slot_key("s")
+    routes._save_index(
+        {
+            "s": {
+                "spec_dir": str(spec_dir),
+                "working_dir": str(tmp_path / "wd"),
+                "spec_type": "feature",
+                "status": "planning",
+                "slot_key": slot_key,
+            }
+        }
+    )
+    return str(spec_dir), slot_key
+
+
+@pytest.mark.asyncio
+async def test_second_answer_to_one_decision_is_refused(tmp_path, monkeypatch):
+    """The first answer dispatches; a later one for the same decision does not.
+
+    This is the case the state file cannot catch: the agent has not written
+    ``answer`` yet (its turn has not run), so nothing on disk says the decision is
+    settled -- only this backend's record does."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        body = {"spec_dir": spec_dir, "slot_key": slot_key, "decision_id": "transport"}
+        first = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={**body, "decision_option": "HTTPS", "text": "Decision - transport: HTTPS"},
+        )
+        second = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={**body, "decision_option": "Streaming", "text": "Decision - transport: Streaming"},
+        )
+        payload = await second.json()
+    finally:
+        await client.close()
+
+    assert first.status == 200
+    assert second.status == 409, payload
+    assert payload.get("code") == "decision_already_answered", payload
+    # The refusal names the answer the agent actually has, so the client can show
+    # the settled state rather than a bare error.
+    assert payload.get("answer") == "HTTPS", payload
+    assert dispatched == ["Decision - transport: HTTPS"], (
+        "a second answer reached the agent, reversing a settled decision"
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_answers_to_one_decision_dispatch_once(tmp_path, monkeypatch):
+    """The double-click race. Both requests read the decision as unanswered, so
+    only an atomic claim can keep one of them out -- a client-side lock cannot,
+    and neither can a check-then-write."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        body = {"spec_dir": spec_dir, "slot_key": slot_key, "decision_id": "transport"}
+        results = await asyncio.gather(
+            client.post(f"{_BASE}/specs/s/message", json={**body, "decision_option": "A", "text": "A"}),
+            client.post(f"{_BASE}/specs/s/message", json={**body, "decision_option": "B", "text": "B"}),
+        )
+        statuses = sorted(r.status for r in results)
+    finally:
+        await client.close()
+
+    assert statuses == [200, 409], statuses
+    assert len(dispatched) == 1, f"both clicks reached the agent: {dispatched}"
+
+
+@pytest.mark.asyncio
+async def test_a_plain_message_is_never_locked(tmp_path, monkeypatch):
+    """Only a decision answer is one-way. Ordinary chat keeps working, repeatedly,
+    and writes nothing to the ledger."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        body = {"spec_dir": spec_dir, "slot_key": slot_key}
+        one = await client.post(f"{_BASE}/specs/s/message", json={**body, "text": "looks good"})
+        two = await client.post(f"{_BASE}/specs/s/message", json={**body, "text": "looks good"})
+    finally:
+        await client.close()
+
+    assert (one.status, two.status) == (200, 200)
+    assert len(dispatched) == 2
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_re_emitted_pending_decision_reads_as_answered(tmp_path, monkeypatch):
+    """The card that came back. The agent re-writes a settled decision id with
+    ``answer: null``; the detail read must still report the recorded answer and
+    mark it locked, or the UI renders options for a decision that is closed."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(
+        tmp_path,
+        state={
+            "decisions": [
+                {
+                    "id": "transport",
+                    "title": "Inbound transport",
+                    "options": ["HTTPS", "Streaming"],
+                    "answer": None,
+                }
+            ]
+        },
+    )
+    outcome, _held = await routes._claim_decision(
+        "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+    )
+    assert outcome == routes._CLAIM_RECORDED
+
+    app = web.Application(middlewares=[_auth_mw])
+    routes.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        client.app["state"] = _slot_stub()[0]
+        resp = await client.get(f"{_BASE}/specs/s")
+        data = await resp.json()
+
+    assert resp.status == 200, data
+    decision = data["state"]["decisions"][0]
+    assert decision["answer"] == "HTTPS", "the agent's pending re-emission won"
+    assert decision["locked"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_answer_is_redacted_on_egress(tmp_path, monkeypatch):
+    """index.json is agent-writable, so the ledger is untrusted input like every
+    other field -- and the overlay bypasses the state file's own scrub."""
+    _redirect_state(monkeypatch, tmp_path)
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    spec_dir, _slot_key = _decision_spec(
+        tmp_path,
+        state={"decisions": [{"id": "d", "title": "Which key", "answer": None}]},
+    )
+    routes._save_decisions(
+        {spec_dir: {"name": "s", "answers": {"d": f"use {secret}"}}}
+    )
+
+    app = web.Application(middlewares=[_auth_mw])
+    routes.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        client.app["state"] = _slot_stub()[0]
+        resp = await client.get(f"{_BASE}/specs/s")
+        data = await resp.json()
+
+    assert secret not in json.dumps(data["state"])
+
+
+@pytest.mark.asyncio
+async def test_a_claim_is_pinned_to_the_spec_it_was_made_for(tmp_path, monkeypatch):
+    """A delete-and-recreate in flight must not have an answer stamped onto the
+    replacement's entry -- same identity pin every other mutation takes."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+
+    wrong_dir, _ = await routes._claim_decision(
+        "s", "d", "A", expect_spec_dir=str(tmp_path / "elsewhere"), expect_slot_key=slot_key
+    )
+    wrong_key, _ = await routes._claim_decision(
+        "s", "d", "A", expect_spec_dir=spec_dir, expect_slot_key="spec-builder-s-other"
+    )
+
+    assert wrong_dir == routes._CLAIM_STALE
+    assert wrong_key == routes._CLAIM_STALE
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_full_ledger_refuses_rather_than_dispatching_unrecorded(tmp_path, monkeypatch):
+    """The cap fails CLOSED. Dispatching an answer this backend could not record
+    would produce exactly the re-answerable card the ledger exists to prevent."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    routes._save_decisions(
+        {
+            spec_dir: {
+                "name": "s",
+                "answers": {f"d{i}": "A" for i in range(routes._MAX_RECORDED)},
+            }
+        }
+    )
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "one-too-many",
+                "decision_option": "A",
+                "text": "A",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload.get("code") == "decision_ledger_full", payload
+    assert dispatched == []
+
+
+def test_the_claim_is_the_last_await_before_the_dispatch():
+    """Source guard on the ORDER, and on the absence of a compensating write.
+
+    Recording AFTER the dispatch leaves a window where the answer is in the agent's
+    queue but not in the ledger -- the state in which a second click still looks
+    legitimate. And nothing may await between a committed claim and the dispatch:
+    anything that could refuse the dispatch there would strand the claim, and undoing
+    it needs a write that can itself fail, which leaves the card permanently locked on
+    an answer the agent never got.
+
+    The turn lock is what makes that reachable: it spans the running-check, the claim
+    and the dispatch, so no other handler can start a turn in between.
+    """
+    src = inspect.getsource(routes._handle_message)
+    claim = src.index("_claim_decision(")
+    dispatch = src.index("_dispatch_turn(")
+    assert claim < dispatch, (
+        "the decision is dispatched before it is recorded, so a concurrent second "
+        "answer can still be admitted"
+    )
+    lock = src.index("async with _turn_lock(")
+    assert lock < claim and lock < dispatch, (
+        "the claim and the dispatch are not both inside the turn lock, so a turn can "
+        "start between the running-check and the dispatch"
+    )
+    after_claim = src[claim:dispatch].split("_claim_decision(", 1)[1]
+    awaits = [
+        ln.strip()
+        for ln in after_claim.splitlines()
+        if "await " in ln and not ln.strip().startswith("#")
+    ]
+    assert not awaits, (
+        f"something awaits between the claim and the dispatch: {awaits!r}"
+    )
+    assert not hasattr(routes, "_release_decision"), (
+        "the claim is being rolled back again; a compensating write that fails leaves "
+        "the card locked on an answer the agent never received"
+    )
+
+
+# ── GPT round 1 on the decision ledger ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_claim_is_refused_while_a_delete_is_reserved(tmp_path, monkeypatch):
+    """The claim must honour the delete reservation, like every other mutation.
+
+    Without it the claim commits (spec_dir still matches) while the pre-dispatch
+    re-pin refuses, because THAT pin does honour the marker. The answer is then
+    recorded and never sent -- and a delete that rolls back leaves the entry alive
+    with a decision locked to an answer the agent never received, which nothing
+    can re-open."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+
+    async def _reserve(idx_name: str) -> None:
+        def _apply(index: dict) -> bool:
+            index[idx_name][routes._DELETING] = {"owner": routes._PROCESS_ID, "at": time.time()}
+            return True
+
+        await routes._mutate_index(_apply)
+
+    await _reserve("s")
+    outcome, _held = await routes._claim_decision(
+        "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+    )
+
+    assert outcome == routes._CLAIM_STALE
+    assert await routes._recorded_answers(spec_dir) == {}, (
+        "an answer was recorded onto a spec whose delete was in flight"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_key_matches_the_id_the_detail_read_serves(tmp_path, monkeypatch):
+    """The overlay matches the ledger KEY against the id from the state file, so
+    the two must be normalized identically.
+
+    An id carrying whitespace (or longer than a tighter cap) used to be stripped
+    on the wire but not in the state projection. The mismatch is silent in the
+    worst way: the answer IS recorded, no card is ever locked, and the decision
+    stays re-answerable forever."""
+    client = _make_client(monkeypatch, tmp_path)
+    raw_id = "  transport shape  "
+    spec_dir, slot_key = _decision_spec(
+        tmp_path,
+        state={"decisions": [{"id": raw_id, "title": "Inbound transport", "options": ["HTTPS"]}]},
+    )
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: None)
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        # The SPA echoes back the id the detail read gave it, verbatim.
+        served = routes._normalize_spec_state(
+            json.loads((Path(spec_dir) / ".spec-state.json").read_text())
+        )
+        assert served is not None
+        served_id = served["decisions"][0]["id"]
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": served_id,
+                "decision_option": "HTTPS",
+                "text": "Decision - Inbound transport: HTTPS",
+            },
+        )
+        assert resp.status == 200, await resp.json()
+        detail = await (await client.get(f"{_BASE}/specs/s")).json()
+    finally:
+        await client.close()
+
+    decision = detail["state"]["decisions"][0]
+    assert decision["locked"] is True, (
+        "the recorded answer did not match the served id, so the card is still clickable"
+    )
+    assert decision["answer"] == "HTTPS"
+
+
+@pytest.mark.asyncio
+async def test_an_answer_without_its_option_is_refused(tmp_path, monkeypatch):
+    """The option is what gets recorded and later rendered. A decision answer that
+    carries no option cannot be recorded honestly, so it is refused rather than
+    falling back to the composed prompt."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 400, payload
+    assert payload.get("code") == "decision_option_required", payload
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_the_card_shows_the_option_not_the_whole_prompt(tmp_path, monkeypatch):
+    """What the agent is SENT is the composed prompt; what the card shows back is
+    the choice. Recording the prompt put the entire localized sentence in the
+    answer line."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(
+        tmp_path,
+        state={"decisions": [{"id": "transport", "title": "Inbound transport", "options": ["HTTPS"]}]},
+    )
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        prompt = "Decision — “Inbound transport”: HTTPS"
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": prompt,
+            },
+        )
+        assert resp.status == 200, await resp.json()
+        detail = await (await client.get(f"{_BASE}/specs/s")).json()
+    finally:
+        await client.close()
+
+    assert dispatched == [prompt], "the agent must still receive the full prompt"
+    assert detail["state"]["decisions"][0]["answer"] == "HTTPS", (
+        "the card renders the composed prompt instead of the chosen option"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_delete_that_lands_after_the_repin_strands_no_claim(tmp_path, monkeypatch):
+    """The window the in-claim reservation check does NOT cover, closed by ordering.
+
+    A DELETE reserving after the pre-dispatch re-pin used to reach a claim that had
+    already committed: the dispatch was refused, and when the delete rolled back the
+    spec came back with a decision locked to an answer the agent never received.
+    With the claim as the last await, the same delete makes the CLAIM refuse, so
+    nothing is recorded and the user can answer again."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    real_touch = routes._touch_spec
+    calls: list[int] = []
+
+    async def _touch_then_reserve(name, **kw):
+        out = await real_touch(name, **kw)
+        calls.append(1)
+        # The second _touch_spec is the pre-dispatch re-pin; the delete reserves
+        # immediately after it returns, which is the window under test.
+        if len(calls) == 2:
+            def _apply(index: dict) -> bool:
+                index[name][routes._DELETING] = {"owner": routes._PROCESS_ID, "at": time.time()}
+                return True
+
+            await routes._mutate_index(_apply)
+        return out
+
+    monkeypatch.setattr(routes, "_touch_spec", _touch_then_reserve)
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert dispatched == []
+    assert await routes._recorded_answers(spec_dir) == {}, (
+        "an answer stayed recorded although its dispatch was refused -- the decision "
+        "is now locked to something the agent never received"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_is_refused_while_the_agent_is_running(tmp_path, monkeypatch):
+    """A running slot QUEUES the message, and Pause clears that queue by design --
+    so a queued answer may never be delivered while the ledger claims it was.
+
+    Refused instead of queued, and nothing recorded, so the user can answer again
+    once the turn ends."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+    # The gate sits BEFORE the claim, so a busy click never touches the ledger at
+    # all -- it does not record-then-release, which would churn index.json (and
+    # leave a lock behind if the release failed).
+    claims: list = []
+    real_claim = routes._claim_decision
+
+    async def _record_claim(*a, **kw):
+        claims.append(a)
+        return await real_claim(*a, **kw)
+
+    monkeypatch.setattr(routes, "_claim_decision", _record_claim)
+
+    state, slot = _slot_stub()
+    slot.running = True
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload.get("code") == "decision_agent_busy", payload
+    assert dispatched == []
+    assert claims == [], "a busy click reached the ledger instead of being refused first"
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_plain_message_still_queues_behind_a_running_turn(tmp_path, monkeypatch):
+    """The busy refusal is scoped to decision answers. Ordinary chat keeps its
+    queue-behind-the-turn behaviour -- that is how a user steers a working agent."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, slot = _slot_stub()
+    slot.running = True
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "also check the auth flow"},
+        )
+    finally:
+        await client.close()
+
+    assert resp.status == 200
+    assert dispatched == ["also check the auth flow"]
+
+
+# ── the ledger is out of the agent's reach ───────────────────────────────────
+
+
+def test_the_decision_ledger_is_not_in_the_agent_writable_index():
+    """The record must not live on ``index.json``.
+
+    That file is agent-writable by design (its own docstrings say so), so a ledger
+    field on it could be erased to re-open a settled decision or forged to lock one
+    the user never answered -- and a forged entry also puts an answer on screen
+    that nobody chose."""
+    src = inspect.getsource(routes)
+    assert "answered_decisions" not in src, (
+        "the ledger is back on an index entry, where the agent can rewrite it"
+    )
+    write = inspect.getsource(routes._claim_decision_locked)
+    assert "_mutate_index(" not in write, (
+        "the claim writes through the index mutator again, so the record is "
+        "agent-writable"
+    )
+    assert "_DECISIONS_LOCK" in write
+    assert "_save_decisions(" in write
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "~/.kiro/crew/trust/spec-builder-decisions.json",
+        "~/.kirocrew/trust/spec-builder-decisions.json",
+        # The PARENT, which is the half a leaf-only entry missed.
+        "~/.kiro/crew/trust",
+        "~/.kirocrew/trust",
+    ],
+)
+def test_the_decision_ledger_is_on_the_security_keystone(path):
+    """Read+write keystone, like the Notes vault registry and the Ops Mission
+    Control policy: app-owned, not a secret, but forging or erasing it defeats the
+    app's safety property, so the agent must reach it through neither the file
+    tools nor a shell.
+
+    The PARENT is gated too. Under this app's own state dir it was not: a directory
+    below ``workspace/`` is not a sensitive path, so one ``ln -s`` naming it
+    redirected every read and write, and this backend opens the path directly (as
+    keystone writers must) so it would have followed the link."""
+    from kiro_crew import security
+
+    assert security.is_sensitive_path(path)
+    assert security.is_sensitive_bash_command(f"echo x > {path}") is not None
+    assert security.is_sensitive_bash_command(f"cat {path}") is not None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ln -s /tmp/evil ~/.kiro/crew/trust",
+        "ln -sf /tmp/evil ~/.kiro/crew/trust/spec-builder-decisions.json",
+        "mv ~/.kiro/crew/trust /tmp/x",
+        "mv /tmp/evil ~/.kiro/crew/trust/spec-builder-decisions.json",
+        "rm -rf ~/.kiro/crew/trust",
+        "cp /tmp/evil ~/.kiro/crew/trust/spec-builder-decisions.json",
+    ],
+)
+def test_the_ledger_directory_cannot_be_swapped_or_removed(cmd):
+    """The reported vector: replace the ledger's PARENT and the backend follows it.
+    Every verb that could repoint or destroy the directory (or plant a file in it)
+    has to be refused, not just a read or a redirect at the leaf."""
+    from kiro_crew import security
+
+    assert security.is_sensitive_bash_command(cmd) is not None, cmd
+
+
+def test_the_ledger_is_not_under_the_apps_own_state_dir(tmp_path, monkeypatch):
+    """Source/behaviour guard: the default location must be the gated trust root.
+
+    Anything under the app's state dir has a replaceable parent, which is the defect
+    this move fixes -- and it would come back silently, because the app opens the
+    path directly and a symlinked parent reads and writes exactly like a real one."""
+    monkeypatch.setattr(routes, "_DECISIONS_PATH", None)
+    monkeypatch.setattr(routes, "_STATE_DIR", tmp_path / "state")
+
+    path = routes._decisions_path()
+
+    assert path.parent.name == "trust", path
+    assert (tmp_path / "state") not in path.parents, path
+    from kiro_crew import security
+
+    assert security.is_sensitive_path(str(path))
+    assert security.is_sensitive_path(str(path.parent))
+
+
+@pytest.mark.asyncio
+async def test_a_forged_ledger_for_another_spec_dir_is_ignored(tmp_path, monkeypatch):
+    """A record is scoped to the spec_dir it was written for. A delete leaves the
+    documents on disk, so a re-import under the same name at a different path is a
+    DIFFERENT spec and must start with no answers."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, _slot_key = _decision_spec(tmp_path)
+    routes._save_decisions(
+        {str(tmp_path / "somewhere-else"): {"name": "s", "answers": {"d": "A"}}}
+    )
+
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_spec_forgets_its_answers(tmp_path, monkeypatch):
+    """Otherwise a re-import at the same name AND path inherits locks from the spec
+    that was deleted, and its cards are settled before the user answers anything."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, await resp.text()
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_torn_ledger_file_reads_as_nothing_recorded(tmp_path, monkeypatch):
+    """Degrade toward answerable, never toward a locked card nobody can clear, and
+    never toward raising inside a request."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, _slot_key = _decision_spec(tmp_path)
+    routes._decisions_path().parent.mkdir(parents=True, exist_ok=True)
+    routes._decisions_path().write_text("{ not json")
+
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_ledger_refuses_the_write_instead_of_erasing_it(tmp_path, monkeypatch):
+    """A corrupt read must not become data loss.
+
+    Treating an unreadable file as an empty ledger and saving over it would erase
+    every recorded answer -- for every spec -- and make settled decisions answerable
+    again. Reads still fail soft (the card stays answerable, which is the safe
+    direction); WRITES refuse."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    routes._save_decisions(
+        {"/elsewhere": {"name": "other", "answers": {"kept": "yes"}}}
+    )
+    corrupt = routes._decisions_path().read_text()[:-3]  # truncate the JSON
+    routes._decisions_path().write_text(corrupt)
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 503, payload
+    assert payload.get("code") == "decision_record_unreadable", payload
+    assert dispatched == []
+    # The unreadable file is left EXACTLY as it was rather than replaced.
+    assert routes._decisions_path().read_text() == corrupt
+
+
+@pytest.mark.asyncio
+async def test_a_delete_reserved_during_the_claim_records_nothing(tmp_path, monkeypatch):
+    """The window a separate liveness hop left open: a DELETE reserving between the
+    check and the write. Both now happen under ``_INDEX_LOCK`` in one hop, and
+    ``_mark_deleting`` takes that same lock, so the two serialize."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert await _mark_reserved("s")
+
+    outcome, _held = await routes._claim_decision(
+        "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+    )
+
+    assert outcome == routes._CLAIM_STALE
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+def test_the_claim_checks_liveness_and_writes_in_one_transaction():
+    """Source guard: the index read and the ledger write must sit inside the SAME
+    ``_INDEX_LOCK`` block, not in two hops. Split across hops, a delete reserving in
+    between has its answer recorded for a spec already being torn down."""
+    src = inspect.getsource(routes._claim_decision_locked)
+    lock = src.index("with _INDEX_LOCK:")
+    assert src.index("_spec_is_live(") > lock
+    assert src.index("_save_decisions(") > lock
+    assert "await" not in src, "the transaction body awaits, so it is not one hop"
+    # And the async wrapper must do nothing but hand it to a worker thread.
+    wrapper = inspect.getsource(routes._claim_decision)
+    assert "asyncio.to_thread(" in wrapper
+    assert "_read_decisions(" not in wrapper
+
+
+def test_the_detail_read_scopes_the_slot_from_a_fresh_index_read():
+    """Source guard: nothing may await between the detail handler's FRESH index read
+    and the ``_ensure_worker_slot`` call that consumes its ``meta``.
+
+    A delete-and-re-import in that window hands the replacement's slot the stale
+    entry, and the agent's next turn then runs in the OLD project directory. Reading
+    this backend's decision ledger separately opened exactly that window; the read
+    belongs in the one filesystem hop above instead."""
+    src = inspect.getsource(routes._handle_get)
+    fresh = src.rindex("await _aload_index()")
+    # The CALL, not the comment that names the helper a few lines above it.
+    scope = src.index("await _ensure_worker_slot(")
+    assert fresh < scope, "the slot is scoped before the index is re-read"
+    between = src[fresh + len("await _aload_index()") : scope]
+    awaits = [
+        ln.strip()
+        for ln in between.splitlines()
+        if "await " in ln and not ln.strip().startswith("#")
+    ]
+    assert not awaits, (
+        f"an await sits between the fresh index read and the slot scoping: {awaits!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_detail_read_serves_the_recorded_answer(tmp_path, monkeypatch):
+    """The overlay still applies now that it happens inside the document hop."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(
+        tmp_path,
+        state={"decisions": [{"id": "transport", "title": "Inbound", "options": ["HTTPS"]}]},
+    )
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    app = web.Application(middlewares=[_auth_mw])
+    routes.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        client.app["state"] = _slot_stub()[0]
+        data = await (await client.get(f"{_BASE}/specs/s")).json()
+
+    decision = data["state"]["decisions"][0]
+    assert decision["locked"] is True
+    assert decision["answer"] == "HTTPS"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_index_removal_puts_the_answers_back(tmp_path, monkeypatch):
+    """A spec that survives a failed delete keeps its answers.
+
+    This is what fixes the ordering rather than compensating for it: the ledger is
+    cleared only AFTER the index entry is actually gone, so a failure of the index write
+    cannot leave the spec alive with its decisions answerable again. There is no restore
+    path to get wrong, because nothing was removed.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    real_mutate = routes._mutate_index
+    calls: list[int] = []
+
+    async def _fail_the_final_pop(mutate):
+        calls.append(1)
+        # The pop is the LAST index mutation of the delete; everything before it
+        # (the reservation) must still work.
+        if len(calls) >= 2:
+            return False
+        return await real_mutate(mutate)
+
+    monkeypatch.setattr(routes, "_mutate_index", _fail_the_final_pop)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 503, payload
+    assert payload.get("code") == "index_write_failed", payload
+    assert await routes._recorded_answers(spec_dir) == {"transport": "HTTPS"}, (
+        "the spec survived the failed delete with its recorded answers erased"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_turn_can_start_while_an_answer_is_being_recorded(tmp_path, monkeypatch):
+    """The turn lock, behaviourally.
+
+    A turn starting between the running-check and the dispatch would have the answer
+    QUEUED behind it (and droppable by a Pause) while the ledger claims it was
+    delivered. Undoing the claim at that point needs a write that can itself fail, so
+    the answer path holds the lock instead: another would-be dispatcher cannot get in
+    until this one has dispatched.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    # What the racing dispatcher observed when it finally got the lock: the number of
+    # dispatches already made. 0 would mean it cut in before ours.
+    seen_at_acquire: list[int] = []
+    race: list = []
+    real_claim = routes._claim_decision
+
+    async def _claim_while_another_dispatcher_waits(*a, **kw):
+        async def _other_dispatcher() -> None:
+            # By DIRECTORY, the key the handler uses (see _turn_lock).
+            async with routes._turn_lock(spec_dir):
+                seen_at_acquire.append(len(dispatched))
+
+        race.append(asyncio.create_task(_other_dispatcher()))
+        await asyncio.sleep(0)  # let it reach the lock
+        return await real_claim(*a, **kw)
+
+    monkeypatch.setattr(routes, "_claim_decision", _claim_while_another_dispatcher_waits)
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        body = await resp.text()
+    finally:
+        await client.close()
+    await asyncio.gather(*race)
+
+    assert resp.status == 200, body
+    assert len(dispatched) == 1
+    assert seen_at_acquire == [1], (
+        "another dispatcher acquired the turn lock before this answer was dispatched, "
+        f"so the answer could have been queued: {seen_at_acquire!r}"
+    )
+
+
+def test_every_turn_start_takes_the_turn_lock():
+    """Source guard: a dispatcher that skips the lock can start a turn between a
+    decision answer's running-check and its dispatch, which is what the lock exists to
+    prevent. The CREATE path is exempt: the spec does not exist before it, so no answer
+    can be in flight for it."""
+    for handler in (routes._handle_message, routes._handle_handoff):
+        src = inspect.getsource(handler)
+        assert "async with _turn_lock(" in src, (
+            f"{handler.__name__} dispatches a turn without taking the turn lock"
+        )
+        assert src.index("async with _turn_lock(") < src.index("_dispatch_turn("), (
+            f"{handler.__name__} takes the lock after dispatching"
+        )
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_spec_drops_its_turn_lock(tmp_path, monkeypatch):
+    """Housekeeping: the registry is keyed by the spec's directory, so a deleted spec's
+    lock goes with it rather than accumulating for the lifetime of the process."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _slot_key = _decision_spec(tmp_path)
+    routes._turn_lock(spec_dir)
+    assert routes._decision_key(spec_dir) in routes._TURN_LOCKS
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, await resp.text()
+    assert routes._decision_key(spec_dir) not in routes._TURN_LOCKS
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_same_path_reimport_during_the_read_is_refused(tmp_path, monkeypatch):
+    """A delete leaves the documents on disk, so a re-import at the same name AND path
+    is a DIFFERENT creation. A spec_dir-only freshness check passed it, pairing the
+    replacement's metadata with documents and a decision record read for the spec that
+    is gone -- serving the deleted spec's locked answers on the new one."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    real_collect = routes._collect_spec_documents
+
+    def _collect_then_reimport(name, sd):
+        # Same name, same path, NEW creation -- exactly what a delete + re-import
+        # leaves behind.
+        idx = routes._load_index()
+        idx["s"]["slot_key"] = routes._new_slot_key("s")
+        routes._save_index(idx)
+        return real_collect(name, sd)
+
+    monkeypatch.setattr(routes, "_collect_spec_documents", _collect_then_reimport)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _slot_stub()[0]
+        resp = await client.get(f"{_BASE}/specs/s")
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload.get("code") == "spec_changed_during_read", payload
+
+
+@pytest.mark.asyncio
+async def test_a_failed_ledger_write_is_a_named_refusal_not_a_500(tmp_path, monkeypatch):
+    """A full or unwritable data home must not 500.
+
+    A 500 carries no code the client can act on, so its optimistic lock would stay
+    while NOTHING was recorded or dispatched -- a locked card for an answer the agent
+    never got. The named pre-dispatch refusal is what lets the card re-open."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    def _no_space(_store: dict) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(routes, "_save_decisions", _no_space)
+
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 503, payload
+    assert payload.get("code") == "decision_record_write_failed", payload
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_a_raised_index_removal_still_restores_the_answers(tmp_path, monkeypatch):
+    """``_mutate_index`` can RAISE as well as return False (a full data home), and both
+    leave the spec in the index with its answers already cleared. The restore must run
+    on either path, or a restart exposes the surviving spec with its settled decisions
+    answerable again."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    real_mutate = routes._mutate_index
+    calls: list[int] = []
+
+    async def _raise_on_the_final_pop(mutate):
+        calls.append(1)
+        if len(calls) >= 2:
+            raise OSError(28, "No space left on device")
+        return await real_mutate(mutate)
+
+    monkeypatch.setattr(routes, "_mutate_index", _raise_on_the_final_pop)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 503, payload
+    assert payload.get("code") == "index_write_failed", payload
+    assert await routes._recorded_answers(spec_dir) == {"transport": "HTTPS"}
+
+
+@pytest.mark.asyncio
+async def test_the_delete_holds_the_turn_lock(tmp_path, monkeypatch):
+    """A handoff that has already passed its freshness check would otherwise acquire
+    the lock after the delete released it and start a turn on a spec that is gone. The
+    delete holds the lock across its whole destructive sequence, so the other handler
+    sees either a live spec or none."""
+    client = _make_client(monkeypatch, tmp_path)
+    _decision_spec(tmp_path)
+
+    # What the racing dispatcher saw when it got the lock: whether the spec was still
+    # indexed. With the delete holding the lock it must be gone by then.
+    still_indexed: list[bool] = []
+    race: list = []
+    real_forget = routes._forget_decisions
+
+    async def _forget_while_another_dispatcher_waits(*a, **kw):
+        async def _other_dispatcher() -> None:
+            async with routes._turn_lock("s"):
+                still_indexed.append("s" in await routes._aload_index())
+
+        race.append(asyncio.create_task(_other_dispatcher()))
+        await asyncio.sleep(0)
+        return await real_forget(*a, **kw)
+
+    monkeypatch.setattr(routes, "_forget_decisions", _forget_while_another_dispatcher_waits)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+    await asyncio.gather(*race)
+
+    assert resp.status == 200, await resp.text()
+    assert still_indexed == [False], (
+        "another dispatcher held the lock while the spec was still indexed mid-delete, "
+        f"so it could have started a turn on a spec being removed: {still_indexed!r}"
+    )
+
+
+def test_a_turn_lock_from_a_dead_loop_is_not_reused(tmp_path, monkeypatch):
+    """An asyncio.Lock binds to the loop that first awaits it, so a module-level
+    registry outliving a loop would hand back a lock bound to the dead one and raise
+    "is bound to a different event loop" on acquisition.
+
+    Deliberately NOT an asyncio test: it drives two loops of its own, which cannot be
+    done from inside a running one."""
+    _redirect_state(monkeypatch, tmp_path)
+
+    async def _take() -> int:
+        lock = routes._turn_lock("s")
+        async with lock:
+            return id(lock)
+
+    first = asyncio.new_event_loop()
+    try:
+        first_id = first.run_until_complete(_take())
+    finally:
+        first.close()
+
+    second = asyncio.new_event_loop()
+    try:
+        second_id = second.run_until_complete(_take())  # must not raise
+    finally:
+        second.close()
+
+    assert first_id != second_id, "the lock from the closed loop was reused"
+
+
+def test_every_destructive_or_dispatching_handler_takes_the_turn_lock():
+    """Source guard. A handler that starts OR destroys a turn without the lock can
+    interleave with an answer being recorded. The CREATE path is exempt: the spec does
+    not exist before it, so no answer can be in flight for it."""
+    for handler in (routes._handle_message, routes._handle_handoff, routes._handle_delete):
+        src = inspect.getsource(handler)
+        assert "async with _turn_lock(" in src, (
+            f"{handler.__name__} runs without taking the turn lock"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_parent_is_created_on_first_write(tmp_path, monkeypatch):
+    """The ledger lives under ``trust/``, not this app's state dir, so on a fresh
+    install its parent may not exist yet -- and the app's own mkdir is the only thing
+    that creates it. Without this the FIRST answer of a new install fails to record."""
+    _redirect_state(monkeypatch, tmp_path)
+    # A parent that does not exist, exactly like a fresh install's trust root.
+    ledger = tmp_path / "fresh-home" / "trust" / "spec-builder-decisions.json"
+    monkeypatch.setattr(routes, "_DECISIONS_PATH", ledger)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert not ledger.parent.exists()
+
+    outcome, _held = await routes._claim_decision(
+        "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+    )
+
+    assert outcome == routes._CLAIM_RECORDED
+    assert ledger.is_file()
+    assert await routes._recorded_answers(spec_dir) == {"transport": "HTTPS"}
+
+
+def test_a_duplicate_decision_id_is_dropped():
+    """The id IS the identity: the ledger is keyed on it and the overlay matches on it,
+    so two cards claiming one id would both settle when either is answered -- and the
+    second would display an answer chosen for the first. The FIRST occurrence wins."""
+    out = routes._normalize_spec_state(
+        {
+            "decisions": [
+                {"id": "transport", "title": "Inbound transport", "options": ["HTTPS"]},
+                {"id": "transport", "title": "Something else entirely", "options": ["A"]},
+            ]
+        }
+    )
+    assert out is not None
+    assert [d["title"] for d in out["decisions"]] == ["Inbound transport"]
+
+
+@pytest.mark.asyncio
+async def test_an_undispatched_answer_is_never_reopened(tmp_path, monkeypatch):
+    """The crash window, resolved in the only direction that keeps the guarantee.
+
+    A ledger write and the dispatch it authorizes are two steps and no ordering makes
+    them atomic. If the process dies in between, the answer is recorded but undelivered
+    -- and it STAYS recorded, across restarts. Reopening it would be a silent reversal of
+    a decision that may already have reached the agent, which is the whole defect this
+    file exists to prevent; a locked card showing the user's own choice is a stall the
+    user clears by saying so in the spec's chat.
+    """
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    # Nothing else ran: no dispatch, no second write. A restart changes nothing, since
+    # the record carries no process-scoped state that a new process could disown.
+    monkeypatch.setattr(routes, "_PROCESS_ID", "9999:a-new-process")
+
+    assert await routes._recorded_answers(spec_dir) == {"transport": "HTTPS"}
+    outcome, held = await routes._claim_decision(
+        "s", "transport", "Streaming", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+    )
+    assert outcome == routes._CLAIM_TAKEN, "a recorded answer was reopened after a restart"
+    assert held == "HTTPS"
+
+
+def test_nothing_writes_the_ledger_after_the_dispatch():
+    """Source guard: the claim is the LAST ledger write before the dispatch, and there
+    is no write after it.
+
+    A post-dispatch write to mark the answer delivered cannot work: its own failure is
+    indistinguishable from the crash it would be detecting, so a reader could only treat
+    the record as unconfirmed -- reopening a delivered answer. The absence of that write
+    is the invariant, so it is worth pinning.
+    """
+    src = inspect.getsource(routes._handle_message)
+    assert "_claim_decision(" in src
+    after = src[src.index("_dispatch_turn("):]
+    for writer in ("_claim_decision", "_save_decisions", "_confirm_decision", "_forget_decisions"):
+        assert writer not in after, f"{writer} runs after the dispatch"
+
+
+@pytest.mark.asyncio
+async def test_a_delete_whose_cleanup_fails_still_deletes(tmp_path, monkeypatch):
+    """The ledger cleanup is housekeeping, so it cannot fail a delete that has happened.
+
+    The index entry and the conversation are already gone by then; refusing here would
+    report a spec as alive when it is not. A leftover entry is bounded and only readable
+    by a spec re-created at the same name AND path -- which, by the identity this ledger
+    uses, is the same spec.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    def _boom(_store):
+        raise OSError("read-only data home")
+
+    monkeypatch.setattr(routes, "_save_decisions", _boom)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 200, payload
+    assert "s" not in await routes._aload_index()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_clears_the_record_after_the_index_entry(tmp_path, monkeypatch):
+    """...and on the happy path the entry IS cleared, so the ledger does not accumulate
+    answers for specs that no longer exist."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, await resp.text()
+    assert await routes._recorded_answers(spec_dir) == {}
+
+
+def test_the_delete_clears_the_ledger_after_the_index_write():
+    """Source guard on that order. Clearing FIRST is what let a crash strand a surviving
+    spec with its answers erased."""
+    src = inspect.getsource(routes._handle_delete)
+    assert src.index("_mutate_index(_pop_if_same)") < src.index("_forget_decisions("), (
+        "the ledger is cleared before the index entry is removed"
+    )
+
+
+def test_an_undecodable_record_is_unusable_not_an_exception(tmp_path, monkeypatch):
+    """``read_text`` decodes, so non-UTF-8 bytes raise UnicodeDecodeError -- a
+    ValueError, which the OSError handler does not catch.
+
+    Every caller is built around the (store, usable) contract, so an undecodable file
+    has to arrive as "exists but unusable": the detail read fails soft and a claim
+    refuses. Left uncaught it left this function by raising, which is a 500 carrying no
+    code the client could act on.
+    """
+    path = tmp_path / "spec-builder-decisions.json"
+    path.write_bytes(b'{"/x": {"name": "s", "answers": {"d": "\xff\xfe not utf-8"}}}')
+    monkeypatch.setattr(routes, "_DECISIONS_PATH", path)
+
+    store, usable = routes._read_decisions()
+
+    assert store == {}
+    assert usable is False, "an undecodable ledger reported itself as writable"
+
+
+def test_a_recorded_answer_round_trips_non_ascii(tmp_path, monkeypatch):
+    """The ledger's encoding is a property of the FILE, not of the host reading it.
+
+    ``atomic_write`` always emits UTF-8 while ``read_text()`` without an encoding decodes
+    with the platform default -- the ANSI code page on Windows. Under that asymmetry an
+    option carrying an em dash came back mojibake, so the locked card displayed an answer
+    the user never chose. Asserting the exact string back is what pins the explicit
+    encoding on the read; the undecodable-bytes test above cannot, since on a UTF-8 host
+    both spellings behave alike.
+    """
+    monkeypatch.setattr(routes, "_DECISIONS_PATH", tmp_path / "spec-builder-decisions.json")
+    option = "HTTPS — with mTLS (日本語, café)"
+    # A real directory, keyed the way the code keys it: a hard-coded "/x" resolves to a
+    # drive-anchored path on Windows, so the store key and the lookup key disagreed there.
+    spec_dir = tmp_path / "the-spec"
+    spec_dir.mkdir()
+    key = routes._decision_key(str(spec_dir))
+
+    routes._save_decisions({key: {"name": "s", "answers": {"transport": option}}})
+    store, usable = routes._read_decisions()
+
+    assert usable is True
+    assert routes._decision_record(store, str(spec_dir)) == {"transport": option}
+
+
+@pytest.mark.asyncio
+async def test_an_alias_name_for_the_same_folder_cannot_re_answer(tmp_path, monkeypatch):
+    """A name is a label the agent can mint more of; the directory is the spec.
+
+    Adding a second index entry pointing at the SAME spec directory used to give the
+    alias its own empty record, so its cards rendered answerable and a click dispatched
+    a conflicting answer over the same documents. Keyed on the directory, both names
+    resolve to one record.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    # The alias: a second, perfectly valid index entry for the same files.
+    index = await routes._aload_index()
+    alias_key = routes._new_slot_key("s-alias")
+    index["s-alias"] = {**index["s"], "slot_key": alias_key}
+    routes._save_index(index)
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+    state, _slot = _slot_stub()
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s-alias/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": alias_key,
+                "decision_id": "transport",
+                "decision_option": "Streaming",
+                "text": "Decision - transport: Streaming",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload.get("code") == "decision_already_answered", payload
+    assert payload.get("answer") == "HTTPS"
+    assert dispatched == [], "the alias dispatched a second answer for a settled decision"
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_spec_keeps_its_recorded_answers(tmp_path, monkeypatch):
+    """The other side of the same coin: renaming the index entry cannot reopen a
+    decision, because the record is not keyed on the name.
+
+    This is what makes an index rewrite structurally unable to reach a settled answer,
+    rather than something that has to be detected and refused.
+    """
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    index = await routes._aload_index()
+    index["renamed"] = index.pop("s")
+    routes._save_index(index)
+
+    assert await routes._recorded_answers(spec_dir) == {"transport": "HTTPS"}
+    outcome, held = await routes._claim_decision(
+        "renamed", "transport", "Streaming",
+        expect_spec_dir=spec_dir, expect_slot_key=index["renamed"]["slot_key"],
+    )
+    assert outcome == routes._CLAIM_TAKEN, "a rename reopened a settled decision"
+    assert held == "HTTPS"
+
+
+def test_a_symlinked_spelling_of_the_folder_is_one_record(tmp_path):
+    """The key is canonicalized, so a symlinked path to the same directory cannot mint a
+    second record -- which would be an alias hole again, wearing a filesystem hat."""
+    real = tmp_path / "real-spec"
+    real.mkdir()
+    link = tmp_path / "link-spec"
+    link.symlink_to(real, target_is_directory=True)
+
+    assert routes._decision_key(str(link)) == routes._decision_key(str(real))
+
+    store = {routes._decision_key(str(real)): {"name": "s", "answers": {"transport": "HTTPS"}}}
+    assert routes._decision_record(store, str(link)) == {"transport": "HTTPS"}
+
+
+@pytest.mark.asyncio
+async def test_a_delete_clears_the_record_for_that_folder_only(tmp_path, monkeypatch):
+    """The delete clears by directory, so it cannot reach another spec's record."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    other = str(tmp_path / "another-spec")
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+    store, _usable = routes._read_decisions()
+    store[routes._decision_key(other)] = {"name": "other", "answers": {"kept": "yes"}}
+    routes._save_decisions(store)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, await resp.text()
+    assert await routes._recorded_answers(spec_dir) == {}
+    assert await routes._recorded_answers(other) == {"kept": "yes"}
+
+
+@pytest.mark.asyncio
+async def test_deleting_one_alias_leaves_the_shared_record_alone(tmp_path, monkeypatch):
+    """The record belongs to the directory, so it outlives any one name pointing at it.
+
+    Keying on the directory is what closes the alias hole, but it also means a single
+    name's delete must not clear the record: the surviving alias still serves those
+    documents, and a cleared record would hand it a clean slate for decisions that are
+    already settled -- the alias hole again, reached through a delete.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    assert (
+        await routes._claim_decision(
+            "s", "transport", "HTTPS", expect_spec_dir=spec_dir, expect_slot_key=slot_key
+        )
+    )[0] == routes._CLAIM_RECORDED
+
+    index = await routes._aload_index()
+    alias_key = routes._new_slot_key("s-alias")
+    index["s-alias"] = {**index["s"], "slot_key": alias_key}
+    routes._save_index(index)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, await resp.text()
+    assert await routes._recorded_answers(spec_dir) == {"transport": "HTTPS"}, (
+        "deleting one name cleared the record the surviving alias still needs"
+    )
+    outcome, held = await routes._claim_decision(
+        "s-alias", "transport", "Streaming",
+        expect_spec_dir=spec_dir, expect_slot_key=alias_key,
+    )
+    assert outcome == routes._CLAIM_TAKEN, "the surviving alias could re-answer"
+    assert held == "HTTPS"
+
+
+@pytest.mark.asyncio
+async def test_an_alias_mid_turn_blocks_the_answer(tmp_path, monkeypatch):
+    """A running turn under ANY name on this directory blocks the answer.
+
+    Aliases are separate sessions over the same documents, so checking only this
+    request's own slot let one alias record and dispatch an answer while the other's
+    agent was still working -- two concurrent agents, one set of files, and an answer
+    delivered to whichever won.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+
+    index = await routes._aload_index()
+    alias_key = routes._new_slot_key("s-alias")
+    index["s-alias"] = {**index["s"], "slot_key": alias_key}
+    routes._save_index(index)
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+
+    # The ALIAS is mid-turn; the name being answered is idle.
+    state, _slot = _slot_stub()
+    busy = types.SimpleNamespace(key=alias_key, running=True, messages=[])
+    real_get_slot = state.get_slot
+
+    def _get_slot(key):
+        return busy if key == alias_key else real_get_slot(key)
+
+    state.get_slot = _get_slot
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={
+                "spec_dir": spec_dir,
+                "slot_key": slot_key,
+                "decision_id": "transport",
+                "decision_option": "HTTPS",
+                "text": "Decision - transport: HTTPS",
+            },
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    # `spec_busy_elsewhere`, not `decision_agent_busy`: the blocker is a DIFFERENT
+    # session on these files, which refuses every kind of dispatch, not just answers.
+    assert payload.get("code") == "spec_busy_elsewhere", payload
+    assert dispatched == [], "an answer was dispatched while an alias's agent was working"
+    assert await routes._recorded_answers(spec_dir) == {}, (
+        "the answer was recorded even though nothing was dispatched"
+    )
+
+
+def test_the_turn_lock_is_keyed_by_directory_not_name():
+    """Source guard. A per-name lock is what let two aliases start turns on one
+    directory concurrently, so the key is worth pinning."""
+    for handler in (routes._handle_message, routes._handle_handoff, routes._handle_delete):
+        body = inspect.getsource(handler)
+        assert "_turn_lock(name)" not in body, (
+            f"{handler.__name__} still locks by name, so an alias gets its own lock"
+        )
+        assert "_turn_lock(_acanonical" not in body and "_turn_lock(await" not in body, (
+            f"{handler.__name__} should hold the key in a local, not re-derive it"
+        )
+        assert "_acanonical_dir(" in body, (
+            f"{handler.__name__} does not canonicalize its directory off the loop"
+        )
+
+
+@pytest.mark.asyncio
+async def test_deleting_one_alias_keeps_the_shared_turn_lock(tmp_path, monkeypatch):
+    """The lock is keyed by directory, so it must outlive any one name using it.
+
+    Dropping it while another alias is still indexed would hand the next arrival a
+    brand-new lock object, and a turn could then start on documents another turn is
+    already working -- the very race the directory-keyed lock closes. Only the LAST name
+    on a directory may retire its lock.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _slot_key = _decision_spec(tmp_path)
+    routes._turn_lock(spec_dir)
+    key = routes._decision_key(spec_dir)
+    assert key in routes._TURN_LOCKS
+    held = routes._TURN_LOCKS[key]
+
+    index = await routes._aload_index()
+    index["s-alias"] = {**index["s"], "slot_key": routes._new_slot_key("s-alias")}
+    routes._save_index(index)
+
+    await client.start_server()
+    try:
+        client.app["state"] = None
+        resp = await client.delete(f"{_BASE}/specs/s")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, await resp.text()
+    assert routes._TURN_LOCKS.get(key) is held, (
+        "the surviving alias lost the lock it serializes on"
+    )
+
+
+def _alias_of(index: dict, name: str, alias: str) -> str:
+    """Add a second index entry for the same directory. Returns its slot key."""
+    alias_key = routes._new_slot_key(alias)
+    index[alias] = {**index[name], "slot_key": alias_key}
+    routes._save_index(index)
+    return alias_key
+
+
+@pytest.mark.asyncio
+async def test_an_alias_mid_turn_blocks_an_ordinary_message(tmp_path, monkeypatch):
+    """Not just decision answers: ANY dispatch would be a second agent on these files.
+
+    Gating the alias check on `decision_id` left the plain message path wide open -- the
+    ordinary way a user talks to a spec -- so two agents could edit one spec's documents
+    concurrently while the decision lock looked after itself.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    alias_key = _alias_of(await routes._aload_index(), "s", "s-alias")
+
+    dispatched: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
+    state, _slot = _slot_stub()
+    busy = types.SimpleNamespace(key=alias_key, running=True, messages=[])
+    real_get_slot = state.get_slot
+    state.get_slot = lambda k: busy if k == alias_key else real_get_slot(k)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/s/message",
+            json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "just a note"},
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload.get("code") == "spec_busy_elsewhere", payload
+    assert dispatched == [], "a turn started while another view's agent was working"
+
+
+@pytest.mark.asyncio
+async def test_an_alias_mid_turn_blocks_a_handoff(tmp_path, monkeypatch):
+    """...and a handoff, which starts an autonomous build -- the most expensive way to
+    end up with two agents in one spec directory.
+
+    The refusal must also RELEASE the loop it already armed: arming happens before the
+    turn lock, so returning 409 without releasing left an active timer that later
+    dispatched the very build this refused.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _slot_key = _decision_spec(tmp_path, state={"phase": "tasks"})
+    (Path(spec_dir) / "tasks.md").write_text("- [ ] a task\n")
+    alias_key = _alias_of(await routes._aload_index(), "s", "s-alias")
+
+    state, _slot = _slot_stub()
+    busy = types.SimpleNamespace(key=alias_key, running=True, messages=[])
+    real_get_slot = state.get_slot
+    state.get_slot = lambda k: busy if k == alias_key else real_get_slot(k)
+
+    armed: list = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: armed.append(a[2]))
+    # Past the authorization gate, which runs BEFORE the turn lock: the refusal under
+    # test lives inside the lock, since only the lock keeps an alias from starting a turn
+    # between the check and the dispatch.
+    monkeypatch.setattr(routes, "_autonudge_instance", lambda: object())
+
+    async def _authorized(**_kw):
+        # (armed_loop, authz_err, status) -- the tuple the handler unpacks.
+        return types.SimpleNamespace(id="loop-1"), "", 200
+
+    monkeypatch.setattr(routes, "authorize_and_add_nudge", _authorized)
+
+    released: list = []
+
+    async def _remove(spec_name, *, only_loop_id=None):
+        released.append(only_loop_id)
+
+    monkeypatch.setattr(routes, "_remove_nudge_loop", _remove)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(f"{_BASE}/specs/s/handoff", json={"spec_dir": spec_dir})
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload.get("code") == "spec_busy_elsewhere", payload
+    assert armed == [], "a build was armed while another view's agent was working"
+    assert released == ["loop-1"], (
+        "the refusal left the armed loop running, so the refused build fires later"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_alias_set_excludes_our_own_slot(tmp_path, monkeypatch):
+    """Our own slot is the same session, and must never read as a concurrent editor.
+
+    That exclusion is what preserves same-slot queuing: a message to the session that is
+    working is queued by _dispatch_turn, the long-standing behaviour. Only ANOTHER name's
+    slot is a second agent on these documents, and only that refuses.
+    """
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir, slot_key = _decision_spec(tmp_path)
+    alias_key = _alias_of(await routes._aload_index(), "s", "s-alias")
+
+    key = routes._decision_key(spec_dir)
+    aliases = await routes._alias_slots(key, own_slot_key=slot_key)
+
+    assert aliases == {alias_key: "s-alias"}
+    assert slot_key not in aliases, "our own running slot would read as a concurrent editor"
+
+
+def test_nothing_canonicalizes_a_path_on_the_event_loop():
+    """``_decision_key`` resolves a path, so it belongs off the loop.
+
+    A spec on stalled network storage would otherwise freeze the gateway and its
+    heartbeats inside ``_turn_lock``. The async handlers take their key from
+    ``_acanonical_dir``; only the documented BLOCKING helpers call the sync form.
+    """
+    allowed = {
+        "_decision_key",
+        "_acanonical_dir",
+        "_decision_record",
+        "_claim_decision_locked",
+        "_forget_decisions_locked",
+        "_alias_slots_locked",
+    }
+    tree = ast.parse(inspect.getsource(routes))
+    offenders = []
+    for node in ast.walk(tree):
+        # BOTH kinds: _turn_lock is a plain def that runs ON the loop, so restricting
+        # this to async defs left the exact function this finding was about unguarded.
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        if node.name in allowed:
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "_decision_key"
+            ):
+                offenders.append(node.name)
+    assert not offenders, f"synchronous _decision_key called on the loop in: {sorted(set(offenders))}"
+
+
+def test_an_unresolvable_directory_keeps_its_literal_key(tmp_path, monkeypatch):
+    """``resolve()`` can fail, and the key still has to come back.
+
+    A symlink loop raises OSError on some Python versions and RuntimeError on others, so
+    both are caught: the path simply keeps its literal spelling, which is the stricter
+    direction (it gets its own key rather than merging with another spec's).
+    """
+    loop_a = tmp_path / "a"
+    loop_b = tmp_path / "b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+
+    # The real thing: a resolution that genuinely cannot complete.
+    assert routes._decision_key(str(loop_a)) == str(loop_a)
+
+    # And the version-dependent twin, which no host raises on demand.
+    real_resolve = Path.resolve
+
+    def _loop(self, *a, **k):
+        if self == Path("/spec/on/a/loop"):
+            raise RuntimeError("symlink loop")
+        return real_resolve(self, *a, **k)
+
+    monkeypatch.setattr(Path, "resolve", _loop)
+    assert routes._decision_key("/spec/on/a/loop") == "/spec/on/a/loop"

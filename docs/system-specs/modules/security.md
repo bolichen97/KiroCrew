@@ -171,6 +171,19 @@ under `(allow default)`, never an edition-resolved or user-writable executable.
 - **Bash gate**: the marker leaf is also in `_WRITE_PROTECTED_BASH_LEAVES`, and `is_sensitive_bash_command` matches it **verb-independently** (any command naming the home-anchored marker path, including a trailing-`/` subpath so `mkdir -p …/.data-home-ready/x` — which also materializes it — is caught). This mirrors the verb-independent backstop the sensitive-dir matcher uses, so quoted redirects / `cp` / `python open()` / novel write verbs cannot bypass an enumerated allowlist. Bash *reads* are incidentally blocked too — harmless, since the marker holds no secret (it is deliberately NOT in `_SENSITIVE_HOME_DIRS`, so file-read tools and `is_sensitive_path` are unaffected) and the only legitimate readers (`kirocrew doctor`, the migration code) use Python `os` calls, not bash.
 - The migration code stamps the marker directly in Python (not via a tool/bash), so legitimate stamping is unaffected. As with credential paths, the bash gate is home-anchored, defense-in-depth: a `cd`-into-home + bare-relative-leaf write is a pre-existing limitation shared by every sensitive-path rule, not specific to the marker.
 
+**Spec Builder's decision record** (`trust/spec-builder-decisions.json`) — the app
+refuses a second answer for a decision it has already recorded (the record is written
+before the answer is dispatched to an agent and is never rewritten), so this file
+is an **input to that refusal**, not a setting. An agent able to write it could erase an
+entry to make a settled decision answerable again, or forge one to lock a decision the
+user never answered and display an answer they never chose. It lives under the
+whole-directory `trust` entry rather than getting a leaf of its own, because gating the
+leaf alone left its parent replaceable: a directory under `workspace/` is not itself a
+sensitive path, so one `ln -s` naming it redirected every read and write — the app opens
+the path directly, as keystone writers must, so it would have followed the link. It is
+also deliberately NOT a field on the app's `index.json`, which is agent-writable by
+design.
+
 **Ops Mission Control authorization inputs** (`apps/ops-mission-control/data/rotation.yaml`,
 `apps/ops-mission-control/data/incidents/index.json`) — two app-owned files that are
 write-protected on both layers for the same reason as the marker above, and with the same
@@ -968,12 +981,7 @@ full inherited environment. The one deliberate *credential* exception is Kiro CL
 OWN model credential (`KIRO_API_KEY`, `_IDENTITY_PROBE_ENV_KEYS`), forwarded to the
 `whoami` identity probe only: the CLI reports an API-key session as signed in only
 when it can see that variable, so filtering it out reports a host that ACP
-authenticates on as signed out. In a post-scrub Docker container the variable
-lives only in the data home's `.env` (the entrypoint scrubs every
-`_CREDENTIAL_KEYS` entry — this one included — out of the gateway's
-`/proc/<pid>/environ`), so the identity probe and the kiro-cli spawn paths read
-it back from that file for exactly the one child that owns it; every other
-scrubbed credential stays in-process. The exposure delta is that one probe's argv — the
+authenticates on as signed out. The exposure delta is that one probe's argv — the
 credential reaches the same resolved binary the same probe already executes, in the
 same standard sandbox posture, against the same real home. The `--version` probe,
 which is the first execution of a candidate that has not yet answered anything,

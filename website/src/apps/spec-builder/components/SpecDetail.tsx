@@ -159,6 +159,15 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
     onError: (e) => setErr((e as Error).message),
     onSettled: invalidate,
   })
+  // Decision answers go out on their own mutation because they carry the decision
+  // id: the backend records that id and refuses a second answer for it, so a
+  // settled decision cannot be changed later from a re-rendered card.
+  const decisionMutation = useMutation({
+    mutationFn: (v: { id: string; option: string; msg: string }) =>
+      specApi.answerDecision(name, v.id, v.option, v.msg, specId()),
+    onError: (e) => setErr((e as Error).message),
+    onSettled: invalidate,
+  })
 
   const advancing = messageMutation.isPending
 
@@ -351,7 +360,7 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
           </div>
           <SpecStatePanel
             detail={detail}
-            sendMessage={(msg) => messageMutation.mutateAsync(msg)}
+            answerDecision={(id, option, msg) => decisionMutation.mutateAsync({ id, option, msg })}
           />
           {comments.length > 0 && (
             <div

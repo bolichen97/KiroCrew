@@ -111,6 +111,7 @@ _STATE_DIR: Path | None = None
 _INDEX_PATH: Path | None = None
 _DELETED_PATH: Path | None = None
 _SETTINGS_PATH: Path | None = None
+_DECISIONS_PATH: Path | None = None
 
 
 def _state_dir() -> Path:
@@ -136,6 +137,31 @@ def _deleted_path() -> Path:
 
 def _settings_path() -> Path:
     return _SETTINGS_PATH if _SETTINGS_PATH is not None else _state_dir() / "settings.json"
+
+
+def _decisions_path() -> Path:
+    """Decisions this backend has already dispatched to an agent.
+
+    Under the security keystone's ``trust/`` directory, NOT in this app's own state
+    dir. Two reasons, and the second is why the leaf alone was not enough:
+
+      * the index is agent-writable by design, and this record is the app's promise
+        that a decision the user answered cannot be answered again -- so an agent
+        able to edit it could erase an entry to re-open a settled decision, or forge
+        one to lock a decision the user never answered;
+      * gating only the FILE left its parent replaceable. ``workspace/spec-builder``
+        is not itself a sensitive path, so one ``ln -s`` or ``mv`` naming the
+        directory redirected every read and write this backend makes -- it opens the
+        path directly, as keystone writers must. The whole ``trust`` directory is
+        gated (it is the SEL trust root), so the parent, the leaf and every shell
+        verb naming either are refused.
+
+    This backend opens the path directly, which is how the keystone leaves are always
+    written (see the Notes vault registry and the Ops Mission Control policy leaf).
+    """
+    if _DECISIONS_PATH is not None:
+        return _DECISIONS_PATH
+    return config_dir() / "trust" / "spec-builder-decisions.json"
 
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -939,13 +965,22 @@ def _read_spec_text(spec_dir: Path, fname: str) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
-def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
+def _collect_spec_documents(name: str, spec_dir: Path) -> tuple[str, dict, dict | None]:
     """Gather everything the detail endpoint needs off the filesystem.
 
-    BLOCKING — call via ``asyncio.to_thread``. Bundled into one function so the
-    detail handler makes a single thread hop instead of three, and so no future
+    BLOCKING -- call via ``asyncio.to_thread``. Bundled into one function so the
+    detail handler makes a single thread hop instead of four, and so no future
     edit can reintroduce an inline read: derive the phase, read the three spec
-    documents, and read + normalize the agent-authored state file.
+    documents, read + normalize the agent-authored state file, and overlay this
+    backend's recorded decisions onto it.
+
+    The overlay belongs in THIS hop rather than in the handler. Reading the ledger
+    separately put an await between the handler's fresh index read and the slot
+    scoping that consumes it, so a delete-and-re-import in that window handed the
+    replacement's slot a stale ``meta`` -- and the agent's next turn ran in the old
+    project directory. The ledger is scoped by ``spec_dir``, and the fresh index
+    read refuses outright when that no longer matches, so reading it here is either
+    consistent with the response or the whole request is refused.
     """
     phase = _derive_phase(spec_dir)
     files = _read_spec_files(spec_dir)
@@ -956,7 +991,10 @@ def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
             state = _normalize_spec_state(json.loads(raw_text))
         except json.JSONDecodeError:
             state = None
-    return phase, files, state
+    with _DECISIONS_LOCK:
+        store, _usable = _read_decisions()
+        recorded = _decision_record(store, str(spec_dir))
+    return phase, files, _apply_recorded_answers(state, recorded)
 
 
 def _verified_spec_dir(spec_dir: Path) -> Path | None:
@@ -1612,6 +1650,7 @@ def _normalize_spec_state(raw: Any) -> dict | None:
     out: dict[str, Any] = {}
 
     decisions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for item in (raw.get("decisions") or [])[:_MAX_DECISIONS] if isinstance(raw.get("decisions"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -1619,6 +1658,13 @@ def _normalize_spec_state(raw: Any) -> dict | None:
         title = _clean_str(item.get("title"))
         if not did or not title:
             continue
+        # The id IS the identity: the ledger is keyed on it and the overlay matches on
+        # it, so two entries claiming one id would both settle when either is answered
+        # -- and the second card would display an answer chosen for the first. A
+        # duplicate is malformed agent output; the FIRST occurrence wins.
+        if did in seen_ids:
+            continue
+        seen_ids.add(did)
         opts_raw = item.get("options")
         options = [
             _clean_str(o) for o in (opts_raw[:_MAX_OPTIONS] if isinstance(opts_raw, list) else []) if isinstance(o, str)
@@ -1630,6 +1676,9 @@ def _normalize_spec_state(raw: Any) -> dict | None:
                 "options": [o for o in options if o],
                 "recommended": _clean_str(item.get("recommended")),
                 "answer": _clean_str(item.get("answer")),
+                # Overlaid from this backend's own ledger; the agent does not get
+                # to declare a decision re-openable. See _apply_recorded_answers.
+                "locked": False,
             }
         )
     out["decisions"] = decisions
@@ -1637,6 +1686,461 @@ def _normalize_spec_state(raw: Any) -> dict | None:
     ctx = raw.get("context")
     out["context"] = {"template": _clean_str(ctx.get("template")) if isinstance(ctx, dict) else ""}
     return out
+
+
+# ── recorded decisions ───────────────────────────────────────────────────────
+#
+# A decision answer is a one-way door. Once an option has been dispatched to the
+# agent it is part of the conversation the agent is already acting on, so the
+# card must never offer options for that decision again.
+#
+# The agent-authored state file cannot enforce that, for two reasons that both
+# happened in practice:
+#
+#  * it lags. The turn that writes ``answer`` runs AFTER the message is
+#    dispatched, so between the click and that write the card still reads as
+#    pending and a second click sends a different answer for a decision the
+#    agent already has.
+#  * it is the agent's own output. A later state write can re-emit the same
+#    decision id with ``answer: null`` -- a re-render of a question already
+#    settled -- and the card comes back offering options. A user reading that
+#    repeat as a NEW question then "answers" it again and silently reverses
+#    their earlier decision.
+#
+# So the backend keeps the record itself, on the spec's index entry, and claims
+# it atomically before dispatching: the claim is what makes concurrent clicks
+# resolve to exactly one answer, and the overlay on the detail read is what
+# keeps a settled card settled no matter what the agent writes afterwards.
+
+#: Cap on the ledger. It is per spec and grows only when a decision is answered
+#: for the FIRST time, so this is far above any real spec -- it is here so an
+#: agent that emits ids in a loop cannot grow the file without bound.
+#:
+#: There is deliberately NO separate cap on a decision id. The ledger key has to
+#: be byte-identical to the id ``_normalize_spec_state`` serves, or the overlay
+#: silently misses and the card stays clickable after being answered -- so the id
+#: goes through that same ``_clean_str`` (redact + ``_MAX_FIELD``) and nothing
+#: else. A tighter cap here was exactly that mismatch for any id over its length.
+_MAX_RECORDED = 500
+
+#: Serializes read-modify-write on the decisions file across worker threads, the
+#: same discipline ``_INDEX_LOCK`` gives the index.
+_DECISIONS_LOCK = threading.Lock()
+
+#: One asyncio lock per spec, held across "is a turn running? -> record the answer
+#: -> dispatch it", and across a DELETE's whole destructive sequence. Every handler
+#: that can start or destroy a turn takes it, so ``slot.running`` cannot flip -- and
+#: the spec cannot be deleted -- while an answer is being recorded.
+#:
+#: This is what removes the need for a compensating write. A decision answer must
+#: never be QUEUED (Pause clears the queue, so the answer may never be delivered
+#: while the ledger claims it was), and the check for that can only be trusted if
+#: nothing can start a turn between the check and the dispatch. Without the lock the
+#: claim had to be rolled back when a turn appeared mid-write -- and a rollback that
+#: itself fails leaves the card permanently locked on an answer the agent never got,
+#: which is worse than the defect the ledger exists to fix.
+#:
+#: Keyed by spec NAME, which is what every handler here already has, and bounded by
+#: the index. Entries are dropped when a spec is deleted.
+#:
+#: The LOOP is stored alongside each lock and compared on every lookup. An
+#: ``asyncio.Lock`` binds to the loop that first awaits it, so a module-level
+#: registry that outlived a loop would hand back a lock bound to the dead one and
+#: raise "is bound to a different event loop" on acquisition -- which is what a
+#: second gateway loop in one process (and the test suite) does.
+# Keyed by CANONICAL SPEC DIRECTORY (see _turn_lock), never by name.
+_TURN_LOCKS: dict[str, tuple[Any, asyncio.Lock]] = {}
+
+
+def _turn_lock(dir_key: str) -> asyncio.Lock:
+    """The turn-start lock for a spec DIRECTORY on the RUNNING loop, created on first use.
+
+    ``dir_key`` is an ALREADY-CANONICAL directory (``_acanonical_dir``): this runs on the
+    event loop, so it must not resolve a path itself.
+
+    Keyed on the directory, not the name, for the same reason the decision ledger is: the
+    index can hold several names for one directory, and a per-name lock let two of them
+    start turns on the same documents concurrently -- each seeing only its own idle slot,
+    so both dispatched. One directory is one turn.
+
+    Safe to build lazily without its own mutex: every caller runs on the event
+    loop, and the get-or-create below contains no await.
+    """
+    loop = asyncio.get_running_loop()
+    entry = _TURN_LOCKS.get(dir_key)
+    if entry is not None and entry[0] is loop:
+        return entry[1]
+    lock = asyncio.Lock()
+    _TURN_LOCKS[dir_key] = (loop, lock)
+    return lock
+
+
+def _alias_slots_locked(dir_key: str, *, own_slot_key: str) -> dict[str, str]:
+    """slot_key -> name for every OTHER indexed spec on this directory.
+
+    BLOCKING -- call via ``asyncio.to_thread`` (``_alias_slots`` is the only caller). It
+    reads the index and resolves each entry's directory, both filesystem work, which is
+    exactly why it does not belong on the loop.
+
+    Excludes the caller's own slot: that one is the same session, where an ordinary
+    message is legitimately QUEUED rather than refused. Another name is a different
+    session over the same documents, so a turn running under it is a concurrent editor.
+    """
+    out: dict[str, str] = {}
+    with _INDEX_LOCK:
+        index = _load_index()
+    for other, meta in index.items():
+        if not isinstance(meta, dict) or _decision_key(str(meta.get("spec_dir", ""))) != dir_key:
+            continue
+        slot_key = str(meta.get("slot_key", ""))
+        if not slot_key or slot_key == own_slot_key:
+            continue
+        out[slot_key] = other
+    return out
+
+
+async def _alias_slots(dir_key: str, *, own_slot_key: str) -> dict[str, str]:
+    """``_alias_slots_locked`` off the event loop."""
+    return await asyncio.to_thread(_alias_slots_locked, dir_key, own_slot_key=own_slot_key)
+
+
+def _busy_alias(state: Any, aliases: dict[str, str]) -> str:
+    """The name of an alias whose agent is mid-turn, or "".
+
+    Deliberately on the loop and deliberately in-memory only: the slot registry lives on
+    the loop, so reading ``running`` from a worker thread would race the very state it is
+    trying to observe. The filesystem half of this question is answered by
+    ``_alias_slots_locked`` before the lock is taken.
+    """
+    if state is None:
+        return ""
+    for slot_key, other in aliases.items():
+        slot = state.get_slot(slot_key) if hasattr(state, "get_slot") else None
+        if slot is not None and getattr(slot, "running", False):
+            return other
+    return ""
+
+
+def _read_decisions() -> tuple[dict, bool]:
+    """Read the whole decisions file. BLOCKING -- call under the lock.
+
+    Returns ``(store, usable)``. ``usable`` is False when a file that EXISTS could
+    not be read or parsed, and that distinction decides whether a caller may write:
+
+      * a READ (the detail overlay) fails soft to ``{}`` -- toward answerable,
+        never toward a locked card nobody can clear;
+      * a WRITE must refuse. Treating an unreadable file as an empty ledger and
+        saving over it would erase every other spec's answers and make settled
+        decisions answerable again -- a corrupt read must not become a data loss.
+
+    A MISSING file is the ordinary first-run case: empty and writable.
+    """
+    path = _decisions_path()
+    try:
+        # encoding pinned: ``atomic_write`` always emits UTF-8, but ``read_text()``
+        # without an encoding decodes with the platform default -- the ANSI code page on
+        # Windows. That asymmetry is not theoretical: a recorded option carrying an em
+        # dash or any non-ASCII character would come back mojibake, so the card would
+        # display an answer the user never chose, and on a UTF-8 sequence cp1252 cannot
+        # map, the read would fail outright. The file's encoding is a property of the
+        # file, not of the host that happens to read it.
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, True
+    except (OSError, UnicodeError):
+        # UnicodeError as well as OSError: the decode above raises UnicodeDecodeError on
+        # bytes that are not valid UTF-8 -- a ValueError, not an OSError, so it would
+        # otherwise leave this function by raising. Every caller is built around the
+        # (store, usable) contract, so an undecodable file has to arrive here as "exists
+        # but unusable" rather than as a 500 on the detail read.
+        logger.warning("could not read the decision record at %s", path, exc_info=True)
+        return {}, False
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("the decision record at %s is not valid JSON", path)
+        return {}, False
+    if not isinstance(data, dict):
+        logger.warning("the decision record at %s is not an object", path)
+        return {}, False
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)}, True
+
+
+def _save_decisions(store: dict) -> None:
+    """Persist the decisions file. Atomic (temp + rename), like every writer here.
+
+    No mkdir of its own: ``atomic_write`` creates the target's parent, which matters
+    because the ledger lives under the keystone's ``trust/`` root rather than this
+    app's state dir, and that directory may not exist yet on a fresh install.
+    """
+    atomic_write(_decisions_path(), json.dumps(store, indent=2))
+
+
+def _decision_key(spec_dir: str) -> str:
+    """The ledger key for a spec: its directory, canonicalized.
+
+    The DIRECTORY is the identity, not the name. Both live in the index, but only the
+    name is a label the agent can mint more of -- adding a second entry pointing at the
+    same files gave the alias its own (empty) record, so its cards rendered answerable
+    and a click dispatched a conflicting answer over the same documents. Keying on the
+    directory collapses every name for one spec onto one record.
+
+    ``realpath`` because a symlinked spelling of the same directory must not mint a
+    second record; resolution failures fall back to the literal path, which is stricter
+    (an unresolvable path simply gets its own key) rather than merging two specs.
+
+    BLOCKING -- ``resolve()`` is a filesystem call, so a spec on stalled network storage
+    would freeze the caller. Every on-loop user takes its key from ``_acanonical_dir``
+    instead; ``test_nothing_canonicalizes_a_path_on_the_event_loop`` holds that line.
+
+    ``RuntimeError`` as well as ``OSError``: a symlink loop raises the former on some
+    Python versions and the latter on others, and both mean the same thing here -- the
+    path does not resolve, so it keeps its literal spelling.
+    """
+    try:
+        return str(Path(spec_dir).resolve())
+    except (OSError, RuntimeError):  # pragma: no cover - vanished or looping path
+        return spec_dir
+
+
+async def _acanonical_dir(spec_dir: str) -> str:
+    """``_decision_key`` off the event loop. The only form a handler may call."""
+    return await asyncio.to_thread(_decision_key, spec_dir)
+
+
+def _decision_record(store: dict, spec_dir: str) -> dict[str, str]:
+    """The answers recorded for the spec living in THIS directory.
+
+    A delete clears the record, so a re-import into the same directory legitimately
+    starts clean; one into a different directory is a different spec and has its own
+    key. Nothing here consults the index, which is what keeps an index rewrite from
+    reaching a settled answer: it can change what a name points AT, but it cannot
+    replace, erase or move the record for a directory.
+    """
+    entry = store.get(_decision_key(spec_dir))
+    if not isinstance(entry, dict):
+        return {}
+    answers = entry.get("answers")
+    if not isinstance(answers, dict):
+        return {}
+    return {k: v for k, v in answers.items() if isinstance(k, str) and k and isinstance(v, str)}
+
+
+async def _recorded_answers(spec_dir: str) -> dict[str, str]:
+    """Answers this backend has already recorded for a spec, id -> option.
+
+    Off the event loop: a ledger read is a file read.
+    """
+
+    def _read() -> dict[str, str]:
+        with _DECISIONS_LOCK:
+            store, _usable = _read_decisions()
+            return _decision_record(store, spec_dir)
+
+    return await asyncio.to_thread(_read)
+
+
+def _apply_recorded_answers(spec_state: dict | None, recorded: dict[str, str]) -> dict | None:
+    """Overlay the recorded answers onto agent-authored state, ledger wins.
+
+    A decision this backend has dispatched is reported with that answer and
+    ``locked``, whatever the state file says about it -- including a pending
+    re-emission of the same id. Decisions the agent has dropped from its state
+    file are NOT resurrected: there is no card to lock, and synthesising one
+    would put a title on screen that no longer exists anywhere.
+    """
+    if not recorded or not isinstance(spec_state, dict):
+        return spec_state
+    decisions = spec_state.get("decisions")
+    if not isinstance(decisions, list):
+        return spec_state
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        answer = recorded.get(str(d.get("id", "")))
+        if answer is None:
+            continue
+        # Redacted on the way out like every other served value: this path does not
+        # go through the state file's own scrub.
+        d["answer"] = _clean_str(answer)
+        d["locked"] = True
+    return spec_state
+
+
+#: Outcomes of a decision claim. ``stale`` means the spec's identity moved (or its
+#: delete was reserved) while the request was in flight, which the caller reports as
+#: a stale client rather than as anything about the decision. ``unreadable`` means
+#: the record exists but could not be read, so writing would erase it.
+_CLAIM_RECORDED = "recorded"
+_CLAIM_TAKEN = "already_answered"
+_CLAIM_STALE = "stale"
+_CLAIM_FULL = "ledger_full"
+_CLAIM_UNREADABLE = "unreadable"
+_CLAIM_WRITE_FAILED = "write_failed"
+
+
+def _spec_is_live(index: dict, name: str, *, expect_spec_dir: str, expect_slot_key: str) -> bool:
+    """True when *name* is still the same indexed, non-deleting spec.
+
+    The identity check the ledger cannot make for itself: the index is what says
+    which directory and creation a name currently means, and whether a delete is
+    reserved. Refusing on a reservation matters because a claim that commits while
+    the dispatch is refused would lock a decision to an answer the agent never got.
+
+    Takes an index SNAPSHOT rather than reading it, so the caller can hold
+    ``_INDEX_LOCK`` across the check and its own write.
+    """
+    meta = index.get(name)
+    if meta is None or meta.get(_DELETING):
+        return False
+    if str(meta.get("spec_dir", "")) != expect_spec_dir:
+        return False
+    if expect_slot_key and str(meta.get("slot_key", "")) != expect_slot_key:
+        return False
+    return True
+
+
+def _claim_decision_locked(
+    name: str,
+    decision_id: str,
+    option: str,
+    expect_spec_dir: str,
+    expect_slot_key: str,
+) -> tuple[str, str]:
+    """Liveness check + ledger write as ONE transaction. Returns the claim outcome.
+
+    BLOCKING -- call via ``asyncio.to_thread`` (``_claim_decision`` is the only
+    caller). It reads the index synchronously on purpose: the check and the commit
+    must be inseparable, because a DELETE reserving between them would have the
+    answer recorded for a spec already being torn down. ``_mark_deleting`` writes
+    that reservation under ``_INDEX_LOCK``, so holding the same lock here serializes
+    the two -- either the reservation is visible and this refuses, or it lands after
+    this commit and the delete's own cleanup removes the record.
+
+    Lock ORDER is ``_INDEX_LOCK`` then ``_DECISIONS_LOCK``, everywhere. Nothing
+    takes them the other way round, which is what keeps this deadlock-free.
+    """
+    with _INDEX_LOCK:
+        if not _spec_is_live(
+            _load_index(),
+            name,
+            expect_spec_dir=expect_spec_dir,
+            expect_slot_key=expect_slot_key,
+        ):
+            return _CLAIM_STALE, ""
+        with _DECISIONS_LOCK:
+            store, usable = _read_decisions()
+            if not usable:
+                return _CLAIM_UNREADABLE, ""
+            answers = _decision_record(store, expect_spec_dir)
+            held = answers.get(decision_id)
+            if held is not None:
+                return _CLAIM_TAKEN, held
+            if len(answers) >= _MAX_RECORDED:
+                return _CLAIM_FULL, ""
+            # The ONE durable write. It lands before the dispatch and is never rewritten:
+            # a second write to mark the answer delivered could itself fail, and its
+            # failure would be indistinguishable from the crash it was added to detect --
+            # so the only safe reading of a record is "final".
+            answers[decision_id] = option
+            # Keyed on the directory; `name` is carried for readability only and is
+            # never matched on, so a later rename or alias cannot strand the record.
+            store[_decision_key(expect_spec_dir)] = {"name": name, "answers": answers}
+            try:
+                _save_decisions(store)
+            except OSError:
+                # A full or unwritable data home. Raising here would 500 the request,
+                # and a 500 carries no code the client can act on -- so its optimistic
+                # lock would stay while nothing was recorded OR dispatched. A named
+                # pre-dispatch refusal is the honest answer: nothing happened, and the
+                # card re-opens.
+                logger.warning("could not record the decision answer for %s", name, exc_info=True)
+                return _CLAIM_WRITE_FAILED, ""
+            return _CLAIM_RECORDED, ""
+
+
+async def _claim_decision(
+    name: str,
+    decision_id: str,
+    option: str,
+    *,
+    expect_spec_dir: str,
+    expect_slot_key: str,
+) -> tuple[str, str]:
+    """Record *option* as the answer to *decision_id*, once and only once.
+
+    Returns ``(outcome, recorded_option)``. On ``_CLAIM_TAKEN`` the second value
+    is the answer that IS recorded, so the caller can tell the client what the
+    agent was actually given instead of a bare refusal.
+
+    One worker-thread hop (see ``_claim_decision_locked``), so two concurrent
+    requests for the same decision cannot both observe it unanswered -- the
+    double-click case, and the one a client-side lock cannot close.
+    """
+    return await asyncio.to_thread(
+        _claim_decision_locked, name, decision_id, option, expect_spec_dir, expect_slot_key
+    )
+
+
+def _forget_decisions_locked(spec_dir: str) -> tuple[bool, bool]:
+    """Clear the ledger record for a deleted spec's directory.
+
+    Returns ``(ok, still_referenced)``. ``still_referenced`` is what tells the caller
+    another indexed name is serving these documents, which decides both this cleanup and
+    whether the directory's turn lock may be dropped -- one index read answering both,
+    under one lock, rather than two reads that could disagree.
+
+    BLOCKING -- call via ``asyncio.to_thread`` (``_forget_decisions`` is the only
+    caller). It reads the index synchronously because the decision it makes depends on
+    what the index still says, and splitting that across a hop would only widen the
+    window in which the answer changes.
+
+    Lock ORDER is ``_INDEX_LOCK`` then ``_DECISIONS_LOCK``, as everywhere else.
+    """
+    with _INDEX_LOCK:
+        key = _decision_key(spec_dir)
+        # The record belongs to the DIRECTORY, so it outlives any one name pointing at
+        # it. The doomed name is already out of the index by now, so anything left here
+        # is a live spec still serving these documents -- and clearing the record would
+        # hand it a clean slate for decisions that are already settled. Keeping the entry
+        # is the same cheap residue a failed cleanup leaves.
+        if any(
+            isinstance(meta, dict) and _decision_key(str(meta.get("spec_dir", ""))) == key
+            for meta in _load_index().values()
+        ):
+            return True, True  # still referenced -- deliberately nothing to do
+        with _DECISIONS_LOCK:
+            store, usable = _read_decisions()
+            if not usable:
+                return False, False
+            if key not in store:
+                return True, False  # nothing recorded -- already in the wanted state
+            del store[key]
+            _save_decisions(store)
+            return True, False
+
+
+async def _forget_decisions(spec_dir: str) -> tuple[bool, bool]:
+    """Drop a deleted spec's answers. Housekeeping, and deliberately best-effort.
+
+    Runs AFTER the index entry is gone, and its failure is not fatal, because of what
+    the two residues cost. Clearing the ledger FIRST means a crash before the index
+    write leaves a spec that still exists with its settled decisions answerable again
+    -- a silent reversal, the one outcome this file exists to prevent. Leaving an entry
+    behind costs nothing comparable: it is keyed on the directory, so the only spec that
+    can read it again is one serving those same documents, which is who those answers
+    were given for. Bounded, too -- ``_MAX_RECORDED`` caps it.
+
+    So a stale entry is at worst a few bytes and at best correct, while an erased one is
+    a reversal. Returns ``(ok, still_referenced)``; see ``_forget_decisions_locked``.
+    """
+    try:
+        return await asyncio.to_thread(_forget_decisions_locked, spec_dir)
+    except Exception:
+        logger.warning("could not clear the decision record for %s", spec_dir, exc_info=True)
+        # Unknown whether another name still serves the directory, so claim it does: that
+        # keeps the turn lock in place, which is the safe direction for a shared lock.
+        return False, True
 
 
 def _discard_queued_work(slot: Any) -> None:
@@ -2908,6 +3412,9 @@ async def _handle_get(request: web.Request) -> web.Response:
     if not meta:
         return web.json_response({"code": "not_found", "error": "not found"}, status=404)
     spec_dir = Path(meta["spec_dir"])
+    # Captured BEFORE the awaits below so the freshness check can compare the whole
+    # identity, not just the directory (see that check for why).
+    original_slot_key = str(meta.get("slot_key", ""))
 
     state = request.app.get("state")
 
@@ -2918,10 +3425,13 @@ async def _handle_get(request: web.Request) -> web.Response:
     #
     # ALL of the detail handler's filesystem work happens in ONE worker-thread
     # hop: stat-ing the three phase files, reading up to three 1 MiB documents,
-    # and reading .spec-state.json. The UI polls this endpoint every 2.5s while a
-    # build runs, so doing it inline froze the gateway's event loop — chat
-    # streaming and heartbeats included — for the duration of every poll.
-    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, spec_dir)
+    # reading .spec-state.json, and overlaying the recorded decisions. The UI polls
+    # this endpoint every 2.5s while a build runs, so doing it inline froze the
+    # gateway's event loop — chat streaming and heartbeats included — for the
+    # duration of every poll. It is also the only place the ledger may be read from
+    # here: a separate await would sit between the fresh index read below and the
+    # slot scoping that consumes it.
+    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, name, spec_dir)
 
     # Live context counters from the worker slot's transcript. The slot is
     # CREATED here if it does not exist yet (see _ensure_worker_slot): a spec
@@ -2940,7 +3450,14 @@ async def _handle_get(request: web.Request) -> web.Response:
     meta = fresh.get(name)
     if not meta:
         return web.json_response({"code": "not_found", "error": "not found"}, status=404)
-    if str(meta.get("spec_dir", "")) != str(spec_dir):
+    # BOTH halves of the identity, not just the directory. A delete leaves the
+    # documents on disk, so a re-import at the same name AND path is a DIFFERENT
+    # creation with its own conversation -- and a spec_dir-only check would pair the
+    # replacement's metadata with documents and a decision record read for the spec
+    # that is gone, serving the deleted spec's locked answers on the new one.
+    if str(meta.get("spec_dir", "")) != str(spec_dir) or str(
+        meta.get("slot_key", "")
+    ) != original_slot_key:
         return web.json_response(
             {"code": "spec_changed_during_read", "error": "spec was recreated while loading; retry"}, status=409
         )
@@ -3052,6 +3569,26 @@ async def _handle_message(request: web.Request) -> web.Response:
     # conversation -- and this instruction would land in the replacement's chat.
     claimed_dir = str(body.get("spec_dir", "") or "").strip()
     claimed_key = str(body.get("slot_key", "") or "").strip()
+    # Present only when this message is a decision card's answer.
+    #
+    # Both values go through _clean_str -- the SAME projection _normalize_spec_state
+    # applies -- and through nothing else. Two reasons, and both were defects:
+    #
+    #  * the id becomes the ledger KEY, and the overlay matches it against the id
+    #    the detail read serves. A different normalization here (a strip, a shorter
+    #    cap) makes the two disagree for whitespace-bearing or long ids, and a
+    #    disagreement is invisible: the answer is recorded, no card is ever locked,
+    #    and the decision stays re-answerable.
+    #  * the OPTION is what gets recorded and later rendered as the answer. The
+    #    composed prompt ("Decision — <title>: <option>", localized) must not be:
+    #    the card would show the whole sentence back instead of the choice.
+    decision_id = _clean_str(body.get("decision_id"))
+    decision_option = _clean_str(body.get("decision_option"))
+    if decision_id and not decision_option:
+        return web.json_response(
+            {"code": "decision_option_required", "error": "decision_option required with decision_id"},
+            status=400,
+        )
     fresh = await _touch_spec(
         name, expect_spec_dir=claimed_dir or None, expect_slot_key=claimed_key or None
     )
@@ -3066,33 +3603,150 @@ async def _handle_message(request: web.Request) -> web.Response:
         return web.json_response(
             {"code": "slot_owned_by_another_app", "error": "this spec's chat session is owned by another app"}, status=409
         )
-    # Re-pin immediately before dispatch. _ensure_worker_slot awaits (it revalidates
-    # the working dir off the event loop), so a delete can start AND finish between
-    # the check above and this line -- handing the turn to a slot whose spec is gone.
-    # Nothing awaits between this refusal and _dispatch_turn, which is synchronous.
-    #
-    # BOTH pins come from `fresh` -- the entry this request already verified -- not
-    # from the client body. `slot_key` is optional on the wire (an older client that
-    # sends none is treated as unpinned rather than refused), so reusing the CLAIMED
-    # value here meant a request without one had no creation pin on the second check:
-    # a delete plus a same-path recreate passed it, because spec_dir still matched,
-    # and the stale slot wrote into the replacement's files. The captured value is
-    # server-side data, so pinning to it is strictly stronger AND still lets an older
-    # client through the first check.
-    if (
-        await _touch_spec(
-            name,
-            expect_spec_dir=fresh.get("spec_dir"),
-            expect_slot_key=str(fresh.get("slot_key", "")) or None,
-        )
-        is None
-    ):
-        return web.json_response(
-            {"code": "stale_client", "error": "spec was deleted or recreated; reload and retry"}, status=409
-        )
-    _dispatch_turn(state, slot, text)
-    _audit("spec_message", name)
-    return web.json_response({"ok": True})
+    # Off the loop, BEFORE the lock: both are filesystem work (a path resolve and an
+    # index read), and the lock itself must not do either -- a spec on stalled network
+    # storage would otherwise freeze the gateway while holding it.
+    dir_key = await _acanonical_dir(str(fresh.get("spec_dir", "")))
+    # Every OTHER name on this directory. Read before the lock for the same reason, and
+    # nothing is lost by reading early: a turn can only START under the directory-keyed
+    # lock this handler is about to hold, so no alias can begin one after this scan. One
+    # that FINISHES meanwhile just makes the reading stale in the safe direction.
+    aliases = await _alias_slots(dir_key, own_slot_key=str(getattr(slot, "key", "")))
+    # The turn lock spans the running-check, the claim and the dispatch, so no other
+    # handler can start a turn on this spec in between -- see _TURN_LOCKS. Acquired
+    # BEFORE the re-pin so the last await before the dispatch is still a pinning one.
+    async with _turn_lock(dir_key):
+        # An alias mid-turn is a SECOND session over these documents, so its turn is a
+        # concurrent editor no matter what this request carries -- a decision answer, an
+        # ordinary message, anything. Refused for all of them.
+        #
+        # Our OWN slot is excluded from `aliases`, which is what preserves same-slot
+        # queuing: a message to the session that is running is queued by _dispatch_turn
+        # (the established behaviour), while a decision answer to it is refused below --
+        # a queued answer may never be delivered, and the ledger would claim it was.
+        if busy_under := _busy_alias(state, aliases):
+            _audit("spec_busy_elsewhere", f"{name}: {busy_under}", outcome="denied")
+            return web.json_response(
+                {
+                    "code": "spec_busy_elsewhere",
+                    "error": (
+                        f"another view of this spec ({busy_under}) has an agent working on "
+                        "these files; wait for it to finish"
+                    ),
+                },
+                status=409,
+            )
+        # Re-pin after slot acquisition. _ensure_worker_slot awaits (it revalidates the
+        # working dir off the event loop), so a delete can start AND finish between the
+        # check above and this line -- handing the turn to a slot whose spec is gone.
+        #
+        # BOTH pins come from `fresh` -- the entry this request already verified -- not
+        # from the client body. `slot_key` is optional on the wire (an older client that
+        # sends none is treated as unpinned rather than refused), so reusing the CLAIMED
+        # value here meant a request without one had no creation pin on the second check:
+        # a delete plus a same-path recreate passed it, because spec_dir still matched,
+        # and the stale slot wrote into the replacement's files. The captured value is
+        # server-side data, so pinning to it is strictly stronger AND still lets an older
+        # client through the first check.
+        if (
+            await _touch_spec(
+                name,
+                expect_spec_dir=fresh.get("spec_dir"),
+                expect_slot_key=str(fresh.get("slot_key", "")) or None,
+            )
+            is None
+        ):
+            return web.json_response(
+                {"code": "stale_client", "error": "spec was deleted or recreated; reload and retry"}, status=409
+            )
+        # A decision answer is claimed before it is dispatched, and a decision that is
+        # already recorded is refused outright -- the agent has that answer and is
+        # acting on it, so a second one would silently reverse a settled decision. The
+        # claim is atomic (see _claim_decision), so two concurrent clicks on the same
+        # card resolve to exactly one dispatched answer rather than two turns.
+        #
+        # The claim is the LAST await before the synchronous dispatch, and that position
+        # is the whole point. Anything awaiting after a committed claim can still refuse
+        # the dispatch, and a claim whose dispatch was refused is the one state nothing
+        # can recover from: the card is locked and the agent never heard the choice.
+        #
+        # A RUNNING slot is refused rather than queued. _dispatch_turn queues into a turn
+        # that is already in flight, and a Pause (or Stop, or Delete) clears that queue by
+        # design -- ending a turn must not let the agent keep working. So a queued answer
+        # is an answer that may never be delivered, while the ledger would go on claiming
+        # it was.
+        #
+        # The check is trustworthy because the turn lock is held from here through the
+        # dispatch: nothing else can start a turn on this spec in between. That is what
+        # lets the claim commit exactly once, with NO compensating write -- a rollback
+        # that itself failed would leave the card permanently locked on an answer the
+        # agent never got, which is worse than the defect the ledger exists to fix.
+        if decision_id and getattr(slot, "running", False):
+            return web.json_response(
+                {
+                    "code": "decision_agent_busy",
+                    "error": "the agent is working on this spec; answer the decision once it stops",
+                    "decision_id": decision_id,
+                },
+                status=409,
+            )
+        if decision_id:
+            outcome, held = await _claim_decision(
+                name,
+                decision_id,
+                decision_option,
+                expect_spec_dir=str(fresh.get("spec_dir", "")),
+                expect_slot_key=str(fresh.get("slot_key", "")),
+            )
+            if outcome == _CLAIM_TAKEN:
+                return web.json_response(
+                    {
+                        "code": "decision_already_answered",
+                        "error": "this decision was already sent to the agent and cannot be changed",
+                        "decision_id": decision_id,
+                        "answer": _clean_str(held),
+                    },
+                    status=409,
+                )
+            if outcome == _CLAIM_FULL:
+                _audit("spec_decision_ledger_full", name, outcome="denied")
+                return web.json_response(
+                    {"code": "decision_ledger_full", "error": "too many recorded decisions for this spec"}, status=409
+                )
+            if outcome == _CLAIM_UNREADABLE:
+                # The record exists but could not be read. Writing would erase every
+                # answer in it, so nothing is recorded and nothing is dispatched.
+                _audit("spec_decision_record_unreadable", name, outcome="denied")
+                return web.json_response(
+                    {
+                        "code": "decision_record_unreadable",
+                        "error": "this spec's recorded decisions could not be read; retry shortly",
+                    },
+                    status=503,
+                )
+            if outcome == _CLAIM_WRITE_FAILED:
+                # The record could not be written (a full or unwritable data home), so
+                # nothing was recorded and nothing is dispatched.
+                _audit("spec_decision_record_write_failed", name, outcome="denied")
+                return web.json_response(
+                    {
+                        "code": "decision_record_write_failed",
+                        "error": "this spec's recorded decisions could not be written; retry shortly",
+                    },
+                    status=503,
+                )
+            if outcome != _CLAIM_RECORDED:
+                return web.json_response(
+                    {"code": "stale_client", "error": "spec was deleted or recreated; reload and retry"}, status=409
+                )
+            _audit("spec_decision_answered", f"{name}: {decision_id}")
+        # Nothing may await between the last refusal above and this synchronous dispatch.
+        _dispatch_turn(state, slot, text)
+        # Nothing follows the dispatch. The answer was already recorded as final above,
+        # so there is no second write here whose failure could reopen a decision the
+        # agent has now seen.
+        _audit("spec_message", name)
+        return web.json_response({"ok": True})
 
 
 async def _handle_handoff(request: web.Request) -> web.Response:
@@ -3309,31 +3963,66 @@ async def _handle_handoff(request: web.Request) -> web.Response:
         return web.json_response(
             {"code": "authorization_refused", "error": f"could not start autonomous execution: {authz_err}"}, status=403
         )
-    # Arming awaits too, so re-verify the creation once more. A DELETE landing in
-    # that window tears down the slot and the loops it can see BY NAME -- ours
-    # arrives after, and would be left nudging a spec that no longer exists. The
-    # old arm-then-commit order caught this at the commit; the reorder above has to
-    # catch it here instead.
-    if (
-        await _touch_spec(
-            name,
-            expect_spec_dir=str(spec_dir),
-            expect_slot_key=captured_slot_key or None,
-            # The loop is armed: the reconciler can see it now, so the pre-arm
-            # exemption must end here rather than expire on the grace window.
-            exec_arming_at=0.0,
-        )
-        is None
-    ):
-        await _release(
-            "deleted or recreated during authorization",
-            loop_id=getattr(armed_loop, "id", None),
-        )
-        return web.json_response(
-            {"code": "spec_changed_during_start", "error": "spec was deleted or recreated while execution was starting"},
-            status=409,
-        )
-    _dispatch_turn(state, slot, prompt)
+    # The same turn lock the message and delete paths take, held across the FINAL
+    # freshness check AND the dispatch. Two orderings depend on that span: a decision
+    # answer must not be queued behind a build starting here (Pause would drop it),
+    # and a DELETE must not slip between this check and the dispatch -- holding the
+    # lock only for the dispatch left exactly that window, so the turn started on a
+    # spec the delete had already removed.
+    handoff_dir_key = await _acanonical_dir(str(spec_dir))
+    handoff_aliases = await _alias_slots(
+        handoff_dir_key, own_slot_key=str(captured_slot_key or "")
+    )
+    async with _turn_lock(handoff_dir_key):
+        # A handoff starts an autonomous build. Another name on this directory that is
+        # mid-turn is a second agent already editing these files, so the build waits --
+        # the same refusal an ordinary message gets, for the same reason.
+        #
+        # The loop is ALREADY ARMED by the time we get here (arming happens before this
+        # lock), so this refusal has to release it like every other abort path in this
+        # handler. Returning without that left an active timer which later dispatched the
+        # very build this refused.
+        if busy_under := _busy_alias(state, handoff_aliases):
+            await _release(
+                f"busy under {busy_under}",
+                loop_id=getattr(armed_loop, "id", None),
+            )
+            _audit("spec_handoff_denied", f"{name}: busy under {busy_under}", outcome="denied")
+            return web.json_response(
+                {
+                    "code": "spec_busy_elsewhere",
+                    "error": (
+                        f"another view of this spec ({busy_under}) has an agent working on "
+                        "these files; wait for it to finish"
+                    ),
+                },
+                status=409,
+            )
+        # Arming awaits too, so re-verify the creation once more. A DELETE landing in
+        # that window tears down the slot and the loops it can see BY NAME -- ours
+        # arrives after, and would be left nudging a spec that no longer exists. The
+        # old arm-then-commit order caught this at the commit; the reorder above has to
+        # catch it here instead.
+        if (
+            await _touch_spec(
+                name,
+                expect_spec_dir=str(spec_dir),
+                expect_slot_key=captured_slot_key or None,
+                # The loop is armed: the reconciler can see it now, so the pre-arm
+                # exemption must end here rather than expire on the grace window.
+                exec_arming_at=0.0,
+            )
+            is None
+        ):
+            await _release(
+                "deleted or recreated during authorization",
+                loop_id=getattr(armed_loop, "id", None),
+            )
+            return web.json_response(
+                {"code": "spec_changed_during_start", "error": "spec was deleted or recreated while execution was starting"},
+                status=409,
+            )
+        _dispatch_turn(state, slot, prompt)
     _audit("spec_handoff", name)
     return web.json_response({"ok": True, "status": "executing"})
 
@@ -3475,109 +4164,144 @@ async def _handle_delete(request: web.Request) -> web.Response:
     # entry was already gone while the documents were still on disk and
     # untombstoned: a list poll landing there re-adopted the markdown through
     # discovery, so the DELETE returned 200 with the spec still listed. The
-    # tombstone is what discovery consults, so it has to exist before the entry
-    # stops being visible. It is cleared again on every path that does not delete.
-    await asyncio.to_thread(_remember_deleted, doomed_dir)
-    # RESERVE the name rather than dropping the entry. Popping it freed the name for
-    # the duration of the teardown, so a same-name create could take it and the
-    # rollback had to restore under `<name>-2` -- which carries a per-creation slot
-    # key that only the ORIGINAL name may own, leaving the conversation unreachable.
-    # Marking keeps the entry (hidden from the list), so the name cannot be taken and
-    # a rollback restores the original with its key intact.
-    if not await _mark_deleting(
-        name, expect_spec_dir=doomed_dir, expect_slot_key=doomed_slot_key
-    ):
-        await asyncio.to_thread(_forget_deleted, doomed_dir)
-        return web.json_response({"code": "not_found", "error": "not found"}, status=404)
-    # RESERVED -- only now capture the runtime. Capturing before the reservation left
-    # a window where a message could materialize a NEW slot (or arm a new loop) that
-    # this capture had already passed: the teardown below then cancelled a stale
-    # handle while the freshly-created session kept running the agent against files
-    # the user had just deleted. With the marker set first, _touch_spec refuses that
-    # message, so nothing new can appear between here and the teardown.
-    state = request.app.get("state")
-    doomed_loop_id = _exec_loop_id(name)
-    doomed_slot = state.get_slot(_slot_key(name)) if state is not None else None
-    # Stop any execution loop; leave the .md files on disk (they are the user's
-    # project files under .kiro/specs) — only drop app bookkeeping + the slot.
-    try:
-        await _remove_nudge_loop(name, only_loop_id=doomed_loop_id)
-    except Exception:
-        # Fail the delete rather than report success: the entry is still in the
-        # index, so a retry is meaningful, and the persisted loop cannot rearm
-        # against a same-name spec re-imported later. Release the reservation and
-        # the tombstone too -- both were taken above, and leaving either behind
-        # would hide a spec the user still has from their own list.
-        logger.warning("spec %s: loop removal failed — delete aborted", name, exc_info=True)
-        await _unmark_deleting(name, expect_spec_dir=doomed_dir)
-        await asyncio.to_thread(_forget_deleted, doomed_dir)
-        _audit("spec_delete_aborted", name, outcome="denied")
-        return web.json_response(
-            {"code": "loop_removal_failed", "error": "could not stop this spec's background loop; nothing was deleted"},
-            status=503,
-        )
-    # NOW tear the worker slot down: removing only the nudge loop left the
-    # in-flight turn ALIVE, so the agent kept running and editing the user's files
-    # after they deleted the spec, and re-creating the same name resurrected the old
-    # transcript (get_or_create_slot keys off the slot name). Mirrors the gateway's own
-    # slot-delete order internally: pop from the registry, cancel and await the task,
-    # then persist as closed.
-    #
-    # require_archive: the conversation is the user's data. A failed history write used
-    # to be logged at DEBUG while the delete returned 200 -- the transcript silently
-    # gone. Now the reservation is released instead, so the spec is still listed with
-    # its session intact and the retry is meaningful.
-    if not await _teardown_worker_slot(
-        state, name, only_slot=doomed_slot, require_archive=True
-    ):
-        released = await _unmark_deleting(name, expect_spec_dir=doomed_dir)
-        # The spec lives again, so the tombstone must go: leaving it would suppress
-        # the documents from discovery for a spec that was never deleted.
-        await asyncio.to_thread(_forget_deleted, doomed_dir)
-        detail = (
-            "nothing was deleted"
-            if released
-            else "nothing was deleted; the spec may need a reload to reappear"
-        )
-        return web.json_response(
-            {
-                "code": "archive_failed",
-                "error": f"could not archive this spec's conversation; {detail}",
-            },
-            status=503,
-        )
+    # The same lock the message and handoff paths take. Without it a handoff that
+    # already passed its freshness check acquires the lock AFTER this delete released
+    # it and starts a turn on a spec that no longer exists; and a decision answer
+    # could be recorded against a spec being torn down. Held across the whole
+    # destructive sequence, so those handlers see either a live spec or none.
+    doomed_key = await _acanonical_dir(doomed_dir)
+    async with _turn_lock(doomed_key):
+        # tombstone is what discovery consults, so it has to exist before the entry
+        # stops being visible. It is cleared again on every path that does not delete.
+        await asyncio.to_thread(_remember_deleted, doomed_dir)
+        # RESERVE the name rather than dropping the entry. Popping it freed the name for
+        # the duration of the teardown, so a same-name create could take it and the
+        # rollback had to restore under `<name>-2` -- which carries a per-creation slot
+        # key that only the ORIGINAL name may own, leaving the conversation unreachable.
+        # Marking keeps the entry (hidden from the list), so the name cannot be taken and
+        # a rollback restores the original with its key intact.
+        if not await _mark_deleting(
+            name, expect_spec_dir=doomed_dir, expect_slot_key=doomed_slot_key
+        ):
+            await asyncio.to_thread(_forget_deleted, doomed_dir)
+            return web.json_response({"code": "not_found", "error": "not found"}, status=404)
+        # RESERVED -- only now capture the runtime. Capturing before the reservation left
+        # a window where a message could materialize a NEW slot (or arm a new loop) that
+        # this capture had already passed: the teardown below then cancelled a stale
+        # handle while the freshly-created session kept running the agent against files
+        # the user had just deleted. With the marker set first, _touch_spec refuses that
+        # message, so nothing new can appear between here and the teardown.
+        state = request.app.get("state")
+        doomed_loop_id = _exec_loop_id(name)
+        doomed_slot = state.get_slot(_slot_key(name)) if state is not None else None
+        # Stop any execution loop; leave the .md files on disk (they are the user's
+        # project files under .kiro/specs) — only drop app bookkeeping + the slot.
+        try:
+            await _remove_nudge_loop(name, only_loop_id=doomed_loop_id)
+        except Exception:
+            # Fail the delete rather than report success: the entry is still in the
+            # index, so a retry is meaningful, and the persisted loop cannot rearm
+            # against a same-name spec re-imported later. Release the reservation and
+            # the tombstone too -- both were taken above, and leaving either behind
+            # would hide a spec the user still has from their own list.
+            logger.warning("spec %s: loop removal failed — delete aborted", name, exc_info=True)
+            await _unmark_deleting(name, expect_spec_dir=doomed_dir)
+            await asyncio.to_thread(_forget_deleted, doomed_dir)
+            _audit("spec_delete_aborted", name, outcome="denied")
+            return web.json_response(
+                {"code": "loop_removal_failed", "error": "could not stop this spec's background loop; nothing was deleted"},
+                status=503,
+            )
+        # NOW tear the worker slot down: removing only the nudge loop left the
+        # in-flight turn ALIVE, so the agent kept running and editing the user's files
+        # after they deleted the spec, and re-creating the same name resurrected the old
+        # transcript (get_or_create_slot keys off the slot name). Mirrors the gateway's own
+        # slot-delete order internally: pop from the registry, cancel and await the task,
+        # then persist as closed.
+        #
+        # require_archive: the conversation is the user's data. A failed history write used
+        # to be logged at DEBUG while the delete returned 200 -- the transcript silently
+        # gone. Now the reservation is released instead, so the spec is still listed with
+        # its session intact and the retry is meaningful.
+        if not await _teardown_worker_slot(
+            state, name, only_slot=doomed_slot, require_archive=True
+        ):
+            released = await _unmark_deleting(name, expect_spec_dir=doomed_dir)
+            # The spec lives again, so the tombstone must go: leaving it would suppress
+            # the documents from discovery for a spec that was never deleted.
+            await asyncio.to_thread(_forget_deleted, doomed_dir)
+            detail = (
+                "nothing was deleted"
+                if released
+                else "nothing was deleted; the spec may need a reload to reappear"
+            )
+            return web.json_response(
+                {
+                    "code": "archive_failed",
+                    "error": f"could not archive this spec's conversation; {detail}",
+                },
+                status=503,
+            )
 
-    def _pop_if_same(idx: dict) -> bool:
-        # Identity-pinned: a same-name spec cannot exist here (the name was reserved),
-        # but the entry is still re-read under the lock, so pin it anyway rather than
-        # trusting the snapshot this handler loaded before the awaits.
-        meta = idx.get(name)
-        if meta is None or str(meta.get("spec_dir", "")) != doomed_dir:
-            return False
-        actual_key = str(meta.get("slot_key", ""))
-        if doomed_slot_key and actual_key and actual_key != doomed_slot_key:
-            return False
-        del idx[name]
-        return True
+        def _pop_if_same(idx: dict) -> bool:
+            # Identity-pinned: a same-name spec cannot exist here (the name was reserved),
+            # but the entry is still re-read under the lock, so pin it anyway rather than
+            # trusting the snapshot this handler loaded before the awaits.
+            meta = idx.get(name)
+            if meta is None or str(meta.get("spec_dir", "")) != doomed_dir:
+                return False
+            actual_key = str(meta.get("slot_key", ""))
+            if doomed_slot_key and actual_key and actual_key != doomed_slot_key:
+                return False
+            del idx[name]
+            return True
 
-    if not await _mutate_index(_pop_if_same):
-        # The conversation is ALREADY archived, so un-deleting would be the lie the
-        # ordering above exists to prevent. The reservation stays, which keeps the
-        # spec hidden and makes a retry idempotent: it re-runs a no-op teardown and
-        # removes the entry.
-        logger.warning("spec %s: archived but the index entry could not be removed", name)
-        return web.json_response(
-            {
-                "code": "index_write_failed",
-                "error": (
-                    "this spec's conversation was archived but its record could not be "
-                    "removed; retry the delete"
-                ),
-            },
-            status=503,
-        )
-    _audit("spec_delete", name)
-    return web.json_response({"ok": True})
+        # _mutate_index can RAISE (a full or unwritable data home) as well as return
+        # False, and both mean the same thing here: the entry is still in the index while
+        # its answers are already gone.
+        try:
+            popped = await _mutate_index(_pop_if_same)
+        except Exception:
+            logger.warning("spec %s: the index entry could not be removed", name, exc_info=True)
+            popped = False
+        if not popped:
+            # The conversation is ALREADY archived, so un-deleting would be the lie the
+            # ordering above exists to prevent. The reservation stays, which keeps the
+            # spec hidden and makes a retry idempotent: it re-runs a no-op teardown and
+            # removes the entry.
+            #
+            # The recorded answers are untouched, which is why there is nothing to put
+            # back: the ledger is only cleared once the entry is actually gone. The spec
+            # still exists, so its settled decisions stay settled.
+            logger.warning("spec %s: archived but the index entry could not be removed", name)
+            return web.json_response(
+                {
+                    "code": "index_write_failed",
+                    "error": (
+                        "this spec's conversation was archived but its record could not be "
+                        "removed; retry the delete"
+                    ),
+                },
+                status=503,
+            )
+        # The spec is gone from the index. NOW the ledger entry can go: until this point
+        # a failure had to leave the answers intact, because a spec that survives with
+        # its answers erased is a decision silently reopened. From here the spec cannot
+        # come back under this name and path except as the same spec, so a cleanup
+        # failure is housekeeping -- logged, not fatal, and not worth failing a delete
+        # that has already happened.
+        forgot, still_referenced = await _forget_decisions(doomed_dir)
+        if not forgot:
+            _audit("spec_decision_record_stale", name, outcome="denied")
+            logger.warning("spec %s: deleted, but its decision record could not be cleared", name)
+        if not still_referenced:
+            # Only when this was the LAST name on the directory. Dropping a lock another
+            # alias still serializes on would hand the next arrival a brand-new lock, and
+            # two turns could then run on the same documents -- which is the hole the
+            # directory-keyed lock exists to close.
+            _TURN_LOCKS.pop(doomed_key, None)
+        _audit("spec_delete", name)
+        return web.json_response({"ok": True})
 
 
 def register_routes(app: web.Application) -> None:
