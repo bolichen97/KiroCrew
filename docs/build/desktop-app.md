@@ -538,5 +538,5 @@ See [`website/electron/README.md`](../../website/electron/README.md) and
 
 ## See also
 
-- [install.md](../guides/install.md) — all three build/run methods and the Makefile targets
+- [install.md](../guides/install.md) — all three build/run methods and the build targets
 - [README](../README.md) — project overview and Quick Start

@@ -119,6 +119,27 @@ make build                                   # npm build + editable backend inst
 PYTHONPATH=src python -m kiro_crew gateway   # -> http://localhost:5476
 ```
 
+On Windows the same targets run through `make.ps1`, because `make` is not part
+of a Windows install and the Makefile's recipes are POSIX-shaped
+(`.venv/bin/pip`, `rm -rf`, `cp -R`, `bash ensure-*.sh`):
+
+```powershell
+.\make.ps1 build                             # same two steps, same artifacts
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m kiro_crew gateway
+```
+
+The venv interpreter is named explicitly rather than a bare `python`: the
+dependencies live only in `.venv`, and on Windows a bare `python` resolves to the
+system interpreter (or the Microsoft Store alias stub), which would fail at
+import. `.\.venv\Scripts\Activate.ps1` first is the other way, after which
+`python` and `kirocrew` both resolve inside the venv.
+
+The two drivers expose the same target set, and
+`test/test_build_target_parity.py` fails the build if one gains a target the
+other lacks. Differences are confined to what the platform forces: a Windows
+venv puts its executables in `.venv\Scripts\`, and the macOS-only
+`resign-macos-libs.sh` step has no Windows counterpart.
+
 `make build` runs two steps:
 
 1. **`frontend`**: `npm ci` (or `npm install`) + `npm run build` in `website/`,
@@ -131,6 +152,15 @@ Both targets bootstrap their toolchain first (`ensure-node.sh`,
 `ensure-python.sh`) and fall back to whatever is on `PATH` if that fails. The
 backend target refuses to build a venv from an interpreter older than 3.10
 rather than letting the install backtrack forever.
+
+`make.ps1` resolves the same toolchain but installs none of it: the bootstrap
+scripts' install paths are `curl … | sh`, so on Windows it searches (`py`
+launcher first, then `PATH`, skipping the Microsoft Store alias stub) and prints
+the `winget` command to run if nothing usable is found. It honors the same
+`<data-home>/python-bin` and `node-bin-dir` markers those scripts record. The
+`desktop` and `backend-bin` targets are the exception: they delegate to
+`packaging/build-desktop.sh`, which provisions its own `uv` and
+python-build-standalone interpreter on every platform.
 
 After the backend target runs, `bin/kirocrew` resolves its real install root,
 sets `KIROCREW_PROJECT_DIR`, and delegates to `.venv/bin/kirocrew`. That console
@@ -228,18 +258,32 @@ locates and launches the bundled backend.
 For always-on servers the gateway also ships as a public multi-arch image on
 GHCR. See [docker.md](docker.md).
 
-## Makefile targets
+## Build targets
+
+Every target has the same name on both drivers: `make <target>` on macOS and
+Linux, `.\make.ps1 <target>` on Windows.
 
 | Target | What it does |
 |--------|--------------|
 | `make build` | Frontend (npm/Vite) + backend into `.venv` |
+| `make frontend` | Dashboard only: npm build, staged into `src/kiro_crew/static/dist` |
+| `make backend` | Backend only: `.venv` + editable install with the `dev` extra |
 | `make wheel` | Self-contained pip wheel with the dashboard bundled, into `dist/` |
 | `make backend-bin` | Frozen standalone backend binary (host arch only) |
-| `make desktop` | Full desktop app: DMG on macOS, AppImage on Linux |
+| `make desktop` | Full desktop app: DMG on macOS, AppImage on Linux, NSIS installer on Windows |
 | `make test` | Build, then run the `pytest` suite |
 | `make clean` | Remove build artifacts, dists, and caches |
 
-Override the Python interpreter with `make PY=python3.12 build`.
+Override the Python interpreter with `make PY=python3.12 build`, or
+`.\make.ps1 build -Py C:\path\to\python.exe`.
+
+Both desktop targets run `packaging/build-desktop.sh` on every platform,
+including Windows, where `make.ps1` invokes it through the Git for Windows bash:
+the script already normalizes MSYS `uname` output and has a Windows PBS branch,
+and CI's Windows lane calls it the same way. The plain `build` path needs no
+bash. Note that a locally built Windows installer is **unsigned** — only CI's
+signing lane has the signing identity — so SmartScreen shows an "unrecognized
+app" interstitial.
 
 ## First run
 

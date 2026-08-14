@@ -66,7 +66,34 @@ From a clone, in PowerShell:
 ```powershell
 git clone https://github.com/kirodotdev/KiroCrew.git
 cd kirocrew
+.\make.ps1 build
+```
 
+If that reports "running scripts is disabled on this system", Windows' default
+execution policy (`Restricted`) is blocking it. Either allow your own scripts
+once, or bypass the policy for a single run without changing any setting:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # persistent, no admin needed
+powershell -ExecutionPolicy Bypass -File .\make.ps1 build   # or: one run only
+```
+
+`make.ps1` is the Windows counterpart of the Makefile — same target names, same
+artifacts (`build`, `frontend`, `backend`, `test`, `wheel`, `backend-bin`,
+`desktop`, `clean`). It exists as a separate driver because `make` is not part of
+a Windows install and the Makefile's recipes are POSIX-shaped throughout;
+`test/test_build_target_parity.py` fails the build if the two target sets
+diverge. Unlike `ensure-python.sh` / `ensure-node.sh`, `make.ps1` itself installs
+no toolchain (their install paths are `curl … | sh`): it searches — the `py`
+launcher first, then `PATH`, skipping the Microsoft Store alias stub — and prints
+the `winget` command if nothing usable is found. The two desktop targets are the
+exception, because they hand off to `packaging/build-desktop.sh`, which does
+provision what it needs: a pinned `uv` and a python-build-standalone interpreter
+to embed in the app.
+
+The equivalent by hand, if you would rather not use the driver:
+
+```powershell
 # Build the frontend first (optional but recommended) so the dashboard is bundled:
 #   cd website; npm install; npm run build; cd ..
 #   Copy-Item -Recurse website\dist src\kiro_crew\static\dist
@@ -279,5 +306,7 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 ## Related
 
 - [README](../../README.md) — quick-start Platforms note
+- [install](install.md) — the build-target table shared with macOS and Linux
 - [AGENTS.md](../../AGENTS.md) — the cross-platform shim table
 - `src/kiro_crew/platform_compat.py` — the cross-platform shim
+- `make.ps1` — the Windows build driver

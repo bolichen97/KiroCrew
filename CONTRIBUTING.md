@@ -35,8 +35,9 @@ tell you in a paragraph.
 
 ## Prerequisites
 
-- macOS or Linux (Windows is not supported by the `kiro-cli` backend)
-- Python ≥ 3.9
+- macOS, Linux, or Windows — Windows builds and runs natively from source, with
+  the documented feature limits in the [Windows guide](docs/guides/windows-install.md)
+- Python ≥ 3.10
 - Node.js ≥ 22 (24 LTS recommended) and npm (for the frontend)
 - The `kiro-cli` agent on your `PATH`, logged in (`kiro-cli login`) — it is the
   only LLM backend (`agent.provider = acp`)
@@ -67,6 +68,11 @@ kirocrew gateway             # start server (dashboard + messaging channels)
 ```
 
 The dashboard is at `http://localhost:5476`.
+
+On Windows, `.\make.ps1 build` does steps 2 and 3 in one command (the venv lands
+in `.venv\Scripts\`, and `Activate.ps1` replaces `source .venv/bin/activate`).
+Read the [Windows guide](docs/guides/windows-install.md) first — a few features
+need an explicit opt-in there.
 
 **Messaging channels are optional**: the default `kirocrew setup` configures
 none, and the dashboard + CLI work without any channel credentials. Connect
