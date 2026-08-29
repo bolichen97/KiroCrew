@@ -893,8 +893,13 @@ class TestSandboxCleanupPathIsDropped:
         close(). finish() may leave the process draining, so the unlink belongs
         to close() alone — a refactor moving it into finish() fails here."""
         sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
-        proc = AsyncMock()
+        # Process methods are mixed sync/async.  Making the whole process an
+        # AsyncMock turns stdin.is_closing() into an unawaited coroutine even
+        # though the real subprocess API is synchronous at that seam.
+        proc = Mock()
         proc.stdout.readline = AsyncMock(side_effect=[b'{"type": "ready"}\n', b""])
+        proc.stdin.is_closing.return_value = False
+        proc.wait = AsyncMock()
         proc.kill = Mock()
         proc.returncode = None
         session = apple_speech.StreamingSession()
@@ -906,6 +911,7 @@ class TestSandboxCleanupPathIsDropped:
         ):
             assert await session.start() == ""
             await session.finish()
+            proc.stdin.close.assert_called_once_with()
             assert created and all(f.exists() for f in created), "finish() must not unlink"
             await session.close()
             assert not any(f.exists() for f in created)
