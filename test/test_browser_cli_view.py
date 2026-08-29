@@ -96,8 +96,19 @@ class _RedirectHandler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def redirecting_server() -> Iterator[int]:
-    """A loopback HTTP server whose root answers 302."""
-    srv = http.server.HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    """A concurrent loopback HTTP server whose root answers 302.
+
+    Relay tests hold more than one connection open at a time.  A serial
+    ``HTTPServer`` leaves one upstream leg queued behind another, so closing
+    that queued connection cannot finish both relay pumps until the unrelated
+    active connection also closes.  Which relay worker reaches the server
+    first is scheduler-dependent.  Match the real dashboard's concurrent
+    connection handling so each test connection owns an independent handler.
+    """
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    # Make server_close() join every request thread after the clients are torn
+    # down; no daemon handler may leak into the next test.
+    srv.daemon_threads = False
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     try:
