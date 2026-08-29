@@ -4833,15 +4833,19 @@ class TestSeedDispatch:
         """When --seed is provided, seed_cmd should be called before gateway."""
         monkeypatch.setattr(sys, "argv", ["kirocrew", "gateway", "--seed", "demo"])
         mock_seed = MagicMock(return_value=0)
+        gateway_call = object()
+        mock_gateway = MagicMock(return_value=gateway_call)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli_server._gateway"),
-            patch("kiro_crew.cli.asyncio.run"),
+            patch("kiro_crew.cli_server._gateway", mock_gateway),
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
         ):
             from kiro_crew.cli import main
 
             main()
         mock_seed.assert_called_once()
+        mock_gateway.assert_called_once()
+        mock_run.assert_called_once_with(gateway_call)
 
     def test_seed_nonzero_exits(self, monkeypatch):
         """When seed_cmd returns non-zero, CLI should sys.exit with that code."""
@@ -4858,15 +4862,19 @@ class TestSeedDispatch:
         """When --seed is not provided, seed_cmd should not be called."""
         monkeypatch.setattr(sys, "argv", ["kirocrew", "gateway"])
         mock_seed = MagicMock()
+        gateway_call = object()
+        mock_gateway = MagicMock(return_value=gateway_call)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli_server._gateway"),
-            patch("asyncio.run"),
+            patch("kiro_crew.cli_server._gateway", mock_gateway),
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
         ):
             from kiro_crew.cli import main
 
             main()
         mock_seed.assert_not_called()
+        mock_gateway.assert_called_once()
+        mock_run.assert_called_once_with(gateway_call)
 
     def test_seed_with_replace_flag(self, monkeypatch):
         """--seed with --seed-replace should call seed_cmd."""
@@ -4876,15 +4884,19 @@ class TestSeedDispatch:
             ["kirocrew", "gateway", "--seed", "demo", "--seed-replace"],
         )
         mock_seed = MagicMock(return_value=0)
+        gateway_call = object()
+        mock_gateway = MagicMock(return_value=gateway_call)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli_server._gateway"),
-            patch("asyncio.run"),
+            patch("kiro_crew.cli_server._gateway", mock_gateway),
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
         ):
             from kiro_crew.cli import main
 
             main()
         mock_seed.assert_called_once()
+        mock_gateway.assert_called_once()
+        mock_run.assert_called_once_with(gateway_call)
 
 
 class TestDoctorEmbeddings:
