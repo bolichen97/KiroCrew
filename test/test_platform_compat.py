@@ -779,12 +779,11 @@ class TestResourceShims:
         if not pc.IS_WINDOWS:
             assert result is None
             return
-        # On Windows self (no children spawned by this test) reads a positive
-        # tree total that is at least the single-process RSS.
+        # This is a real-boundary smoke test only. Comparing it with a second RSS
+        # sample is scheduler-dependent: Windows may trim this process's working
+        # set between the tree and single-process reads. Fixed-value tests in
+        # TestProcRssTree pin the root-plus-descendants sum deterministically.
         assert result is not None and result > 0
-        single = pc.proc_rss_bytes_for_pid(os.getpid())
-        assert single is not None
-        assert result >= single / (1024 * 1024) - 1  # -1: sampled microseconds apart
 
     def test_proc_rss_tree_mb_for_pid_rejects_reserved_pid(self):
         # A reserved/non-int pid must not anchor a tree walk (recycled-root risk).

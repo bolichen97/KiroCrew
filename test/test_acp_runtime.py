@@ -1447,16 +1447,20 @@ def test_get_rss_mb_real_process():
 
 
 def test_get_rss_tree_mb_real_process():
-    """_get_rss_tree_mb sums at least this process's RSS (>0); nonexistent
-    PID returns None. Skips where RSS introspection is unavailable (see
-    test_get_rss_mb_real_process)."""
-    from kiro_crew.acp.runtime import _get_rss_mb, _get_rss_tree_mb
+    """The real tree probe returns a positive sample for this process and None
+    for a nonexistent PID.
 
-    self_rss = _get_rss_mb(os.getpid())
-    if self_rss is None:
-        pytest.skip("RSS introspection unavailable in this environment")
+    Do not compare this sample with a separate single-process RSS read: resident
+    sets are live values and Windows may trim the working set between the two
+    calls.  The deterministic root-plus-descendants arithmetic is covered with
+    fixed values in ``test_platform_compat_coverage.py``.
+    """
+    from kiro_crew.acp.runtime import _get_rss_tree_mb
+
     tree = _get_rss_tree_mb(os.getpid())
-    assert tree is not None and tree >= self_rss  # tree includes self (+ children)
+    if tree is None:
+        pytest.skip("RSS introspection unavailable in this environment")
+    assert tree > 0.0
     assert _get_rss_tree_mb(2**31 - 1) is None
 
 
