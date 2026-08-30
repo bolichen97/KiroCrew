@@ -13,7 +13,6 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { useMenuKeyboard, menuItemsOf } from '../hooks/useMenuKeyboard'
 import { AnimatePresence } from 'framer-motion'
 import DetailPanel from '../components/DetailPanel'
-import Modal from '../components/Modal'
 
 import { i18nT } from '../i18n/t'
 import { useListDetailView } from '../hooks/useListDetailView'
