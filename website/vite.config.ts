@@ -617,7 +617,14 @@ export default defineConfig({
     // 3 is both the fastest and cheaper in memory than 4; peak single-fork RSS
     // was ~1.0-1.4 GB against the 3072 MB per-fork heap ceiling below.
     maxWorkers: 3,
-    execArgv: ['--max-old-space-size=3072'],
+    // Node 25 enables its process-global experimental Web Storage in forks but
+    // gives those workers no persistence path, emitting one
+    // "--localstorage-file ... without a valid path" warning per test file.
+    // happy-dom supplies the window-scoped Storage this suite actually tests,
+    // and setup.ts replaces it with a deterministic in-memory implementation,
+    // so disable the unrelated Node global instead of sharing a disk file
+    // across concurrent workers.
+    execArgv: ['--max-old-space-size=3072', '--no-experimental-webstorage'],
     // Default 5s is too tight for tests that ``await import(...)`` inside the
     // body: under a full concurrent forks run the collect phase can starve the
     // dynamic import past 5s and it times out. 15s gives headroom for
