@@ -780,7 +780,6 @@ test/test_host_isolation_floor.py
 test/test_host_service_guard.py
 test/test_image_artifacts.py
 test/test_inbound_unbind_notice.py
-test/test_inline_tool_cards_props.py
 test/test_install_receipt.py
 test/test_installer_distro.py
 test/test_installer_node_floor.py
