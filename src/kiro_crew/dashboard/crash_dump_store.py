@@ -656,6 +656,36 @@ def dump_first_stack_lines(dump_path: Path, max_lines: int = 5) -> list[str]:
     return (preamble + wedged)[:max_lines]
 
 
+def dump_owner_pid(dump_path: Path) -> int | None:
+    """The PID of the gateway that wrote *dump_path*, from its header, or None.
+
+    Public face of the header parse for the stall attribution, which joins a
+    dump to the cron in-flight markers by PID. Domain and start-id checks are
+    the sweep's concern; a reader correlating two files written by the same
+    process on the same host only needs the number.
+    """
+    owner = _dump_owner(dump_path)
+    return owner[0] if owner is not None else None
+
+
+def dump_wedged_frames(dump_path: Path) -> list[str]:
+    """Every frame line of the WEDGED thread's stack (see ``_wedged_thread_block``).
+
+    Unlike :func:`dump_first_stack_lines` this returns the whole block and no
+    preamble: the stall attribution walks all of it looking for the frame that
+    names the surface (a cron run, a dashboard turn, a channel dispatcher), and
+    that frame sits far below the top-of-stack gate frames.
+    """
+    try:
+        lines = dump_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    stack_lines = [ln for ln in lines[_HEADER_LINES:] if ln.strip()]
+    _preamble, blocks = _split_stack_content(stack_lines)
+    wedged = _wedged_thread_block(blocks)
+    return list(wedged) if wedged is not None else []
+
+
 def dump_replay_lines(
     dump_path: Path, *, max_lines: int = 120, max_bytes: int = 8192
 ) -> tuple[list[str], bool]:
