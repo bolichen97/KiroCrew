@@ -217,6 +217,12 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # OS-masking closes the sideways path without touching a live consumer.
     "ledger",
     "cron-history",
+    # The cron in-flight markers, masked rather than sealed read-only because
+    # nothing in the sandbox reads one: they are written and cleared by the run
+    # task in the GATEWAY process, and the boot-time loop-stall breaker that acts
+    # on them runs in ``CronService.start()``, which only the gateway calls. The
+    # in-sandbox ``mcp_cron`` service is a store accessor and never starts.
+    "cron-running",
     "workflow_library",
     "agentcore-inbound",
     "routing",

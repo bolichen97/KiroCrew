@@ -47,7 +47,14 @@ except ImportError:
     get_description = None  # type: ignore[assignment]
 from croniter import croniter  # type: ignore[import-untyped]
 
-from kiro_crew import cron_script, platform_compat, sel, shutdown_event
+from kiro_crew import (
+    cron_inflight,
+    cron_script,
+    platform_compat,
+    sel,
+    shutdown_event,
+    stall_attribution,
+)
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_dir,
@@ -1106,6 +1113,27 @@ def unhealthy_jobs_from_disk() -> tuple[list[tuple[str, str]], list[tuple[str, s
     return (auto_paused, errored, loadable)
 
 
+def job_pause_state_from_disk(job_id: str) -> str | None:
+    """``"paused by the user"`` / ``"auto-paused"`` / ``"enabled"`` for *job_id*,
+    or None when the store has no such job.
+
+    A sibling of :func:`unhealthy_jobs_from_disk` for the doctor's stall
+    attribution: once a dump is attributed to a job, the next question is
+    whether that job is still scheduled to run again, answered from the store
+    directly so it holds when the gateway is down.
+    """
+    records, _loadable = _read_job_records(config_dir() / _CRONS_FILE)
+    for j in records:
+        if str(j.get("id") or "") != job_id:
+            continue
+        if _record_user_paused(j):
+            return "paused by the user"
+        if j.get("auto_paused", False):
+            return "auto-paused"
+        return "enabled"
+    return None
+
+
 def enabled_count_from_disk(path: Path) -> tuple[int, bool]:
     """Return ``(enabled count, loadable)`` for the store at *path*.
 
@@ -1281,6 +1309,9 @@ class CronService:
         self._cancelled_jobs: set[str] = set()  # job IDs cancelled by the user
         self._job_jitter: dict[str, float] = {}  # job ID → jitter seconds applied
         self._job_run_meta: dict[str, tuple[float, str]] = {}  # job_id → (start_time, trigger)
+        # Where the loop-stall breaker looks for crash dumps. None = the data
+        # home's dump directory; tests point it at a temp dir.
+        self._dumps_dir: Path | None = None
         # Job IDs whose one-shot (delete_after_run / Done) removal was DEFERRED
         # because remove_job_async hit a contended store (CronStoreBusy). The
         # timer tick drains these under the store lock in a worker thread (see
@@ -1402,6 +1433,11 @@ class CronService:
         await asyncio.to_thread(self._load)
         self._running = True
         await self._history.rotate_all()
+        # BEFORE the timer is armed: a job the previous gateway died running
+        # has no last_run_ts for that run, so it is due again the moment the
+        # timer fires. The breaker must have paused it by then or the boot
+        # re-runs the crash.
+        await asyncio.to_thread(self._apply_loop_stall_breaker)
         self._arm_timer()
         logger.info("Cron service started with %d jobs", len(self._jobs))
 
@@ -3428,6 +3464,7 @@ class CronService:
         # one that produced nothing.)
         job.result_produced = False
         being_cancelled = False
+        marker_write: "asyncio.Future[None] | None" = None
         try:
             # The jitter sleep MUST live inside this try: hourly/daily jobs
             # sleep up to 59 min here, and a user cancel() during that window
@@ -3440,6 +3477,23 @@ class CronService:
                 logger.debug("Cron: applying %.0fs jitter to job '%s'", jitter, job.name)
                 await asyncio.sleep(jitter)
             exec_started_at = time.time()
+            # The record a hard exit leaves behind. Every other trace of this
+            # run (last_run_ts, the history row, status) is written in the
+            # finally below, which an os._exit from the loop-stall watchdog
+            # never reaches -- so without this file the store would show the
+            # job as never fired, it would be due again on the next boot, and
+            # nothing could say which job the dying gateway was running. Off
+            # the loop like every other write on this path; best-effort. The
+            # write is kept as a task so the finally below can wait for it: a
+            # cancellation that lands mid-write must not let clear_marker run
+            # before the worker publishes, or the marker it leaves behind would
+            # read as an abandoned run on the next boot.
+            marker_write = asyncio.ensure_future(
+                asyncio.to_thread(
+                    cron_inflight.write_marker, self._dir, job.id, job.name, exec_started_at
+                )
+            )
+            await asyncio.shield(marker_write)
             # Notify dashboard that the job has started executing so the live
             # is_running badge appears without a manual reload.
             try:
@@ -3455,6 +3509,20 @@ class CronService:
             raise
         finally:
             finished_at = time.time()
+            # The run ended by a path that runs finally, so it is no longer in
+            # flight whatever its outcome. A marker that survives this is what a
+            # hard exit looks like, so clear it first and unconditionally --
+            # after the write that may still be publishing it, or a
+            # cancellation mid-write would unlink nothing and leave the marker.
+            try:
+                if marker_write is not None and not marker_write.done():
+                    await asyncio.shield(marker_write)
+            except (asyncio.CancelledError, Exception):
+                pass  # the write is best-effort; the clear below still runs
+            try:
+                await asyncio.to_thread(cron_inflight.clear_marker, self._dir, job.id)
+            except Exception:
+                logger.debug("in-flight marker not cleared for %s", job.id, exc_info=True)
             self._job_start_times.pop(job.id, None)
             self._job_jitter.pop(job.id, None)
             self._job_run_meta.pop(job.id, None)
@@ -3882,6 +3950,156 @@ class CronService:
                 self._save()
             except CronStoreUnreadable as exc:
                 logger.warning("Cron terminal state not persisted: %s", exc)
+
+    # ── Loop-stall breaker ──
+
+    def _apply_loop_stall_breaker(self) -> str | None:
+        """Pause the job the previous gateway died running. WORKER-THREAD ONLY.
+
+        The loop-stall watchdog hard-exits the gateway; the run in flight left an
+        in-flight marker (:mod:`kiro_crew.cron_inflight`) and the dump names the
+        PID. When the newest dump's wedged stack is a cron turn AND exactly one
+        abandoned marker carries that PID, that job is the one whose input
+        stalled the loop -- and left enabled it is due again as soon as the
+        timer arms, which is the hourly crash loop a user reported. It is parked
+        ``auto_paused`` with a ``last_error`` that says why and how to resume,
+        audited like the failure-count auto-pause. Ambiguous evidence (several
+        runs in flight, no marker, a non-cron surface) pauses nothing; the doctor
+        prints the same attribution so the operator can decide.
+
+        What the markers said is recorded (``cron_inflight.record_attribution``)
+        BEFORE they are swept, because the doctor and the restart notification
+        read the same evidence afterwards: an ambiguous verdict the breaker
+        declined to act on must still reach the operator who can act on it.
+
+        A dump is CLAIMED, and its markers swept, only once the breaker has
+        reached a verdict that survives a restart. A pause the store refused to
+        persist leaves the job enabled and still due, so claiming it would let the
+        next boot -- the one whose store is readable again -- skip the job and
+        re-run the crash the breaker exists to stop. That boot is the only one
+        that retries, so it keeps both the claim and the evidence intact.
+        Returns the paused job id, or None.
+
+        Every failure here is swallowed. This is a safety net that runs BEFORE
+        the timer arms, so a fault in it must cost at most the net: letting one
+        propagate would fail ``start()`` and leave the operator with no scheduler
+        at all, which is strictly worse than the crash loop it is trying to stop.
+        """
+        try:
+            return self._loop_stall_breaker_verdict()
+        except Exception:
+            logger.warning("loop-stall breaker skipped after an unexpected failure", exc_info=True)
+            return None
+
+    def _loop_stall_breaker_verdict(self) -> str | None:
+        """The breaker's body. See :meth:`_apply_loop_stall_breaker`, which owns
+        the promise that nothing in here can fail the cron service's start."""
+        try:
+            attribution = stall_attribution.attribute_latest_stall(self._dir, self._dumps_dir)
+        except Exception:
+            logger.debug("loop-stall attribution failed; breaker skipped", exc_info=True)
+            return None
+        if attribution is None:
+            cron_inflight.sweep_abandoned_markers(self._dir)
+            return None
+        if cron_inflight.read_claim(self._dir) == attribution.dump.name:
+            # Settled on an earlier boot: its evidence has been recorded, and
+            # re-pausing a job the operator resumed is what the claim prevents.
+            cron_inflight.sweep_abandoned_markers(self._dir)
+            return None
+        recorded = True
+        if attribution.candidates or attribution.unrelated_abandoned:
+            recorded = cron_inflight.record_attribution(
+                self._dir,
+                attribution.dump.name,
+                attribution.candidates,
+                attribution.unrelated_abandoned,
+            )
+        paused: str | None = None
+        if attribution.is_cron and attribution.job is not None:
+            settled, paused = self._pause_for_loop_stall(attribution)
+            if not settled:
+                return None
+        # Sweep only behind a written claim AND a readable record. With the claim
+        # missing, the next boot would re-derive this verdict from the retained
+        # markers (and the record), and the pause it reaches is idempotent: the
+        # job's own ``last_error`` names the dump, which settles it even after
+        # the operator has resumed the job. With the record missing, the
+        # markers are the only copy of what the doctor has to show.
+        if recorded and cron_inflight.write_claim(self._dir, attribution.dump.name):
+            cron_inflight.sweep_abandoned_markers(self._dir)
+        return paused
+
+    def _pause_for_loop_stall(
+        self, attribution: "stall_attribution.StallAttribution"
+    ) -> tuple[bool, str | None]:
+        """``(settled, paused job id)`` for the job *attribution* names.
+
+        *settled* is False ONLY when the verdict could not be recorded -- an
+        unreadable or unwritable store -- which is the one case a later boot must
+        retry. A job that is already paused, or gone from the store, is settled
+        with nothing paused: there is no action left for any boot to take.
+        """
+        marker = attribution.job
+        if marker is None:  # pragma: no cover - the caller checks
+            return (True, None)
+        with self._file_lock():
+            self._sync()
+            if self._load_failed:
+                logger.warning("loop-stall auto-pause deferred: cron store not readable")
+                return (False, None)
+            job = next((j for j in self._jobs if j.id == marker.job_id), None)
+            if job is None or job.auto_paused or job.user_paused:
+                return (True, None)
+            if job.last_error and attribution.dump.name in job.last_error:
+                # Paused for THIS dump on an earlier boot and since resumed by
+                # the operator (resume keeps ``last_error``): the verdict was
+                # recorded in the store itself, so a lost claim file cannot
+                # turn a resume into a second pause.
+                return (True, None)
+            before = (
+                job.enabled,
+                job.auto_paused,
+                job.last_status,
+                job.last_run_ts,
+                job.last_error,
+            )
+            job.enabled = False
+            job.auto_paused = True
+            job.last_status = "error"
+            job.last_run_ts = marker.started_at
+            job.last_error = (
+                "Paused: the gateway was terminated by the loop-stall watchdog while this "
+                f"job was running (crash dump {attribution.dump.name}). Inspect the command "
+                "the run was about to execute, then resume with "
+                f"`kirocrew cron resume {job.id}`."
+            )
+            try:
+                self._save()
+            except CronStoreUnreadable as exc:
+                # The in-memory job must match the store it could not reach:
+                # still enabled, still due, so this session schedules it as the
+                # disk says and the next boot retries the pause.
+                (
+                    job.enabled,
+                    job.auto_paused,
+                    job.last_status,
+                    job.last_run_ts,
+                    job.last_error,
+                ) = before
+                logger.warning("loop-stall auto-pause not persisted: %s", exc)
+                return (False, None)
+            job._audit_pause_change("auto_paused_loop_stall")
+        logger.error(
+            "Cron job '%s' (%s) auto-paused: the previous gateway was hard-exited by the "
+            "loop-stall watchdog while running it (%s). Resume with `kirocrew cron resume %s` "
+            "once the cause is fixed.",
+            job.name,
+            job.id,
+            attribution.dump.name,
+            job.id,
+        )
+        return (True, job.id)
 
     # ── Persistence ──
 

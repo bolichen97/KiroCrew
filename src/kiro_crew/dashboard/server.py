@@ -180,6 +180,7 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader, set_pending_consumed_hook, set_pending_staged_hook
+from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.tunnel.setup import setup_tunnel
 
 if TYPE_CHECKING:
@@ -3815,6 +3816,16 @@ async def start_dashboard(
             # per dump — the dump is re-detected for up to 7 days on every
             # start, so notifying unconditionally would alert every restart.
             if await asyncio.to_thread(claim_dump_notification, _prior_dump):
+                # Say who the loop was working for, from the same evidence the
+                # doctor reads, so the person restarting knows which job to look
+                # at without opening the dump.
+                try:
+                    _attr_lines = describe(
+                        await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
+                    )
+                except Exception:
+                    logger.debug("stall attribution for notification failed", exc_info=True)
+                    _attr_lines = []
                 try:
                     state.notify(
                         "heartbeat",
@@ -3822,8 +3833,9 @@ async def start_dashboard(
                         (
                             f"The previous gateway stopped responding and exited "
                             f"{_age_h:.1f}h ago, then restarted. Work in flight at "
-                            f"that moment was interrupted and not saved. Thread "
-                            f"stacks: {_prior_dump}"
+                            f"that moment was interrupted and not saved. "
+                            + ("".join(f"{ln}. " for ln in _attr_lines))
+                            + f"Thread stacks: {_prior_dump}"
                         ),
                         meta={"url": "/settings", "dump": str(_prior_dump)},
                     )

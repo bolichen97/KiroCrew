@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from conftest import requires_symlinks
+from kiro_crew import mcp_cron
 from kiro_crew.mcp_cron import (
     _call_tool_inner,
     _glob_could_reach_credentials,
@@ -1211,6 +1212,56 @@ def test_vet_script_file_reads_and_blocks(tmp_path):
 def test_vet_script_file_missing_file_errors(tmp_path):
     err = _vet_script_file(str(tmp_path / "nope.py"))
     assert err is not None and err.startswith("Error:")
+
+
+class TestOversizedScriptIsRefusedNotTruncated:
+    """Reading exactly the cap is a fence BYPASS, not a bound: the vetter sees a body
+    at the limit, scans it clean, and the sandbox then executes the whole file. So the
+    read goes one character past the cap and an oversized script is refused."""
+
+    #: One statement, one pipeline stage, ~607 chars -- long lines keep the body well
+    #: under ``_ALT_MAX_STAGES`` and ``_SOURCE_COMMAND_SUBJECT_CAP``, so a verdict here
+    #: is about the read boundary and not about some other budget.
+    _LINE = 'v = "' + "a" * 600 + '"\n'
+
+    def _body_over_the_cap(self) -> str:
+        return self._LINE * ((mcp_cron._MAX_SCRIPT_SCAN_BYTES // len(self._LINE)) + 2)
+
+    def test_the_read_probes_one_past_the_cap(self):
+        assert mcp_cron._SCRIPT_READ_PROBE_BYTES == mcp_cron._MAX_SCRIPT_SCAN_BYTES + 1
+
+    def test_a_credential_read_past_the_cap_is_not_allowed(self, tmp_path):
+        """The regression: with the read capped AT the limit this returned None and the
+        script ran in full."""
+        prefix = self._body_over_the_cap()
+        f = tmp_path / "evil.py"
+        f.write_text(prefix + 'open("/home/user/.aws/credentials").read()\n', encoding="utf-8")
+        assert len(prefix) > mcp_cron._MAX_SCRIPT_SCAN_BYTES, "payload must sit past the cap"
+
+        err = _vet_script_file(str(f))
+        assert err is not None, "a script whose tail was never scanned must not be allowed"
+        assert "too large to security-scan" in err
+
+    def test_a_script_at_the_cap_is_still_scanned_in_full(self, tmp_path):
+        """No false refusal at the boundary: the probe byte only fires ABOVE the cap."""
+        f = tmp_path / "big_ok.py"
+        body = (self._LINE * (mcp_cron._MAX_SCRIPT_SCAN_BYTES // len(self._LINE)))[
+            : mcp_cron._MAX_SCRIPT_SCAN_BYTES
+        ]
+        f.write_text(body, encoding="utf-8")
+        assert len(body) <= mcp_cron._MAX_SCRIPT_SCAN_BYTES
+        assert _vet_script_file(str(f)) is None
+
+    def test_a_credential_read_inside_the_cap_is_still_blocked(self, tmp_path):
+        """The refusal above is not doing the work a real scan should: a payload the
+        reader DOES reach is still denied on its merits, not on its size."""
+        f = tmp_path / "evil_small.py"
+        f.write_text(
+            self._LINE * 10 + 'open("/home/user/.aws/credentials").read()\n', encoding="utf-8"
+        )
+        err = _vet_script_file(str(f))
+        assert err is not None
+        assert "too large to security-scan" not in err
 
 
 class TestCronAddScriptGuard:

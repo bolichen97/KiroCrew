@@ -30,6 +30,7 @@ from collections.abc import Callable
 import pytest
 
 from kiro_crew.security import (
+    MAX_SCANNABLE_COMMAND_CHARS,
     is_sensitive_bash_command,
     is_sensitive_path,
     redact_credentials,
@@ -318,7 +319,8 @@ def test_long_nonshell_line_does_not_blow_up() -> None:
     diff could not touch the measured code: an absolute ceiling mis-attributes
     runner slowness as a complexity regression (#8374).
 
-    A naive two-size ratio (t_20k / t_10k) does NOT work here, by measurement:
+    A naive two-size ratio (the 20 KB timing over the 10 KB one) does NOT work
+    here, by measurement:
     the anchor's per-separator work inside the large alternation makes even the
     fixed form scale ~4x per input doubling on this blob shape, the same
     doubling signature as the quadratic form -- only the CONSTANT separates them
@@ -346,12 +348,18 @@ def test_long_nonshell_line_does_not_blow_up() -> None:
     ceilings this test used to have. It detects, not prevents: it runs after the
     measured call returns, so a truly unbounded hang is bounded by the CI job
     timeout, not by this assert.
+
+    The blob is sized just UNDER ``MAX_SCANNABLE_COMMAND_CHARS``, because the gate
+    now refuses a longer command without scanning it: above the ceiling both the
+    verdict assertion and the backstop below would measure the refusal rather than
+    the anchor, and the guard would pass no matter what the pattern costs. The
+    refusal itself is pinned in ``test_security_gate_liveness.py``.
     """
-    blob_20k = "abcdefgh " * 2500
-    assert len(blob_20k) > 20_000
+    blob_ceiling = "abcdefgh " * 2200
+    assert 19_000 < len(blob_ceiling) <= MAX_SCANNABLE_COMMAND_CHARS
     # Verdict unchanged: the blob is not a sensitive command. The first call
     # also pays the one-time regex build so it is not billed to a sample.
-    assert bool(is_sensitive_bash_command(blob_20k)) is False
+    assert bool(is_sensitive_bash_command(blob_ceiling)) is False
 
     # ── Same-run calibrated baseline ──
     from kiro_crew import security as security_mod
@@ -409,10 +417,11 @@ def test_long_nonshell_line_does_not_blow_up() -> None:
     # shape the ratio cannot see (see the docstring). Self-calibrating -- the
     # cap scales with the same-run reference timing so runner slowness raises
     # the cap along with the measurement; 60 s remains as the unloaded floor.
-    t_20k = _best_of(is_sensitive_bash_command, blob_20k, reps=2)
+    t_ceiling = _best_of(is_sensitive_bash_command, blob_ceiling, reps=2)
     cap = max(60.0, 20.0 * t_ref)
-    assert t_20k < cap, (
-        f"is_sensitive_bash_command took {t_20k:.2f}s on a 20 KB line "
+    assert t_ceiling < cap, (
+        f"is_sensitive_bash_command took {t_ceiling:.2f}s on a "
+        f"{len(blob_ceiling)}-char line "
         f"(self-calibrated cap {cap:.1f}s) -- this is the catastrophic-"
         "regression backstop, not the complexity guard; the calibrated ratio "
         "above is the guarded property"

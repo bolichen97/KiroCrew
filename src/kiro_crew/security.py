@@ -6625,6 +6625,18 @@ _CREW_SECRET_LEAVES: list[str] = [
     # treatment ``webhooks`` and ``profiles`` already get.
     "crons.json",
     "cron-history",
+    # The in-flight run markers (``cron_inflight``) belong on the same floor for
+    # a sharper reason than the two above: the boot-time loop-stall breaker
+    # TRUSTS them. One marker whose PID matches a cron-surface crash dump is
+    # what makes the breaker park that job, so a marker an agent could write is
+    # an unauthorized "pause this job" primitive that routes around both the MCP
+    # cron tools and the owner-only HTTP surface, and a marker it could DELETE
+    # disables the breaker for a crash loop that is about to recur. The evidence
+    # an automatic state change rests on has to be at least as protected as the
+    # state it changes, which is ``crons.json`` directly above. The service and
+    # the doctor open the directory directly rather than through this gate, so
+    # both keep working; nothing legitimate reads a marker through a file tool.
+    "cron-running",
     # Saved workflow definitions are executable capabilities whose presence is
     # authorized only by an explicit dashboard action. Same-UID owner-only file
     # modes do not stop an agent file tool from planting or rewriting a valid
@@ -7319,8 +7331,81 @@ _WRITE_CMDS = (
     r"|git\s+(?:checkout|restore|reset|apply|clean|rm|mv|stash))\s"
 )
 
-# Matches python/ruby/perl one-liners that open sensitive paths
-_SCRIPT_OPEN = r"(?:python|ruby|perl)\S*\s.*open\s*\("
+# Matches python/ruby/perl one-liners that open sensitive paths. Spelled as the
+# two ordered pieces the linear verb-anchored check walks (see
+# ``_verb_anchored_sensitive_hit``): the interpreter word, then ``open(``
+# somewhere later on the same line, then the sensitive path later still.
+_SCRIPT_OPEN_INTERP = r"(?:python|ruby|perl)\S*\s"
+_SCRIPT_OPEN_CALL = r"open\s*\("
+_SCRIPT_OPEN = rf"{_SCRIPT_OPEN_INTERP}.*{_SCRIPT_OPEN_CALL}"
+
+#: Longest command ``is_sensitive_bash_command`` will scan. Longer input is
+#: REFUSED, not skipped and not scanned: every matcher below is linear in the
+#: subject, so this bound is what turns "linear" into a hard wall-clock ceiling
+#: for a gate that runs synchronously on the event loop under a 25 s watchdog
+#: (``dashboard.loop_stall_exit_after_secs``). Measured after the linearization:
+#: ~10 ms at this size for the pattern pass, ~50 ms for the whole gate. The same
+#: number bounds each tool_input string in ``llm_helpers``; a legitimate
+#: command this long is a heredoc writing a file, and the tool-input tier
+#: already refuses it, so the tiers agree.
+MAX_SCANNABLE_COMMAND_CHARS = 20 * 1024
+
+#: The same ceiling for a subject that is a source BODY rather than a command line
+#: (:func:`is_sensitive_source_body`). It is a different number because the two
+#: subjects have different legitimate sizes, and a ceiling sized for one is a false
+#: refusal of the other: 20 KiB of shell on a single ``Bash`` call is a heredoc, while
+#: 20 KiB of cron script is an ordinary script -- and a size-keyed refusal there is
+#: permanent, re-fired on every tick until someone edits the file, which is the exact
+#: availability defect ``_source_command_subjects`` was introduced to remove.
+#:
+#: It is still a hard ceiling, because "not a command line" does not mean "unbounded":
+#: at this size the whole gate measures ~2 s on a benign body and ~5 s on a verb-dense
+#: one, which fits under the watchdog while a body an order of magnitude larger would
+#: not. It matches what ``mcp_cron`` will READ off disk (``_MAX_SCRIPT_SCAN_BYTES``
+#: aliases this), so the reader admits exactly what the gate will scan and neither can
+#: silently outgrow the other.
+MAX_SCANNABLE_SOURCE_BODY_CHARS = 256 * 1024
+
+
+def _oversize_refusal(length: int, limit: int) -> str:
+    """The pass-0 refusal, in ONE spelling.
+
+    Both entry points refuse above their own ceiling and both must say so the same
+    way, because an operator reading the reason is being told which number to compare
+    their input against.
+    """
+    return (
+        "Blocked: input is too large to security-scan "
+        f"({length} chars > {limit} limit); refused rather than left unscanned"
+    )
+
+
+def _sensitive_path_pattern() -> str:
+    """The home-anchored fenced-directory path, as a regex fragment.
+
+    Shared by the compiled alternation and by the linear verb-anchored check so
+    the two cannot drift on what "a sensitive path" spells.
+    """
+    home = re.escape(str(Path.home()))
+    tilde = re.escape("~")
+    home_var = re.escape("$HOME")
+    # Generic home roots so a literal "/home/<user>" or "/Users/<user>" token
+    # (not just the running user's resolved home) is anchored too.
+    generic_home = r"/home/[^/\s]+|/Users/[^/\s]+"
+    home_alts = f"(?:{home}|{tilde}|{home_var}|{generic_home})"
+    dirs_pattern = "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS)
+    # What may TERMINATE a sensitive path token. A path is very often the last thing
+    # before a shell metacharacter, and accepting only whitespace, a quote, ``/`` or
+    # end-of-string let punctuation defeat the gate outright: ``cd ~/.aws;`` and
+    # ``cd ~/.kiro/crew/models;`` were allowed, while the same commands written with
+    # ``&&`` were blocked -- for no better reason than that ``&&`` is preceded by a
+    # space and ``;`` is not. The asymmetry is the tell; nothing about a semicolon
+    # makes the path less named. So the class is every character a shell itself treats
+    # as the end of a word. Widening a DENY boundary can only ever deny more, which is
+    # the safe direction for this gate, and the rule it enforces is unchanged: naming a
+    # fenced path is the signal.
+    path_end = r"(?:/|\s|$|['\"]|[;&|()<>,:`])"
+    return rf"{home_alts}/(?:{dirs_pattern}){path_end}"
 
 
 def _build_sensitive_regex() -> re.Pattern[str]:
@@ -7353,20 +7438,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # (not just the running user's resolved home) is anchored too.
     generic_home = r"/home/[^/\s]+|/Users/[^/\s]+"
     home_alts = f"(?:{home}|{tilde}|{home_var}|{generic_home})"
-    escaped_dirs = [re.escape(d) for d in _SENSITIVE_HOME_DIRS]
-    dirs_pattern = "|".join(escaped_dirs)
-    # What may TERMINATE a sensitive path token. A path is very often the last thing
-    # before a shell metacharacter, and accepting only whitespace, a quote, ``/`` or
-    # end-of-string let punctuation defeat the gate outright: ``cd ~/.aws;`` and
-    # ``cd ~/.kiro/crew/models;`` were allowed, while the same commands written with
-    # ``&&`` were blocked -- for no better reason than that ``&&`` is preceded by a
-    # space and ``;`` is not. The asymmetry is the tell; nothing about a semicolon
-    # makes the path less named. So the class is every character a shell itself treats
-    # as the end of a word. Widening a DENY boundary can only ever deny more, which is
-    # the safe direction for this gate, and the rule it enforces is unchanged: naming a
-    # fenced path is the signal.
+    # The terminator class and the fenced-dir path itself live in
+    # ``_sensitive_path_pattern`` (shared with the linear verb-anchored check);
+    # its docstring carries the rationale for the terminator class.
     path_end = r"(?:/|\s|$|['\"]|[;&|()<>,:`])"
-    sensitive_path = rf"{home_alts}/(?:{dirs_pattern}){path_end}"
+    sensitive_path = _sensitive_path_pattern()
     # Write-protected leaves (e.g. the on-call schedule): a full home-anchored
     # path to a specific leaf file, matched verb-INDEPENDENTLY (below) so no
     # write form can bypass it. See _WRITE_PROTECTED_BASH_LEAVES for why reads
@@ -7513,16 +7589,25 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|{re.escape('${env:HOMEDRIVE}${env:HOMEPATH}')})"
     )
     win_home_alts = (
-        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}"
+        f"(?:{home}|{generic_win_home}|{userprofile}"
         f"|{tilde}|{home_var})"
     )
     # Between the anchor and the fenced remainder, accept the same
     # canonical-no-op chains (``\.\``, ``\X\..\``): they are equivalent to a
     # plain separator, so ``%APPDATA%\.\kiro-cli\data.sqlite3`` and
     # ``...\AppData\Roaming\..\Roaming\kiro-cli\...`` still name the store.
-    win_sensitive_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern}){win_path_end}"
-    )
+    #
+    # The UNC anchor is the one anchor that takes a PLAIN separator instead.
+    # Its ``[^\s'\"]+`` already absorbs every character a no-op chain can
+    # contain (separators, dots, name characters), so ``unc_prefix win_gsep``
+    # and ``unc_prefix win_sep`` match exactly the same strings -- and only
+    # the second is linear. Combined, the greedy run backtracks one character
+    # at a time and re-walks the whole ``\X\..`` chain from every separator it
+    # lands on: a single 10 KB UNC token cost 0.3 s, 40 KB cost 5 s (measured),
+    # quadratic in the token. With a plain separator each backtrack step is a
+    # constant-time literal check.
+    win_anchor = rf"(?:{win_home_alts}{win_gsep}|{unc_prefix}{win_sep})"
+    win_sensitive_path = rf"{win_anchor}(?:{win_dirs_pattern}){win_path_end}"
     # Windows-native spelling of the publish artifacts above. The pairing invariant
     # applies to this spelling too, not only to POSIX-versus-tool: a native path is the
     # one form the tokenizing passes cannot see, so leaving it out would fence the temp
@@ -7532,7 +7617,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         for d in _KEYSTONE_ARTIFACT_PARENTS
     )
     win_artifact_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_artifact_parents_pattern})"
+        rf"{win_anchor}(?:{win_artifact_parents_pattern})"
         rf"{win_gsep}[^\\/\s'\"]*\.(?:{artifact_suffix_alt})(?![\w-])"
     )
     # ``%APPDATA%`` already points INTO ``AppData\Roaming``, so a spelling like
@@ -7602,7 +7687,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         for leaf in _WRITE_PROTECTED_BASH_LEAVES
     )
     win_write_protected_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_wp_prefixes}){win_gsep}"
+        rf"{win_anchor}(?:{win_wp_prefixes}){win_gsep}"
         rf"(?:{win_wp_leaves}){win_path_end}"
     )
     # A native spelling whose LEAF is an expansion: ``%USERPROFILE%\.kiro\crew\%F%``
@@ -7659,7 +7744,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         r"|\$[A-Za-z_][A-Za-z0-9_]*)"
     )
     win_crew_var_leaf_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_crew_leaf_parents})"
+        rf"{win_anchor}(?:{win_crew_leaf_parents})"
         rf"{win_sep}{any_expansion}"
     )
     # ── ~/.kiro/agents WRITE-protection (a whole DIRECTORY, not a leaf) ──
@@ -7709,7 +7794,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|{re.escape('${env:KIRO_HOME}')})"
     )
     win_agents_write_path = (
-        rf"(?:{win_home_alts}{win_gsep}(?:{win_agents_dir_alt})"
+        rf"(?:{win_anchor}(?:{win_agents_dir_alt})"
         rf"|{win_kiro_home_var}{win_gsep}(?:{agents_leaf_alt})){win_path_end}"
     )
     # Bare path-SEGMENT match for the globally distinctive leaves. Both branches
@@ -7738,7 +7823,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # mkdir-as-directory form are covered.
     bare_weight_path = rf"(?<![\w.\-]){_WHISPER_WEIGHT_NAME}(?![\w\-])"
     return re.compile(
-        # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
+        # (1) redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
         # plus the separators that precede a path argument: whitespace, quote,
         # ``=`` (VAR=path), AND ``:``/``,``/``;`` (option:path, PATH-style
@@ -7753,11 +7838,26 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # line. Note ``\n`` is in the class, so a path at the start of a later
         # line still matches even though ``.`` never crossed a newline anyway.
         # Do NOT reintroduce ``.*`` here.
+        #
+        # The redirect form ``[<>|]\s*<path>`` is spelled the same way, for the
+        # same reason: it used to read ``.*[<>|]\s*``, and THAT ``.*`` is tried
+        # at every offset of every line regardless of content -- the one
+        # construct in this alternation whose cost did not depend on the input
+        # looking like a path at all. Measured on a 10 KB command with no
+        # redirect in it: 0.3 s; 40 KB: 5 s; quadratic. Under ``.search`` the
+        # leading ``.*`` is redundant exactly as it is on the token anchor.
+        #
+        # The VERB-anchored form (``cat .*<path>``, ``tee .*<path>``,
+        # ``python … open( … <path>``) is deliberately NOT in this alternation
+        # any more: ``verb.*path`` re-walks the rest of the line from every verb
+        # occurrence, quadratic on a verb-dense line, and no regex spelling of
+        # "a verb somewhere earlier on this line" is linear. It lives in
+        # ``_verb_anchored_sensitive_hit``, which walks each line once. Both run
+        # from ``_sensitive_pattern_hit``; neither is a complete gate alone.
         # (3) write-protected leaf: matched verb-INDEPENDENTLY too (same token
         # anchor), so a quoted redirect (``> "$HOME/.../marker"``), ``cp``,
         # ``python -c "open(...,'w')"`` or any novel write verb is still caught.
-        rf"(?:(?:{_READ_CMDS}.*|{_WRITE_CMDS}.*|{_SCRIPT_OPEN}.*|.*[<>|]\s*)"
-        rf"{sensitive_path}"
+        rf"(?:[<>|]\s*{sensitive_path}"
         rf"|(?:^|[\s'\"=:,;]){sensitive_path}"
         rf"|(?:^|[\s'\"=:,;]){write_protected_path}"
         # (3b) publish artifacts of a keystone leaf -- the atomic-write temp and the lock
@@ -7805,6 +7905,78 @@ def _get_sensitive_re() -> re.Pattern[str]:
     if _SENSITIVE_RE is None:
         _SENSITIVE_RE = _build_sensitive_regex()
     return _SENSITIVE_RE
+
+
+# ── The verb-anchored form of the sensitive-path match, walked linearly ──
+#
+# ``(?:READ|WRITE)\s.*<path>`` and ``interp\S*\s.*open\s*\(.*<path>`` say "a
+# verb, and later on the same line a fenced path". The regex engine evaluates
+# that by running ``.*`` to the end of the line from EVERY verb occurrence and
+# retrying the path at every position on the way back, so a line with k verbs
+# costs k times its length: quadratic on ``cat a cat b cat c …`` (0.13 s at
+# 40 KB, measured, and it is the only super-linear term left after the
+# redirect and UNC rewrites). Because ``.`` never crosses a newline, the
+# statement decomposes per line into "the earliest end of a verb match" and
+# "any path match starting at or after it" -- two ``search`` calls, each
+# linear, and exactly the language the old branch accepted:
+#
+# * for the verb alternations every alternative is a word followed by ``\s``,
+#   so a match ends at the whitespace after its word and the LEFTMOST match
+#   has the earliest end (a later start inside the same word shares that
+#   whitespace; a later start past it ends later);
+# * for the interpreter form the same holds for ``\S*\s`` (ends at the first
+#   whitespace after the start) and for ``open\s*\(`` (ends at its ``(``), and
+#   the leftmost ``open(`` at or after the interpreter's end is the earliest;
+# * the path is searched from that end with ``pos``: ``$`` in its terminator
+#   class matches at the line's end exactly as it matched before ``\n`` (which
+#   is also in the class) or at end of string.
+#
+# ``_SENSITIVE_RE`` no longer carries this branch; ``_sensitive_pattern_hit``
+# runs both and is what the gate calls. Neither half is a complete gate alone.
+_VERB_ANCHOR_RE: re.Pattern[str] | None = None
+_SCRIPT_OPEN_INTERP_RE = re.compile(_SCRIPT_OPEN_INTERP, re.IGNORECASE)
+_SCRIPT_OPEN_CALL_RE = re.compile(_SCRIPT_OPEN_CALL, re.IGNORECASE)
+_SENSITIVE_PATH_RE: re.Pattern[str] | None = None
+
+
+def _get_verb_anchor_re() -> re.Pattern[str]:
+    global _VERB_ANCHOR_RE
+    if _VERB_ANCHOR_RE is None:
+        _VERB_ANCHOR_RE = re.compile(rf"(?:{_READ_CMDS}|{_WRITE_CMDS})", re.IGNORECASE)
+    return _VERB_ANCHOR_RE
+
+
+def _get_sensitive_path_re() -> re.Pattern[str]:
+    global _SENSITIVE_PATH_RE
+    if _SENSITIVE_PATH_RE is None:
+        _SENSITIVE_PATH_RE = re.compile(_sensitive_path_pattern(), re.IGNORECASE)
+    return _SENSITIVE_PATH_RE
+
+
+def _verb_anchored_sensitive_hit(command: str) -> bool:
+    """True iff some line has a read/write verb, or ``interp … open(``, and a
+    fenced path starting at or after it -- the verb-anchored branch, in linear
+    time (see the block comment above for why this is the same language)."""
+    verb_re = _get_verb_anchor_re()
+    path_re = _get_sensitive_path_re()
+    for line in command.split("\n"):
+        verb = verb_re.search(line)
+        if verb is not None and path_re.search(line, verb.end()) is not None:
+            return True
+        interp = _SCRIPT_OPEN_INTERP_RE.search(line)
+        if interp is None:
+            continue
+        call = _SCRIPT_OPEN_CALL_RE.search(line, interp.end())
+        if call is not None and path_re.search(line, call.end()) is not None:
+            return True
+    return False
+
+
+def _sensitive_pattern_hit(command: str) -> bool:
+    """The pattern tier of the shell gate: the compiled alternation plus the
+    linear verb-anchored branch. Every caller of the old single ``search`` goes
+    through here so the two halves cannot be applied to different subjects."""
+    return bool(_get_sensitive_re().search(command)) or _verb_anchored_sensitive_hit(command)
 
 
 # ── Bounded symlink resolution for the sensitive-path gates ──
@@ -9780,10 +9952,15 @@ def _fence_hit_in_collapsed(
     collapsed copies are still checked in every case; what is skipped is a provably
     duplicate pass, never a layer. The default stays False so a new caller is
     self-sufficient unless it opts out deliberately.
+
+    The path check is ``_sensitive_pattern_hit``, not ``_get_sensitive_re().search``:
+    the verb-anchored branch is no longer spelled inside that alternation, so
+    searching the compiled pattern alone would let a verb-anchored fenced path reach
+    the fence through a doubled separator -- the exact shape this layer exists for.
     """
     candidates = _separator_collapsed_variants(value)
     for candidate in candidates if value_already_scanned else (value, *candidates):
-        if _get_sensitive_re().search(candidate):
+        if _sensitive_pattern_hit(candidate):
             return "Blocked: command accesses sensitive credential path"
         if _extracts_into_trust_root(candidate):
             return "Blocked: command extracts into the governance trust-root directory"
@@ -9994,6 +10171,7 @@ def is_sensitive_bash_command(
     _subject_is_shell_grammar: bool = True,
     _traversal_subjects: "Sequence[str] | None" = None,
     _env_subject: str | None = None,
+    _max_chars: int = MAX_SCANNABLE_COMMAND_CHARS,
 ) -> str | None:
     """Check if a bash command reads sensitive paths, accesses IMDS, or leaks env creds.
 
@@ -10051,10 +10229,26 @@ def is_sensitive_bash_command(
     passes are handed, and a caller that supplies none keeps the whole-subject
     behaviour byte for byte.
 
+    ``_max_chars`` is the pass-0 size ceiling, and it is a parameter for the same
+    reason ``_traversal_subjects`` is: the number belongs to the SUBJECT CLASS, not to
+    this function. A command line and a source body have different legitimate sizes,
+    so one ceiling is a false refusal of the other -- see
+    :data:`MAX_SCANNABLE_SOURCE_BODY_CHARS`. It is never absent, only larger:
+    ``is_sensitive_source_body`` raises it, no caller removes it.
+
     Returns denial reason string, or None if clean.
     """
+    # ── Pass 0: size ceiling ──
+    # Every matcher below is linear in the subject, and this bound is what makes
+    # that a wall-clock ceiling: the gate runs synchronously on the event loop,
+    # so its worst case IS the loop's worst case. An oversized subject is
+    # refused, never scanned partially and never let through unscanned -- a
+    # denied long command is recoverable by the operator, a stalled gateway and
+    # an unscanned command are not.
+    if len(command) > _max_chars:
+        return _oversize_refusal(len(command), _max_chars)
     # ── Pass 1: regex fast-path ──
-    if _get_sensitive_re().search(command):
+    if _sensitive_pattern_hit(command):
         return "Blocked: command accesses sensitive credential path"
     if _extracts_into_trust_root(command):
         return "Blocked: command extracts into the governance trust-root directory"
@@ -10190,6 +10384,14 @@ def is_sensitive_source_body(text: str) -> str | None:
     shell matcher run, and it keeps pass 1b exactly when the body did NOT parse -- an
     uninspected body is scanned as text rather than waved through.
 
+    It also raises the pass-0 size ceiling to
+    :data:`MAX_SCANNABLE_SOURCE_BODY_CHARS` on every one of those paths, including the
+    unparseable fallbacks -- a cron script may legitimately be a shell script, so the
+    fallback is not the rarer case and a body refused there is refused on every tick
+    just the same. The command-line ceiling would ban an ordinary script for its LENGTH,
+    which is the availability defect ``_source_command_subjects`` exists to remove; this
+    would have re-introduced it one pass earlier, at a different number.
+
     The same composition decides the subjects of every pass that REQUIRES a command
     line, for the same reason and with the same fallback. Two of them walk shell
     structure under a fail-closed budget, and a source body is not shell structure: stages are split on
@@ -10223,11 +10425,23 @@ def is_sensitive_source_body(text: str) -> str | None:
     judged by the literal scan and by passes 1 to 3, none of which this touches, and a
     Python-native credential-env read is caught by the cron gate ahead of this function.
     """
+    # The ceiling goes BEFORE the parse, not just inside the passes below. ``ast.parse``
+    # is itself unbounded work on an unbounded body -- measured 0.3 s at this ceiling
+    # and 12 s on a 1.5 MB body of the same shape -- so a bound applied only after the
+    # parse is not a bound on this entry point at all. Its one caller truncates what it
+    # reads to the same number, but a ceiling that holds only while every caller
+    # remembers to pre-truncate is the caller's invariant, not the gate's.
+    if len(text) > MAX_SCANNABLE_SOURCE_BODY_CHARS:
+        return _oversize_refusal(len(text), MAX_SCANNABLE_SOURCE_BODY_CHARS)
     tree = _parse_source_body(text)
     if tree is None:
         # Unparseable: no literals were inspected, so the raw text keeps the full shell
         # treatment -- pass 1b included, and the traversal passes over the document.
-        return is_sensitive_bash_command(text, _subject_is_shell_grammar=True)
+        return is_sensitive_bash_command(
+            text,
+            _subject_is_shell_grammar=True,
+            _max_chars=MAX_SCANNABLE_SOURCE_BODY_CHARS,
+        )
 
     inspected, literal_reason = _sensitive_run_in_source_literals(text, tree=tree)
     if literal_reason:
@@ -10246,7 +10460,11 @@ def is_sensitive_source_body(text: str) -> str | None:
         # PEG parser handles iteratively while the AST walk overflows) followed by
         # ``open(r"…\\kiro-cli\\c.json")`` was neither literal-scanned NOR collapsed,
         # reopening the doubled-separator fence bypass (#6350) inside a script.
-        return is_sensitive_bash_command(text, _subject_is_shell_grammar=True)
+        return is_sensitive_bash_command(
+            text,
+            _subject_is_shell_grammar=True,
+            _max_chars=MAX_SCANNABLE_SOURCE_BODY_CHARS,
+        )
 
     subjects = _source_command_subjects(tree)
     if subjects is None:
@@ -10258,6 +10476,7 @@ def is_sensitive_source_body(text: str) -> str | None:
     return is_sensitive_bash_command(
         text,
         _subject_is_shell_grammar=False,
+        _max_chars=MAX_SCANNABLE_SOURCE_BODY_CHARS,
         _traversal_subjects=subjects,
         # The env rules get a DIFFERENT subject from the traversal passes, because the
         # two need opposite things. A traversal pass needs each command string on its

@@ -19,7 +19,7 @@ from unittest import mock
 import pytest
 from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 
-from kiro_crew import security
+from kiro_crew import cron_inflight, security
 from kiro_crew.security import (
     _SECRET_KEY_LEN,
     apply_resource_limits,
@@ -8956,6 +8956,11 @@ class TestCronStoreProtection:
 
         assert "crons.json" in _CREW_SECRET_LEAVES
         assert "cron-history" in _CREW_SECRET_LEAVES
+        # The in-flight markers are the evidence the boot-time loop-stall breaker
+        # pauses a job on, so they are fenced for a sharper reason than the store
+        # itself: a marker the agent could write is an unauthorized "pause this
+        # job", and one it could delete disables the breaker.
+        assert cron_inflight.RUNNING_DIR_NAME in _CREW_SECRET_LEAVES
 
     @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
     def test_store_and_history_sensitive_under_every_home_prefix(self, prefix: str) -> None:
@@ -8964,10 +8969,16 @@ class TestCronStoreProtection:
         assert is_sensitive_path(f"~/{prefix}/crons.json") is True
         assert is_sensitive_path(f"~/{prefix}/cron-history/_index.jsonl") is True
         assert is_sensitive_path(f"~/{prefix}/cron-history/job123.jsonl") is True
+        assert is_sensitive_path(f"~/{prefix}/cron-running/a1b2c3d4.json") is True
         # The write gate is a superset of the read gate; assert it directly so
         # the file-edit tool path is pinned too.
         assert is_sensitive_write_path(f"~/{prefix}/crons.json") is True
         assert is_sensitive_write_path(f"~/{prefix}/cron-history/_index.jsonl") is True
+        assert is_sensitive_write_path(f"~/{prefix}/cron-running/a1b2c3d4.json") is True
+        assert (
+            is_sensitive_write_path(f"~/{prefix}/cron-running/{cron_inflight.BREAKER_CLAIM_FILE}")
+            is True
+        )
 
     def test_bash_write_and_read_both_blocked(self) -> None:
         for cmd in (
@@ -8978,6 +8989,10 @@ class TestCronStoreProtection:
             "cat ~/.kiro/crew/crons.json",
             "echo x > ~/.kiro/crew/cron-history/_index.jsonl",
             "cat ~/.kirocrew/crons.json",
+            # A forged marker, and erasing one, are both the breaker's problem.
+            'echo {"job_id":"x","pid":1,"started_at":0} > ~/.kiro/crew/cron-running/x.json',
+            "rm ~/.kiro/crew/cron-running/x.json",
+            "cat ~/.kiro/crew/cron-running/x.json",
         ):
             assert is_sensitive_bash_command(cmd) is not None, cmd
 

@@ -51,6 +51,7 @@ from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import _AGENT_DENIED_ENV_KEYS
 from kiro_crew.security import (
     _SENSITIVE_HOME_DIRS,
+    MAX_SCANNABLE_SOURCE_BODY_CHARS,
     audit_bash_exfiltration,
     enabled_rule_ids,
     is_sensitive_bash_command,
@@ -234,7 +235,19 @@ _CRON_MAX_EXPANDED_VALUE = 5000
 _CRON_MAX_ASSIGNMENTS = 64
 # Cap how much of a cron script we read for the security review (256 KiB is far
 # larger than any legitimate cron script; bounds memory on a hostile huge file).
-_MAX_SCRIPT_SCAN_BYTES = 256 * 1024
+# ALIASED to the gate's own source-body ceiling rather than restated, so the reader and
+# the gate cannot disagree about which one is the operative limit.
+_MAX_SCRIPT_SCAN_BYTES = MAX_SCANNABLE_SOURCE_BODY_CHARS
+#: What :func:`_vet_script_file` actually reads: ONE character past the cap, so an
+#: oversized script is DETECTED rather than silently truncated. Reading exactly the cap
+#: is a fence bypass, not a bound: the vetter then sees a body at the limit, scans it
+#: clean, and the sandbox executes the whole file -- so a benign 256 KiB prefix followed
+#: by a credential read in its tail was allowed. The extra character makes the body
+#: exceed ``MAX_SCANNABLE_SOURCE_BODY_CHARS``, which refuses it, and refusing an
+#: unscannable script is the same direction every other budget in the gate takes. A file
+#: of exactly the cap still reads short of this and is scanned in full, so no legitimate
+#: script is refused for being at the boundary.
+_SCRIPT_READ_PROBE_BYTES = _MAX_SCRIPT_SCAN_BYTES + 1
 
 
 def _split_segments(command: str) -> list[tuple[str, str]]:
@@ -820,7 +833,9 @@ def _vet_script_file(file_path: str) -> str | None:
     independently resolves the real path and rejects it via ``is_sensitive_path``
     before opening, so a symlink under the crons dir pointing at a credential
     file (e.g. ``crons/evil.py -> ~/.aws/credentials``) cannot be read here. Read
-    is capped at ``_MAX_SCRIPT_SCAN_BYTES``. Storage-time check only (TOCTOU note:
+    is capped at ``_MAX_SCRIPT_SCAN_BYTES``, and reads one character PAST it so a
+    longer script is refused rather than vetted on its prefix
+    (``_SCRIPT_READ_PROBE_BYTES``). Storage-time check only (TOCTOU note:
     the file could change before execution — the exec-time sandbox is the runtime
     control; this gate stops the obvious register-a-malicious-script case).
     """
@@ -832,7 +847,7 @@ def _vet_script_file(file_path: str) -> str | None:
         return "Error: cron script path blocked by security policy (resolves to a sensitive credential path)"
     try:
         with open(resolved, encoding="utf-8", errors="replace") as f:
-            contents = f.read(_MAX_SCRIPT_SCAN_BYTES)
+            contents = f.read(_SCRIPT_READ_PROBE_BYTES)
     except OSError as e:
         return f"Error: cannot read cron script for security review: {e}"
     return _vet_script_contents(contents)
