@@ -130,7 +130,10 @@ from kiro_crew.dashboard.origin import (
     parse_dashboard_url,
     resolve_dashboard_host,
 )
-from kiro_crew.dashboard.stale_asset_watchdog import run_stale_asset_watchdog
+from kiro_crew.dashboard.stale_asset_watchdog import (
+    run_stale_asset_watchdog,
+    shutdown_exit_code,
+)
 from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
@@ -10669,6 +10672,17 @@ class GatewayOrchestrator:
         await shutdown_event.wait()
         print("👻 Shutting down…")
 
+        # Exit status for the os._exit below. 0 for an operator stop (SIGTERM,
+        # `systemctl stop`, Ctrl-C) so a restart-on-failure supervisor leaves
+        # the gateway down as asked. Non-zero when the stale-asset watchdog is
+        # what set the event: that shutdown exists ONLY to be restarted, and
+        # a supervisor with `Restart=on-failure` semantics never relaunches an
+        # exit 0 — a unit generated before `Restart=always` landed stranded a
+        # gateway for hours on exactly this path. The watchdog has already
+        # returned (True on the vanish path) by the time it sets the event, so
+        # its task result is the signal; see shutdown_exit_code.
+        exit_code = shutdown_exit_code(_watchdog)
+
         # Drop this gateway's run-marker BEFORE _shutdown() releases the
         # listener: once the port is free a replacement gateway can bind it
         # and publish its own marker + credential, which this clear would
@@ -10728,7 +10742,7 @@ class GatewayOrchestrator:
         from kiro_crew.cli import drain_log_queue_before_hard_exit
 
         await drain_log_queue_before_hard_exit()
-        os._exit(0)
+        os._exit(exit_code)
 
     async def _start_channel_transports(
         self, descriptors: "tuple[ChannelDescriptor, ...] | None" = None
