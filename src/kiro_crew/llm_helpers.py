@@ -888,10 +888,11 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
 
 # Longest single string the tool_input scan will attempt.
 #
-# CPython's ``re`` does not release the GIL for the duration of one match call,
-# so the worker-thread hop below yields BETWEEN per-string scans but not WITHIN
-# one: a single huge string holds the GIL inside one ``.search`` and the event
-# loop cannot run its watchdog heartbeat for that whole time.
+# The scan runs on a worker thread, and CPython's ``re`` releases the GIL while a
+# match runs (measured, see ``_first_tool_input_denial``), so the event loop stays
+# live for the whole scan. The ceiling bounds the WORKER instead: an unbounded
+# string parks a thread for as long as the scan takes, and the permission
+# request behind it -- the turn -- waits with it.
 #
 # The anchor rewrite in this change cut the constant but NOT the growth -- the
 # scan is still superlinear in the length of one line. Measured on one dev box:
@@ -920,6 +921,32 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
 _MAX_SCANNABLE_TOOL_INPUT_CHARS = 20 * 1024
 
 
+def _title_denial(
+    title: str,
+    denied_regexes: list[str] | None,
+) -> tuple[str, str] | None:
+    """Return the always-enforced denial for the tool *title*, or ``None``.
+
+    The title is the request's primary subject -- for a shell tool it IS the
+    command -- and it goes through the same three predicates as every
+    tool_input string. Pure and synchronous like :func:`_first_tool_input_denial`,
+    and run on the same worker hop: the field crash this exists for was the
+    sensitive-path gate scanning a ~9 KB TITLE for 25 s on the event loop, so
+    a hop that offloaded only the tool_input strings left the crash path in
+    place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
+    ``"regex"``; the reasons are the exact strings the on-loop checks produced.
+    """
+    if is_sensitive_path(title):
+        return ("path", f"Blocked: sensitive path: {title}")
+    bash_reason = is_sensitive_bash_command(title)
+    if bash_reason:
+        return ("bash", bash_reason)
+    deny_reason = is_denied(title, denied_regexes=denied_regexes)
+    if deny_reason:
+        return ("regex", deny_reason)
+    return None
+
+
 def _first_tool_input_denial(
     strings: list[str],
     denied_regexes: list[str] | None,
@@ -928,12 +955,16 @@ def _first_tool_input_denial(
 
     Pure, synchronous, and blocking: the three predicates are regex-heavy and
     ``_extract_tool_input_strings`` hands over EVERY string in the payload, so a
-    single long document body can occupy this loop for seconds. It therefore
-    runs on a worker thread (one hop for the whole loop, not one per string),
-    which keeps the event loop free BETWEEN strings -- not within one, because
-    ``re`` holds the GIL for a whole match call. That is why each string is
-    length-checked against :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS` first, and an
-    oversized one is denied rather than scanned or skipped.
+    single long document body can occupy the calling thread for seconds. It
+    therefore runs on a worker thread (one hop for the whole loop, not one per
+    string). CPython's ``re`` releases the GIL while a match runs (measured:
+    a 16-23 s ``search`` on a worker left the main thread's tick gaps at
+    20 ms on 3.10, 3.11 and 3.12), so the hop keeps the loop live WITHIN one
+    scan as well as between scans. The length check against
+    :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS` is still there to bound the worker's
+    own wall clock -- a denied oversized string is recoverable, a worker parked
+    for minutes on a pathological payload is not -- and an oversized one is
+    denied rather than scanned or skipped.
 
     The tuple is ``(kind, reason, matched_string)`` where *kind* is
     ``"path"`` / ``"bash"`` / ``"regex"`` / ``"oversize"``. Mechanism
@@ -2059,19 +2090,6 @@ async def _resolve_permission(
         await provider.reject_tool(event.request_id)
         _log("denied", error="Blocked: missing tool title", metadata={"mechanism": "always_deny"})
         return False
-    if is_sensitive_path(normalized):
-        await provider.reject_tool(event.request_id)
-        _log(
-            "denied",
-            error=f"Blocked: sensitive path: {normalized}",
-            metadata={"mechanism": "always_deny"},
-        )
-        return False
-    _bash_reason = is_sensitive_bash_command(normalized)
-    if _bash_reason:
-        await provider.reject_tool(event.request_id)
-        _log("denied", error=_bash_reason, metadata={"mechanism": "always_deny"})
-        return False
     # Honor the user's Settings>Security opt-out + governance pins on this
     # surface too (cron / Slack / workflow / heartbeat). Without threading the
     # effective set, is_denied() fails closed to ALL built-ins here, which would
@@ -2106,43 +2124,44 @@ async def _resolve_permission(
             return unconditional
         return unconditional if is_denied(probe, denied_regexes=_unpinned) else "policy_deny"
 
-    _deny_reason = is_denied(normalized, denied_regexes=_denied_regexes)
-    if _deny_reason:
+    # Defense-in-depth: the title AND every string in event.tool_input go through
+    # the same three predicates. The title usually carries the full path/command
+    # (kiro-cli convention), but tool_input may contain additional arguments or
+    # the actual path when the title is a generic tool name (e.g. "Read", "Bash").
+    _tool_input = event.tool_input or ""
+    _input_strings = _extract_tool_input_strings(_tool_input) if _tool_input else []
+
+    def _scan_off_loop() -> tuple[str, str, str, str] | None:
+        # One worker hop for the title and the whole tool_input loop. Both are
+        # regex-heavy over agent-supplied text; on the event loop a ~9 KB shell
+        # title held the loop past the 25 s stall watchdog and took the gateway
+        # down (the title tier used to run inline here while only the tool_input
+        # tier was offloaded, so that crash path survived the first offload).
+        # ``re`` releases the GIL during a match, so the loop keeps ticking and
+        # a caller's ``asyncio.wait_for`` can cancel the await while the scan
+        # finishes on the worker. Title first, so a request denied on its title
+        # reports the title-tier reason and mechanism exactly as before.
+        title_hit = _title_denial(normalized, _denied_regexes)
+        if title_hit is not None:
+            return (title_hit[0], title_hit[1], normalized, "always_deny")
+        if _input_strings:
+            input_hit = _first_tool_input_denial(_input_strings, _denied_regexes)
+            if input_hit is not None:
+                return (*input_hit, "always_deny_input")
+        return None
+
+    _hit = await asyncio.to_thread(_scan_off_loop)
+    if _hit is not None:
+        _kind, _reason, _matched, _tier = _hit
         await provider.reject_tool(event.request_id)
         _log(
             "denied",
-            error=_deny_reason,
-            metadata={"mechanism": _regex_deny_mechanism(normalized, "always_deny")},
+            error=_reason,
+            metadata={
+                "mechanism": (_regex_deny_mechanism(_matched, _tier) if _kind == "regex" else _tier)
+            },
         )
         return False
-
-    # Defense-in-depth: also inspect event.tool_input for sensitive paths/commands.
-    # The title usually carries the full path/command (kiro-cli convention), but
-    # tool_input may contain additional arguments or the actual path when the
-    # title is a generic tool name (e.g. "Read", "Bash").
-    _tool_input = event.tool_input or ""
-    if _tool_input:
-        # Extract string values from JSON tool_input for path/command checking.
-        _input_strings = _extract_tool_input_strings(_tool_input)
-        # Offloaded: the scan is regex-heavy over every string in the payload,
-        # so a large document body would block the event loop past its watchdog
-        # and take the gateway down. One hop for the whole loop.
-        _hit = await asyncio.to_thread(_first_tool_input_denial, _input_strings, _denied_regexes)
-        if _hit is not None:
-            _kind, _reason, _matched = _hit
-            await provider.reject_tool(event.request_id)
-            _log(
-                "denied",
-                error=_reason,
-                metadata={
-                    "mechanism": (
-                        _regex_deny_mechanism(_matched, "always_deny_input")
-                        if _kind == "regex"
-                        else "always_deny_input"
-                    )
-                },
-            )
-            return False
 
     if policy == ToolApprovalPolicy.HOOK_BASED and hooks:
         tool_result = hooks.on_tool_call(
