@@ -33,6 +33,7 @@ from kiro_crew.providers.base import (
     resolve_billing_stats,
 )
 from kiro_crew.security import (
+    MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
     is_sensitive_bash_command,
     is_sensitive_path,
@@ -910,14 +911,16 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
 # strictly better than the alternative it replaces, which was crashing the
 # gateway and losing the whole turn.
 #
-# Known cost of that trade, and why the ceiling is an interim: a permission-gated
-# write of a benign file larger than this lands its whole content in
-# ``tool_input`` and is now refused. Chunked scanning cannot lift the ceiling on
-# its own, because one branch of the pattern puts an unbounded ``.*`` between a
-# verb and the path, so no chunk overlap preserves that distance. The durable fix
-# is to stop running the SHELL-COMMAND matcher over fields that never carry a
+# Known cost of that trade: a permission-gated write of a benign file larger
+# than this lands its whole content in ``tool_input`` and is refused. The durable
+# fix is to stop running the SHELL-COMMAND matcher over fields that never carry a
 # command. Tracked in https://github.com/kirodotdev/KiroCrew/issues/8053.
-_MAX_SCANNABLE_TOOL_INPUT_CHARS = 20 * 1024
+#
+# One number for both tiers: the shell gate refuses a command above
+# ``security.MAX_SCANNABLE_COMMAND_CHARS`` on its own (every caller, not only
+# this one), so aliasing it here is what keeps "too long for the tool_input
+# scan" and "too long for the command gate" the same size.
+_MAX_SCANNABLE_TOOL_INPUT_CHARS = MAX_SCANNABLE_COMMAND_CHARS
 
 
 def _first_tool_input_denial(

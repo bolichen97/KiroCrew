@@ -29,6 +29,7 @@ import time
 import pytest
 
 from kiro_crew.security import (
+    MAX_SCANNABLE_COMMAND_CHARS,
     is_sensitive_bash_command,
     is_sensitive_path,
     redact_credentials,
@@ -300,9 +301,12 @@ def test_long_nonshell_line_does_not_blow_up() -> None:
     ceiling clears the fixed path by ~4x while the quadratic form overshoots by
     ~4.5x. Deliberately generous -- this test exists to catch a complexity
     regression, not to benchmark CI.
+    Sized just under ``MAX_SCANNABLE_COMMAND_CHARS``: the gate now REFUSES
+    anything above it without scanning (see test_security_gate_liveness.py), so
+    a blob past the ceiling would exercise the refusal, not the scan.
     """
-    blob = "abcdefgh " * 2500
-    assert len(blob) > 20_000
+    blob = "abcdefgh " * 2200
+    assert 19_000 < len(blob) <= MAX_SCANNABLE_COMMAND_CHARS
     started = time.perf_counter()
     verdict = is_sensitive_bash_command(blob)
     elapsed = time.perf_counter() - started
