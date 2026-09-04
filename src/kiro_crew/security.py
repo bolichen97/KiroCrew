@@ -9795,7 +9795,91 @@ def _fence_hit_in_collapsed(
     return None
 
 
-def _sensitive_run_in_source_literals(source: str) -> tuple[bool, str | None]:
+#: Ceiling on how many command-string subjects ONE source body may hand the two
+#: traversal passes. Real scripts sit far below it: measured over the cron scripts of
+#: the install this bound was taken from, the largest (1170 lines) carries 441 string
+#: constants and the median carries ~140, so 1024 is roughly 2.3x the largest real
+#: body. The cap exists because the per-subject cost is bounded while the COUNT is
+#: author-controlled: a generated body carrying tens of thousands of literals would
+#: pay that bounded cost tens of thousands of times on the gateway's single asyncio
+#: loop, which is the wedge shape every other budget in this module exists to stop.
+#: Exhausting it REFUSES, for the same reason ``_ALT_MAX_STAGES`` does -- a subject
+#: past the cap was never inspected, so allowing would make the cap the bypass.
+_SOURCE_COMMAND_SUBJECT_CAP = 1024
+
+
+def _parse_source_body(source: str) -> "ast.Module | None":
+    """*source* as a parse tree, or None when it is not valid Python.
+
+    ONE spelling of the parse and of what "unparseable" means, so the literal fence
+    scan and the traversal-subject collection cannot disagree about the same body --
+    and so a body is parsed once rather than once per question asked of it.
+
+    ``RecursionError`` is caught alongside the syntax errors because a legitimately
+    deep expression can exhaust the interpreter's limit during the parse itself; the
+    caller then treats the body as text, which is the same fail-closed direction the
+    traversal walk takes when its own depth limit is reached.
+    """
+    try:
+        return ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+
+def _source_command_subjects(tree: "ast.Module") -> "tuple[str, ...] | None":
+    """The command strings *tree* CARRIES, as subjects for the two traversal passes.
+
+    Returns the subjects, or None when there are more than
+    :data:`_SOURCE_COMMAND_SUBJECT_CAP` and the caller must therefore refuse.
+
+    A Python body is not a command line, but the shell it reaches it reaches through a
+    STRING -- so the string constants are the command-line subjects inside it, and each
+    is short enough that the structural budgets those two passes carry are never
+    approached. Every ``str``/``bytes`` constant is collected, including an f-string's
+    literal fragments (each parses to its own ``Constant``) and the ones a docstring or
+    a discarded statement-position string holds. Nothing is filtered out on the grounds
+    that it "cannot be a command": a subject that names no traversal simply matches no
+    rule, so over-collecting costs a little work and can only ADD denials, while
+    under-collecting is a missed read. ``bytes`` are decoded latin-1 -- total over a
+    byte range, one code point per byte -- exactly as the fence scan decodes them,
+    because ``subprocess`` accepts a bytes command too.
+
+    A whitespace-only value is the one exclusion, and it is provable rather than
+    heuristic: run as a command it names no program at all.
+
+    Collected in SOURCE ORDER, not walk order. ``ast.walk`` is breadth-first, so a
+    left-nested ``+`` chain yields its right operands before descending and
+    ``"env | gr" + "ep AWS_SEC" + …`` comes back scrambled -- which silently defeated
+    the caller that joins these to reconstruct a fragment-assembled command. Sorting on
+    ``(lineno, col_offset)`` is what the ``+`` at runtime actually does.
+
+    This deliberately does NOT try to reconstruct a command assembled from fragments
+    (an f-string interpolating a variable, a ``+`` chain, ``str.join``). A body able to
+    build its argument at runtime is outside what any static read of the tree can
+    follow -- the limit this module already records for the ``re``-authenticity guards
+    -- and the fragments are still each inspected on their own.
+    """
+    found: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant):
+            continue
+        if isinstance(node.value, str):
+            value = node.value
+        elif isinstance(node.value, bytes):
+            value = node.value.decode("latin-1")
+        else:
+            continue
+        if not value.strip():
+            continue
+        if len(found) >= _SOURCE_COMMAND_SUBJECT_CAP:
+            return None
+        found.append((getattr(node, "lineno", 0), getattr(node, "col_offset", 0), value))
+    return tuple(value for _, _, value in sorted(found, key=lambda item: item[:2]))
+
+
+def _sensitive_run_in_source_literals(
+    source: str, *, tree: "ast.Module | None" = None
+) -> tuple[bool, str | None]:
     """Fence check for a separator RUN inside a decoded literal of a source body.
 
     Returns ``(parsed, reason)``. ``parsed`` is False when the body is not valid
@@ -9818,10 +9902,15 @@ def _sensitive_run_in_source_literals(source: str) -> tuple[bool, str | None]:
     expression the literal reaches, and only when the body has neither rebound the
     name ``re`` nor read a pattern back off an ``re`` object; every other position and
     spelling denies.
+
+    ``tree`` lets a caller that has already parsed *source* hand the result in, so the
+    body is parsed ONCE however many questions are asked of it. Passing it also asserts
+    the body parsed, so ``parsed`` comes back True; a caller that has not parsed omits
+    it and this function parses through the same single helper.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError, RecursionError):
+    if tree is None:
+        tree = _parse_source_body(source)
+    if tree is None:
         return (False, None)
 
     # Statement-position constants are evaluated and thrown away by Python -- EXCEPT a
@@ -9903,6 +9992,8 @@ def is_sensitive_bash_command(
     *,
     enabled_ids: "frozenset[str] | None" = None,
     _subject_is_shell_grammar: bool = True,
+    _traversal_subjects: "Sequence[str] | None" = None,
+    _env_subject: str | None = None,
 ) -> str | None:
     """Check if a bash command reads sensitive paths, accesses IMDS, or leaks env creds.
 
@@ -9931,6 +10022,34 @@ def is_sensitive_bash_command(
     control, the relative-traversal matcher, the normalizer, IMDS and env-credential
     detection -- and its own caller keeps its ``is_sensitive_path`` check on the
     resolved file path.
+
+    ``_traversal_subjects`` and ``_env_subject`` re-point the passes that REQUIRE a
+    command line at the
+    command strings a subject CONTAINS rather than at the subject itself. Three qualify,
+    for two different reasons.
+
+    Passes 4 and 5 walk shell STRUCTURE under a fail-closed budget, and a source body is
+    not a structure they can read: ``_alt_collect_stages`` splits on newline / ``;`` /
+    ``|``, so every line of a Python file is a "pipeline stage" and a few hundred lines
+    exhaust ``_ALT_MAX_STAGES`` with no shell content at all, which correctly (for a
+    command line) refuses. The refusal is then keyed on the body's SIZE, so an ordinary
+    script is banned for its length -- see the ``is_sensitive_source_body`` caller.
+
+    The env-credential rules qualify by a different mechanism: they are
+    ORDERED-EXISTENCE patterns describing ONE pipeline, so over a document they match
+    pieces lying arbitrarily far apart and produce a false DENIAL rather than a refusal.
+    Both are the same premise -- a rule written for one command line, handed a document.
+
+    The remaining passes are left on the whole subject on purpose. Passes 1 to 3 and the
+    IMDS check match text or judge tokens with neither a structural budget nor an
+    ordered-existence shape, so a document cannot assemble a verdict out of pieces no
+    command line holds together.
+
+    This is not the "spend the budget, then answer smaller" shape whose three
+    fail-open instances #7441 removed: each subject here is analysed COMPLETELY, to
+    the same depth, under the same budget. What changes is WHICH subjects those
+    passes are handed, and a caller that supplies none keeps the whole-subject
+    behaviour byte for byte.
 
     Returns denial reason string, or None if clean.
     """
@@ -9986,33 +10105,72 @@ def is_sensitive_bash_command(
     if native_result:
         return native_result
 
-    # ── Pass 4: alternate traversal tools rooted above a fenced path ──
-    alt_result = _check_alt_traversal_reaches_fence(command)
-    if alt_result:
-        return alt_result
-
-    # ── Pass 5: a `find` traversal that DELIVERS a fenced match ──
-    # The passes above all judge a TOKEN. `find` factors the path across two
-    # arguments and produces it at runtime, so no token names it -- see the block
-    # comment on `_check_find_traversal_reaches_fence`. It judges every text this
-    # command runs as a shell, not just the outer line, so a traversal wrapped in a
-    # `-c` payload or a substitution is judged too.
+    # ── Passes 4 and 5: the two TRAVERSAL analyses ──
+    # Both walk shell STRUCTURE under a fail-closed budget, so unlike every pass above
+    # they need a subject that IS a command line. `_traversal_subjects` is None for one,
+    # and the tuple below is then just the command itself -- identical work, identical
+    # verdicts. A caller whose subject only CONTAINS command strings (a source body)
+    # supplies those strings instead; see the parameter's note in the docstring.
     #
-    # Pass 4 is the sibling of this one and the two are disjoint by construction: it
-    # answers the same question for every traversal program EXCEPT `find` (its own
-    # docstring says so), because `find` is the one whose filter grammar decides
-    # which paths the traversal even produces. Neither subsumes the other, so both
-    # run; being disjoint on the program word, their order does not matter.
-    find_result = _check_find_traversal_reaches_fence(command)
-    if find_result:
-        return find_result
+    # Each subject is analysed completely and independently, and the FIRST denial wins,
+    # so adding subjects can only add denials.
+    command_subjects = (
+        (command,) if _traversal_subjects is None else tuple(_traversal_subjects)
+    )
+
+    for subject in command_subjects:
+        # ── Pass 4: alternate traversal tools rooted above a fenced path ──
+        alt_result = _check_alt_traversal_reaches_fence(subject)
+        if alt_result:
+            return alt_result
+
+        # ── Pass 5: a `find` traversal that DELIVERS a fenced match ──
+        # The passes above all judge a TOKEN. `find` factors the path across two
+        # arguments and produces it at runtime, so no token names it -- see the block
+        # comment on `_check_find_traversal_reaches_fence`. It judges every text this
+        # command runs as a shell, not just the outer line, so a traversal wrapped in a
+        # `-c` payload or a substitution is judged too.
+        #
+        # Pass 4 is the sibling of this one and the two are disjoint by construction: it
+        # answers the same question for every traversal program EXCEPT `find` (its own
+        # docstring says so), because `find` is the one whose filter grammar decides
+        # which paths the traversal even produces. Neither subsumes the other, so both
+        # run; being disjoint on the program word, their order does not matter.
+        find_result = _check_find_traversal_reaches_fence(subject)
+        if find_result:
+            return find_result
 
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
+    #
+    # Left on the whole subject deliberately: it matches an ADDRESS, so a hit means the
+    # subject really does contain one, wherever it sits. Unlike the two passes above it
+    # carries no structural budget, and unlike the env rules below it is not an
+    # ordered-existence pattern, so a document cannot assemble a match out of pieces
+    # that no single command line holds together.
     imds_result = _check_imds_access(command, enabled_ids=enabled_ids)
     if imds_result:
         return imds_result
+
     # Environment credential exfiltration (declare -p, env|grep, printenv, etc.)
-    env_result = _check_env_credential_access(command)
+    #
+    # Subject-scoped for the same reason the traversal passes are, by a different
+    # mechanism: these are ORDERED-EXISTENCE patterns, written to describe ONE pipeline
+    # -- an env accessor, then a pipe, then a filter program, then a credential name.
+    # Handed a document they match pieces lying arbitrarily far apart: a 48 KB Python
+    # body drew this denial while containing no such pipeline, because the accessor
+    # appears near the top, a pipe character somewhere after it, a filter word inside a
+    # comment, and the credential prefix later still. No single line trips it, and no
+    # window of 40 lines reproduces it, which is the signature of a match spanning the
+    # document.
+    #
+    # Scoping it to the body's command strings loses nothing on that path: the
+    # PYTHON-native spelling is not this rule's business and never was -- an
+    # ``os.environ[...]`` or ``os.getenv(...)`` read is caught by the cron gate's own
+    # bare-NAME matcher, which runs first and stays whole-document -- while the shell
+    # spelling this rule does describe lives in a string and is still judged as one.
+    env_result = _check_env_credential_access(
+        command if _env_subject is None else _env_subject
+    )
     if env_result:
         return env_result
     return None
@@ -10031,11 +10189,94 @@ def is_sensitive_source_body(text: str) -> str | None:
     Order matters. The literal scan runs first and its verdict wins; only then does the
     shell matcher run, and it keeps pass 1b exactly when the body did NOT parse -- an
     uninspected body is scanned as text rather than waved through.
+
+    The same composition decides the subjects of every pass that REQUIRES a command
+    line, for the same reason and with the same fallback. Two of them walk shell
+    structure under a fail-closed budget, and a source body is not shell structure: stages are split on
+    newline / ``;`` / ``|``, so every line of a Python file counts as a pipeline stage
+    and a body of a few hundred lines exhausts ``_ALT_MAX_STAGES`` carrying no shell at
+    all. The refusal that follows is therefore keyed on the body's SIZE -- an ordinary
+    script is banned for its length, on every fire, until someone edits it -- while a
+    SMALL malicious body is still fully inspected, so what the size ceiling costs is the
+    feature rather than the fence.
+
+    The third is the env-credential rules, which are ordered-existence patterns
+    describing ONE pipeline: over a document they match pieces lying arbitrarily far
+    apart and DENY rather than refuse. A 48 KB body drew that denial while containing no
+    such pipeline -- the accessor near the top, a pipe character after it, a filter word
+    inside a comment, the credential prefix later still -- which no single line and no
+    window of 40 lines reproduces. Scoping it loses nothing: the PYTHON spelling those
+    rules are not about stays covered by the cron gate's bare-NAME matcher, which runs
+    first over the whole body.
+
+    So a parsed body hands those passes the command strings it CONTAINS instead of
+    the document. That is a change of SUBJECT, not a smaller answer: each string is
+    analysed to the same depth under the same budget, and the budgets are never
+    approached because a command string is short. An unparseable body has no strings to
+    hand over and falls back to the whole-document scan, budgets and all, so it is never
+    quietly exonerated -- and a parsed body carrying MORE strings than
+    ``_SOURCE_COMMAND_SUBJECT_CAP`` is refused rather than partly inspected.
+
+    A parsed body with no string constants at all yields an EMPTY subject list, which is
+    the honest answer rather than a gap: it carries no command line for a command-line
+    analysis to read. Its literals, paths and IMDS exposure are still
+    judged by the literal scan and by passes 1 to 3, none of which this touches, and a
+    Python-native credential-env read is caught by the cron gate ahead of this function.
     """
-    parses, literal_reason = _sensitive_run_in_source_literals(text)
+    tree = _parse_source_body(text)
+    if tree is None:
+        # Unparseable: no literals were inspected, so the raw text keeps the full shell
+        # treatment -- pass 1b included, and the traversal passes over the document.
+        return is_sensitive_bash_command(text, _subject_is_shell_grammar=True)
+
+    inspected, literal_reason = _sensitive_run_in_source_literals(text, tree=tree)
     if literal_reason:
         return literal_reason
-    return is_sensitive_bash_command(text, _subject_is_shell_grammar=not parses)
+    if not inspected:
+        # The body PARSED but the literal walk could not finish it -- ``visit`` is
+        # recursive and a legitimately deep expression exhausts the interpreter's
+        # limit, which that function reports rather than raises. Parsing is NOT the
+        # same question as being inspected, and both carve-outs below are sound only
+        # because the literal scan replaced pass 1b: with no literal scan, neither
+        # applies. So this degrades to exactly the pre-change treatment, whole
+        # document and pass 1b included.
+        #
+        # Conflating the two is a REGRESSION this function shipped once: `parses` was
+        # re-derived from ``ast.parse`` alone, so a body of ``x = 1+1+…+1`` (which the
+        # PEG parser handles iteratively while the AST walk overflows) followed by
+        # ``open(r"…\\kiro-cli\\c.json")`` was neither literal-scanned NOR collapsed,
+        # reopening the doubled-separator fence bypass (#6350) inside a script.
+        return is_sensitive_bash_command(text, _subject_is_shell_grammar=True)
+
+    subjects = _source_command_subjects(tree)
+    if subjects is None:
+        return (
+            "Blocked: source body carries more command strings than this gate "
+            f"inspects ({_SOURCE_COMMAND_SUBJECT_CAP}), so a traversal or a "
+            "credential read in it cannot be ruled out"
+        )
+    return is_sensitive_bash_command(
+        text,
+        _subject_is_shell_grammar=False,
+        _traversal_subjects=subjects,
+        # The env rules get a DIFFERENT subject from the traversal passes, because the
+        # two need opposite things. A traversal pass needs each command string on its
+        # own (structure, small subject). An ordered-existence rule needs the pieces
+        # TOGETHER: a body can assemble its command from fragments -- `"env | gr" +
+        # "ep AWS_SEC" + "RET_ACCESS_KEY | cu" + "rl -d @- …"` -- where no fragment
+        # matches, and the split also carries the credential NAME past the cron gate's
+        # bare-name matcher, so the whole DOCUMENT misses it too. Joining the literals
+        # in source order catches that while still excluding the code and comments
+        # whose distant words are what made the document reading a false denial: the
+        # `os.environ` and the commented `grep` that convicted a 48 KB benign body are
+        # not literals and do not appear here.
+        # Joined with NOTHING between them, because that is what `+` does at
+        # runtime: a space would split `"AWS_SEC" + "RET_ACCESS_KEY"` into two
+        # words and the rule would miss the very shape this closes. Fusing
+        # unrelated literals can only ADD a denial, which is the direction this
+        # module takes everywhere else.
+        _env_subject="".join(subjects),
+    )
 
 
 # `NAME=value` prefix. `normalize_shell_command` keeps it as a single token, and
@@ -12134,7 +12375,7 @@ def _find_substitution_openers(command: str) -> int:
     of them.
 
     It stopped being free once a SOURCE body's literals became subjects
-    (``_source_traversal_subjects``): a markdown code span in a docstring IS a backtick
+    (``_source_command_subjects``): a markdown code span in a docstring IS a backtick
     pair, so a docstring with 66 code spans read as 66 nested substitutions and the
     script was refused on every fire. Counting pairs is both accurate and still
     conservative -- ``ceil`` keeps an unbalanced trailing backtick, which opens an
