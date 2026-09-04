@@ -286,10 +286,16 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
   community packs plus `semgrep/`, with `--error`. The fixtures are listed in
   `.semgrepignore` so the deliberately vulnerable fixture code is never read by
   the scan. Blocking.
-- **`dep-audit`** calls the reusable `dependency-vulnerability.yml`, which runs
+- The production dependency audit (`dependency-vulnerability.yml`, which runs
   `scripts/check_npm_audit.py` over every lockfile-backed Node project and fails
-  closed on **high or critical production** vulnerabilities. Time-boxed exceptions
-  live in `.vulnerability-exceptions.json`.
+  closed on **high or critical production** vulnerabilities) is **not** a PR
+  job, nor a nightly one. It reaches the npm registry, whose slow hours made it
+  the one red X on otherwise-green PRs and then failed nightlies for hours at a
+  stretch; it runs before every release build instead, where a vulnerable
+  dependency would actually ship. Time-boxed exceptions live in
+  `.vulnerability-exceptions.json`, and a registry stall or connection fault is
+  retried inside one shared time budget before it fails (see the
+  transient-failure contract in the security spec).
 - **`pr-hygiene`** enforces a Conventional-Commits PR title (it becomes the
   squash-merge message) and at most two commits (`git rev-list --count <= 2`).
   One commit stays the norm; the second is there so a mechanical follow-up (a

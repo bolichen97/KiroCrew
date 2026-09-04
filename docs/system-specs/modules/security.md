@@ -413,11 +413,15 @@ pinned SHA.
 
 ### Production npm Vulnerability Gate (`scripts/check_npm_audit.py`)
 
-Pull requests, tagged releases, and nightly releases share one blocking production-dependency
-control in `.github/workflows/dependency-vulnerability.yml`. The PR caller remains a job in
-`code-review.yml`, so a failure contributes to the existing `Code Review` conclusion consumed by
-`PR Readiness`. Release and nightly wheel and desktop builds both depend directly on the gate;
-all publish, sign, and GitHub Release jobs are therefore transitively unreachable when it fails.
+Tagged releases run one blocking production-dependency control in
+`.github/workflows/dependency-vulnerability.yml`. It deliberately does NOT run per pull request or
+per nightly: the audit reaches the npm registry, whose slow hours made it the one red X on
+otherwise-green PRs (re-run by hand until it passed) and then failed the nightly for hours at a
+stretch, blocking every build behind it — and a gate people learn to re-run until green is not a
+gate. It runs where a vulnerable dependency would actually ship: before every release build, so
+nothing vulnerable is published, and a PR that adds or bumps a dependency is checked by the release
+that would carry it. Release wheel and desktop builds depend directly on the gate; all publish,
+sign, and GitHub Release jobs are therefore transitively unreachable when it fails.
 
 The gate audits all lockfile-backed Node applications independently:
 
@@ -430,8 +434,25 @@ CI pins Node `24.19.0`, then invokes the exact npm package `npm@10.8.2` through 
 installs project packages nor runs project lifecycle scripts. High and critical production
 findings block; information, low, moderate, and development-only findings do not.
 
-**Fail-closed contract.** A missing `npx`, missing manifest or lockfile, timeout, subprocess error,
-exit status other than npm's documented audit-result statuses 0/1, empty or malformed JSON, npm
+**Transient-failure contract.** The audit is an idempotent read, so a stall or connection fault is
+retried rather than failed on the first try. The pinned npm is resolved once up front
+(`npx --yes npm@10.8.2 --version`, verified to print exactly the pinned version) so the download a
+cold runner pays is never charged against an audit's own timeout. Each attempt is bounded by
+`AUDIT_TIMEOUT_SECONDS` (180s); an attempt that times out, raises a subprocess error, or exits with
+a status other than npm's documented audit results 0/1 **and** carries one of npm's connection-level
+markers on stderr (`ETIMEDOUT`, `ECONNRESET`, `EAI_AGAIN`, `E503`, ... — `TRANSIENT_STDERR_MARKERS`)
+is retried up to `AUDIT_ATTEMPTS` (3) times with a short backoff. Every attempt of every audit in a
+run draws on one shared wall-clock budget (`AUDIT_TOTAL_BUDGET_SECONDS`, 720s, under the job's 15-minute ceiling): no attempt gets
+more than the time left, and no retry starts unless the budget still holds its backoff plus a full
+attempt's ceiling, so retries cannot outgrow the job's own `timeout-minutes`. Exit 0/1 are never treated as transient
+whatever stderr says (1 is the audit answering "vulnerable"), and every other failure below is
+definitive and never retried. Exhausting the attempts or the budget fails closed, naming the attempt
+count so a persistent registry outage reads as one rather than as a flaky gate.
+
+**Fail-closed contract.** A missing `npx`, missing manifest or lockfile, a warm-up that does not
+yield the pinned npm, a transient failure that outlives the retries or the budget, a non-transient
+subprocess error, an exit status other than npm's documented audit-result statuses 0/1, empty or
+malformed JSON, npm
 `error` response, unsupported audit report version, inconsistent counts/status, broken advisory
 reference, or high/critical record without a stable advisory identity fails the job. Exit 1 is
 accepted only with a structurally valid report that contains high/critical findings. String `via`

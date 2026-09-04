@@ -198,7 +198,7 @@ jobs:
       # Dependabot PRs run with a read-only token and NO access to repo
       # secrets / OIDC, so the AWS role assumption can never succeed. Skip the
       # credential + review steps and let the gate pass; dependency bumps stay
-      # covered by Semgrep, Dependency Audit, CodeQL and the build/tests.
+      # covered by Semgrep, CodeQL, the nightly/release Dependency Audit and the build/tests.
       - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
