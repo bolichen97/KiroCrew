@@ -6515,6 +6515,7 @@
       "closed": "クローズ",
       "commits": "コミット",
       "confirm_auto_merge": "自動マージを確認",
+      "could_not_refresh_showing_cached": "更新できませんでした — 最後に読み込んだ内容を表示しています",
       "could_not_load_this_pull_request": "このプルリクエストを読み込めませんでした",
       "description": "説明",
       "draft": "ドラフト",

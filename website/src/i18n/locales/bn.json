@@ -6617,6 +6617,7 @@
       "closed": "বন্ধ",
       "commits": "কমিট",
       "confirm_auto_merge": "অটো-মার্জ নিশ্চিত করো",
+      "could_not_refresh_showing_cached": "রিফ্রেশ করা যায়নি — শেষ লোড করা সংস্করণ দেখানো হচ্ছে",
       "could_not_load_this_pull_request": "এই পুল রিকোয়েস্ট লোড করা যায়নি",
       "description": "বিবরণ",
       "draft": "ড্রাফট",

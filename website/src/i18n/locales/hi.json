@@ -6617,6 +6617,7 @@
       "closed": "बंद",
       "commits": "कमिट",
       "confirm_auto_merge": "ऑटो-मर्ज की पुष्टि करें",
+      "could_not_refresh_showing_cached": "रीफ़्रेश नहीं हो सका — पिछला लोड किया गया संस्करण दिखाया जा रहा है",
       "could_not_load_this_pull_request": "यह पुल रिक्वेस्ट लोड नहीं हो सका",
       "description": "विवरण",
       "draft": "ड्राफ़्ट",

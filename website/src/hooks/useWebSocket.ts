@@ -17,6 +17,7 @@ import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
+import { slotChangeUrls } from '../utils/pullRequestLinks'
 import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
 
@@ -1760,16 +1761,41 @@ export function useWebSocket() {
               // Turn boundary: the finished turn is the likeliest moment for
               // this session's PRs to have moved (comments, mergeability, a
               // pushed revision) — changes the lightweight status delta does NOT
-              // carry. Invalidate the detail/status queries so they refetch.
-              // For the ACTIVE slot, refetch now (the panel is on screen). For a
-              // BACKGROUND slot, only MARK stale (refetchType: 'none'): its
-              // detail query is staleTime:Infinity, so without this it would stay
-              // "fresh" forever and render pre-turn data when the user later
-              // switches to it — but refetching an off-screen PR every background
-              // turn would be wasteful, so defer the fetch to its next mount.
+              // carry. Invalidate the detail queries of THIS slot's own pull
+              // requests so they refetch. For the ACTIVE slot, refetch now (the
+              // panel is on screen). For a BACKGROUND slot, only MARK stale
+              // (refetchType: 'none'): its detail query is staleTime:Infinity,
+              // so without this it would stay "fresh" forever and render
+              // pre-turn data when the user later switches to it — but
+              // refetching an off-screen PR every background turn would be
+              // wasteful, so defer the fetch to its next mount.
+              //
+              // Scoped to the slot's own links, never the whole key family: an
+              // unscoped invalidation marked EVERY session's PR stale on EVERY
+              // turn anywhere, so a panel reopened while any chat was running
+              // always refetched (five provider subprocesses per open) even
+              // though nothing about that PR had changed.
+              //
+              // The ACTIVE slot additionally refetches whatever detail query is
+              // MOUNTED — the PR on screen: the slots payload names only the
+              // first few chips, so a session with more PRs than chips could
+              // otherwise have the very PR the user is looking at fall outside
+              // the scoped set. `refetchQueries` with `type: 'active'` is the
+              // primitive for that: it refetches the mounted queries only and
+              // marks nothing else stale. (`invalidateQueries` with
+              // `refetchType: 'active'` would NOT do — refetchType limits only
+              // the refetch, the stale marking still hits every cached PR.) A
+              // background slot's overflow PRs are left to the status-delta
+              // path (lifecycle / CI / merge pair); their comments may lag until
+              // the next event or remount.
               const isActive = data.slot === store.getState().chat.activeSlot
               const refetchType = isActive ? 'active' : 'none'
-              queryClient.invalidateQueries({ queryKey: ['pull-request-source'], refetchType })
+              if (isActive) {
+                void queryClient.refetchQueries({ queryKey: ['pull-request-source'], type: 'active' })
+              }
+              for (const url of slotChangeUrls(store.getState().dashboard.slots, data.slot)) {
+                queryClient.invalidateQueries({ queryKey: ['pull-request-source', url], refetchType: 'none' })
+              }
               queryClient.invalidateQueries({ queryKey: ['pull-request-statuses'], refetchType })
             }
             if ((!autoSpeakRef.current || voiceMutedRef.current) && data.slot === store.getState().chat.activeSlot) {

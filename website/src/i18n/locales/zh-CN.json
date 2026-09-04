@@ -6515,6 +6515,7 @@
       "closed": "已关闭",
       "commits": "提交",
       "confirm_auto_merge": "确认自动合并",
+      "could_not_refresh_showing_cached": "无法刷新——显示上次加载的版本",
       "could_not_load_this_pull_request": "无法加载此拉取请求",
       "description": "描述",
       "draft": "草稿",

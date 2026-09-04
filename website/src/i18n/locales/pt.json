@@ -6719,6 +6719,7 @@
       "closed": "Fechado",
       "commits": "Commits",
       "confirm_auto_merge": "Confirmar merge automático",
+      "could_not_refresh_showing_cached": "Não foi possível atualizar — mostrando a última versão carregada",
       "could_not_load_this_pull_request": "Não foi possível carregar este pull request",
       "description": "Descrição",
       "draft": "Rascunho",

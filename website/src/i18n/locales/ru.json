@@ -6821,6 +6821,7 @@
       "closed": "Закрыт",
       "commits": "Коммиты",
       "confirm_auto_merge": "Подтвердить автослияние",
+      "could_not_refresh_showing_cached": "Не удалось обновить — показана последняя загруженная версия",
       "could_not_load_this_pull_request": "Не удалось загрузить этот пул-реквест",
       "description": "Описание",
       "draft": "Черновик",

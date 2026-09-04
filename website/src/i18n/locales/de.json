@@ -6617,6 +6617,7 @@
       "closed": "Geschlossen",
       "commits": "Commits",
       "confirm_auto_merge": "Auto-Merge bestätigen",
+      "could_not_refresh_showing_cached": "Aktualisierung fehlgeschlagen – letzte geladene Version wird angezeigt",
       "could_not_load_this_pull_request": "Dieser Pull Request konnte nicht geladen werden",
       "description": "Beschreibung",
       "draft": "Entwurf",

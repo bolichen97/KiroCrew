@@ -2093,6 +2093,7 @@
       "checks_unavailable": "Checks unavailable",
       "commits": "Commits",
       "confirm_auto_merge": "Confirm auto-merge",
+      "could_not_refresh_showing_cached": "Couldn't refresh — showing the last loaded version",
       "could_not_load_this_pull_request": "Could not load this pull request",
       "description": "Description",
       "enable_auto_merge": "Enable auto-merge",

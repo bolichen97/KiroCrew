@@ -6719,6 +6719,7 @@
       "closed": "Chiusa",
       "commits": "Commit",
       "confirm_auto_merge": "Conferma il merge automatico",
+      "could_not_refresh_showing_cached": "Impossibile aggiornare: viene mostrata l'ultima versione caricata",
       "could_not_load_this_pull_request": "Impossibile caricare questa pull request",
       "description": "Descrizione",
       "draft": "Bozza",
