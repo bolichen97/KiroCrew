@@ -372,6 +372,7 @@ from .redaction import (
     get_credential_patterns,
     redact_credentials,
     redact_local_paths,
+    redact_path_segments,
 )
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
