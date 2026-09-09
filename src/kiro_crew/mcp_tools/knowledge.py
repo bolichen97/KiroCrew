@@ -56,7 +56,11 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max results to return (default 3, max 5)",
+                        "description": (
+                            "Max results to return (default 3, max 5). One extra "
+                            "result may be appended when an exact-keyword match "
+                            "would otherwise be dropped."
+                        ),
                         "default": 3,
                     },
                     "source_id": {
