@@ -56,7 +56,10 @@ from kiro_crew.dashboard import (
     tailnet,
     tailnet_serve,
 )
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_utils import (
+    effective_session_key,
+    wire_session_subagent_probe,
+)
 from kiro_crew.dashboard.crash_dump_store import (
     claim_dump_notification,
     dump_age_seconds,
@@ -2757,6 +2760,48 @@ def _kick_session_search_index(state: DashboardState) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
+def _kick_knowledge_orphan_reclaim(state: DashboardState) -> None:
+    """Run the knowledge store's orphan sweep as a tracked background task, post-bind.
+
+    ``KnowledgeStore.reclaim_orphans`` is data-scaled and takes SQLite's writer
+    lock; run inside the constructor, on the event loop, before the socket
+    bound, a large store stalls boot long enough for the runtime's timeouts to
+    kill the gateway. Called only after ``_start_site``
+    has returned, and the sweep itself runs on a worker thread (the store's
+    connection is thread-local, so the worker gets its own), never on the loop.
+
+    Only a store that construction already built is swept: ``setup_knowledge_routes``
+    reads the lazy ``knowledge_store`` property at route registration, so on the
+    dashboard entrypoint one always exists. Building one here would be new work
+    on the boot path for an entrypoint that never registered the routes.
+
+    Requests are being served while the sweep waits for its worker, and an
+    ingest in progress is committed in several steps (source row, job, items,
+    mentions), each of which reads as an orphan to the sweep's predicates. The
+    sweep therefore runs inside the store's ``maintenance_window``: it waits
+    for in-flight ingestion to drain, holds new ingestion off while it runs,
+    and is skipped (logged, never forced) if ingestion does not drain in time.
+    """
+
+    def _reclaim_in_thread() -> None:
+        store = state._knowledge_store
+        if store is None:
+            return
+        with store.maintenance_window() as quiescent:
+            if quiescent:
+                store.reclaim_orphans()
+
+    async def _knowledge_orphan_reclaim() -> None:
+        try:
+            await asyncio.to_thread(_reclaim_in_thread)
+        except Exception:  # noqa: BLE001 -- hygiene must never take the gateway down
+            logger.warning("Knowledge store orphan reclaim failed", exc_info=True)
+
+    task = asyncio.create_task(_knowledge_orphan_reclaim())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _register_browser_view_cleanup(app: web.Application, state: DashboardState) -> None:
     """Stop the CLI dashboard process when the gateway shuts down.
 
@@ -3716,6 +3761,9 @@ async def start_dashboard(
     state.wire_session_compact_callback()
     # Visible notice when the watchdog recycles a dashboard session (e.g. RSS)
     state.wire_session_recycle_callback()
+    # The RSS ceiling must not recycle a parent whose sub-agents are still
+    # running on its runtime; the manager cannot see them without this probe.
+    wire_session_subagent_probe(state)
     # Visible notice in a channel that just lost its session-resume binding
     state.wire_session_unbind_listener()
 
@@ -4373,6 +4421,10 @@ async def start_dashboard(
     _kick_connections_warm_scavenge(state)
     _kick_session_search_index(state)
     _kick_config_watch(app, state)
+    # Same shape for the knowledge store's writer-locked orphan sweep: it left
+    # the constructor (which runs pre-bind, on the loop) and runs here on a
+    # worker thread once requests are already being served.
+    _kick_knowledge_orphan_reclaim(state)
 
     # Event-loop heartbeat: proves the asyncio loop is live (the off-loop /proc
     # sampler can't — it runs in a subprocess). Sleeps 10s, then logs actual
@@ -4881,6 +4933,9 @@ async def start_api_server(
     state.wire_session_compact_callback()
     # Visible notice when the watchdog recycles a dashboard session (e.g. RSS)
     state.wire_session_recycle_callback()
+    # The RSS ceiling must not recycle a parent whose sub-agents are still
+    # running on its runtime; the manager cannot see them without this probe.
+    wire_session_subagent_probe(state)
     # Visible notice in a channel that just lost its session-resume binding
     state.wire_session_unbind_listener()
 

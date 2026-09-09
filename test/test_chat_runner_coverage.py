@@ -2438,7 +2438,9 @@ class TestScheduleEagerSpawn:
 
 class TestCapArmedPrefetches:
     @pytest.mark.asyncio
-    async def test_eviction_failure_still_drops_the_registry_entry(self, tmp_path):
+    async def test_eviction_failure_keeps_the_registry_entry(self, tmp_path):
+        """A removal that raises leaves its entry registered: the process is
+        still live, so it still counts, and the next eviction retries it."""
         state = _state(tmp_path)
         state.sessions.remove_if_unclaimed = AsyncMock(side_effect=RuntimeError("shutdown hung"))
         chat_runner._armed_prefetches.clear()
@@ -2446,8 +2448,15 @@ class TestCapArmedPrefetches:
             for i in range(chat_runner._RESUME_PREFETCH_MAX_LIVE + 1):
                 await chat_runner._cap_armed_prefetches(state.sessions, f"key-{i}")
 
-            assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE
+            assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE + 1
+            assert "key-0" in chat_runner._armed_prefetches
+            # Only the oldest is attempted per pass; a failure stops the pass.
+            assert state.sessions.remove_if_unclaimed.await_count == 1
+
+            state.sessions.remove_if_unclaimed = AsyncMock(return_value=True)
+            await chat_runner._cap_armed_prefetches(state.sessions, "newest")
             assert "key-0" not in chat_runner._armed_prefetches
+            assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE
         finally:
             chat_runner._armed_prefetches.clear()
 

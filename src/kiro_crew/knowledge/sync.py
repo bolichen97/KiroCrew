@@ -31,22 +31,27 @@ class SyncScheduler:
     async def sync_source(self, source_id: str) -> dict:
         result: dict[str, object] = {"synced": False, "items_created": 0, "error": None}
         try:
-            source = self._get_source(source_id)
-            if not source:
-                result["error"] = f"Source {source_id} not found"
-                return result
-            # Merge connector-specific fields from properties into source dict
-            props = json.loads(source.get("properties") or "{}")
-            source = {**props, **source}
-            connector = self.get_connector(source["source_type"])
-            if not connector:
-                result["error"] = f"No connector for {source['source_type']}"
-                return result
-            if not await connector.detect_changes(source):
-                return result
-            text, meta = await connector.fetch(source)
-            job_id = await self.pipeline.ingest_text(text, source["name"], source["source_type"],
-                                                     source_id=source_id)
+            # The gate is held from the source lookup through the ingest: the
+            # connector awaits sit between the two, and an itemless row with a
+            # terminal status is reclaimable by the orphan sweep for that
+            # stretch unless the sweep is waiting on this hold.
+            async with self.pipeline.ingestion_in_flight():
+                source = self._get_source(source_id)
+                if not source:
+                    result["error"] = f"Source {source_id} not found"
+                    return result
+                # Merge connector-specific fields from properties into source dict
+                props = json.loads(source.get("properties") or "{}")
+                source = {**props, **source}
+                connector = self.get_connector(source["source_type"])
+                if not connector:
+                    result["error"] = f"No connector for {source['source_type']}"
+                    return result
+                if not await connector.detect_changes(source):
+                    return result
+                text, meta = await connector.fetch(source)
+                job_id = await self.pipeline.ingest_text(text, source["name"], source["source_type"],
+                                                         source_id=source_id)
             if not job_id:
                 return result  # unchanged, nothing to do
             job = self.pipeline.get_job_status(job_id)

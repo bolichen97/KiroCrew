@@ -164,6 +164,29 @@ def _yolo_duration_fields() -> tuple[str, bool, list[str]]:
     return label, permitted, disabled_modes
 
 
+def _gateway_memory_fields() -> tuple[int, int]:
+    """``(gateway_rss_mb, watchdog_rss_max_mb)`` for the status payload.
+
+    The live resident set of THIS process (``platform_compat.proc_rss_bytes``,
+    the same reading ``/api/system`` reports as ``proc_mem_mb``) and the
+    configured per-session tree ceiling (``session.watchdog_rss_max_mb``; ``0``
+    when disabled). Both reads can touch the filesystem, so this runs in a
+    worker thread. Each degrades independently to ``0`` — an unreadable RSS
+    must not hide the ceiling, nor the reverse.
+    """
+    try:
+        rss_mb = int(platform_compat.proc_rss_bytes() // (1024 * 1024))
+    except Exception:
+        logger.debug("could not read gateway RSS for status", exc_info=True)
+        rss_mb = 0
+    try:
+        ceiling = int(KiroCrewConfig.load().session.watchdog_rss_max_mb)
+    except Exception:
+        logger.debug("could not read session.watchdog_rss_max_mb for status", exc_info=True)
+        ceiling = 0
+    return rss_mb, max(0, ceiling)
+
+
 async def api_status(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     uptime = time.time() - state.start_time
@@ -199,6 +222,9 @@ async def api_status(request: web.Request) -> web.Response:
     yolo_duration, until_shutdown_ok, disabled_approval_modes = await asyncio.to_thread(
         _yolo_duration_fields
     )
+    # Off-loop for the same reason: the RSS read is procfs I/O on Linux and the
+    # ceiling is a config read.
+    gateway_rss_mb, watchdog_rss_max_mb = await asyncio.to_thread(_gateway_memory_fields)
     data.update(
         {
             "uptime_secs": int(uptime),
@@ -209,6 +235,12 @@ async def api_status(request: web.Request) -> web.Response:
             "update_progress": state._update_progress,
             "version": kiro_crew.__version__,
             "platform": sys.platform,
+            # The gateway's own live resident set and the per-session tree
+            # ceiling the cleanup watchdog recycles at (0 = disabled), so
+            # `kirocrew status` can show what is bounding memory without the
+            # operator opening the System page.
+            "gateway_rss_mb": gateway_rss_mb,
+            "watchdog_rss_max_mb": watchdog_rss_max_mb,
             "yolo": so_status.active,
             "yolo_active": so_status.active,
             "yolo_expires_at": so_status.expires_at_iso or "",

@@ -25,6 +25,7 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.dashboard.handlers import knowledge as kh
 from kiro_crew.embeddings import PRIORITY_NORMAL
 from kiro_crew.knowledge.embedder import embedder_signature
+from kiro_crew.knowledge.ingestion import IngestionPipeline
 from kiro_crew.knowledge.store import KnowledgeStore
 
 MODULE = "kiro_crew.dashboard.handlers.knowledge"
@@ -1477,6 +1478,33 @@ class TestIngestText:
             assert (await resp.json())["error"] == "internal server error"
         assert not Path(pipeline.ingest_file.await_args.args[0]).exists()
 
+    @pytest.mark.asyncio
+    async def test_the_gate_is_held_from_the_lookup_through_the_ingest(self, store, monkeypatch):
+        """The body read is an await between the source lookup and the ingest,
+        and the handler holds the store's ingestion gate across it: a
+        maintenance window cannot open while the body is in flight, and can
+        once the request has answered."""
+        sid = store.add_source("s", "web", "https://example.com")
+        store.update_source(sid, sync_status="error")
+        pipeline = IngestionPipeline.__new__(IngestionPipeline)
+        pipeline.store = store
+        pipeline.ingest_file = AsyncMock(return_value="job-9")
+        seen: list[bool] = []
+
+        async def _body_read(request, max_bytes=None):
+            with store.maintenance_window(timeout=0.05) as quiescent:
+                seen.append(quiescent)
+            return {"text": "hello"}, None
+
+        monkeypatch.setattr(kh, "read_bounded_json", _body_read)
+        async with _client(_make_app(store, pipeline=pipeline)) as client:
+            resp = await client.post(f"/api/knowledge/sources/{sid}/ingest-text",
+                                     json={"text": "hello"})
+            assert resp.status == 200
+        assert seen == [False], "the maintenance window opened during the body read"
+        with store.maintenance_window(timeout=0.05) as quiescent:
+            assert quiescent is True, "the gate stayed held after the request answered"
+
 
 # --------------------------------------------------- source delete / agent sync
 
@@ -1553,7 +1581,10 @@ class TestSyncSourceAgentBranch:
         sid = store.add_source("s", "web", "", properties={"url": "https://e.test/a"})
         seen = {}
 
-        async def _fake_sync(source_id, url, name, st, pipeline, pool):
+        async def _fake_sync(source_id, url, name, st, pipeline, pool, *, claim_settled=None):
+            # The handler holds the ingestion gate until the task reports its claim.
+            if claim_settled is not None:
+                claim_settled.set()
             seen["url"] = url
 
         monkeypatch.setattr(f"{MODULE}._background_agent_sync", _fake_sync)
@@ -1587,7 +1618,10 @@ class TestSyncSourceAgentBranch:
         sid = store.add_source("s", "web", "https://e.test/a")
         ran = asyncio.Event()
 
-        async def _fake_sync(source_id, url, name, st, pipeline, pool):
+        async def _fake_sync(source_id, url, name, st, pipeline, pool, *, claim_settled=None):
+            # The handler holds the ingestion gate until the task reports its claim.
+            if claim_settled is not None:
+                claim_settled.set()
             ran.set()
 
         monkeypatch.setattr(f"{MODULE}._background_agent_sync", _fake_sync)

@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NoReturn
 
 from kiro_crew import __version__, dep_sync, platform_compat
 from kiro_crew.beacon import distribution, is_default_home
@@ -44,6 +45,7 @@ from kiro_crew.embeddings import (
 )
 from kiro_crew.env import activate_mise
 from kiro_crew.frontend import build_frontend_sync, ensure_dev_dist_symlink
+from kiro_crew.gateway_lock import LockProbeError, lock_holder
 from kiro_crew.git_divergence import (
     UNREADABLE_UNPARSEABLE,
     DivergenceUnreadable,
@@ -323,8 +325,10 @@ _SHUTDOWN_RESPONSE_MAX_BYTES = 4096
 def _request_gateway_shutdown(port: int) -> bool:
     """Request graceful shutdown through the gateway's self-authenticating API.
 
-    This is the safe fallback when the platform listener lookup is available but
-    returns no pid. The request targets a fixed IPv4 loopback URL and presents
+    This is the safe fallback when the platform listener lookup returns no pid,
+    whether because nothing listens on TCP or because the lookup tool itself is
+    unavailable -- the request needs no port tool. The request targets a fixed
+    IPv4 loopback URL and presents
     the per-generation local secret; the handler independently requires both
     loopback origin and a constant-time secret match before setting the same
     shutdown event as SIGTERM.
@@ -409,6 +413,40 @@ def _stop(cli_port: int | None = None) -> None:
     pids = platform_compat.find_listening_pids(port)
 
     if not pids:
+        # Neither fallback below needs the port tool, so both run BEFORE the
+        # tool-absent exit: a live gateway is stopped through its API or its
+        # lock file whether or not `lsof`/`netstat` can be trusted, and the
+        # tool diagnostic is reserved for the case where nothing else found a
+        # gateway either. Graceful API first -- it signals no guessed pid.
+        if _report_authenticated_shutdown(port):
+            return
+        # The port probe found nothing, but the port probe is not how a gateway
+        # is actually kept single-instance — the gateway.lock flock is (see
+        # gateway_lock.py). A gateway bound to a unix socket only, or one whose
+        # listener the port probe missed, still holds that lock; refusing here
+        # would tell the operator "nothing running" the same turn `kirocrew
+        # gateway` refuses to start because the lock IS held. Fall back to the
+        # lock-owner oracle before giving up.
+        try:
+            holder = lock_holder(config_dir())
+        except LockProbeError as exc:
+            # Indeterminate is neither "free" nor "held": signalling the pid the
+            # file records could hit an unrelated process that reused the number.
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_stop",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} reason=lock_probe_indeterminate",
+            )
+            print(f"❌ {exc}. Not signalling anything; check the file and retry.")
+            sys.exit(1)
+        if holder.pid is not None and holder.alive:
+            # A live holder is never signalled from here, whoever it is: the
+            # lock proves a gateway is up, not that the pid it names is one
+            # this command may stop or has confirmed the state of. Name the
+            # holder and the manual step instead.
+            _refuse_lock_holder("gateway_stop", port, holder.pid)
         # Distinguish "lookup tool absent" from "genuinely no listener":
         # find_listening_pids folds a missing lsof into an empty list, so without
         # this a running gateway would be mis-reported as stopped (and _restart
@@ -442,8 +480,6 @@ def _stop(cli_port: int | None = None) -> None:
                     f"port {port}. Install {_tool} and retry."
                 )
             sys.exit(1)
-        if _report_authenticated_shutdown(port):
-            return
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
@@ -542,6 +578,79 @@ def _stop(cli_port: int | None = None) -> None:
         sys.exit(1)
 
 
+def _manual_stop_command(pid: int) -> str:
+    """The command an operator runs to stop *pid* by hand on this platform."""
+    if platform_compat.IS_WINDOWS:
+        return f"taskkill /PID {pid} /T"
+    return f"kill -TERM {pid}"
+
+
+def _refuse_if_lock_held(operation: str, port: int) -> None:
+    """Refuse *operation* unless ``gateway.lock`` is positively free.
+
+    A live holder is refused and named (:func:`_refuse_lock_holder`); an
+    indeterminate probe is refused too, since "free" is the one answer that
+    would let a second writer spawn. Returns only when the lock is free.
+    """
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError as exc:
+        sel().log_api_access(
+            caller="cli",
+            operation=operation,
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=lock_probe_indeterminate",
+        )
+        print(f"❌ {exc}. Not signalling anything and not starting a replacement.")
+        sys.exit(1)
+    if holder.pid is not None and holder.alive:
+        _refuse_lock_holder(operation, port, holder.pid)
+
+
+def _refuse_lock_holder(operation: str, port: int, pid: int) -> NoReturn:
+    """Refuse *operation* because ``gateway.lock`` is held by the live *pid*.
+
+    Reached when the port lookup found nothing and the authenticated shutdown
+    got no answer, yet the lock says a gateway is up. The lock is the oracle
+    for "is something running" -- without it ``kirocrew stop`` and ``kirocrew
+    restart`` report "nothing running" the same moment ``kirocrew gateway``
+    refuses to start for a live pid. It is NOT a path to signal through: a
+    Kiro Crew holder that neither the port nor the API could reach is in a
+    state this command cannot verify, and a foreign holder is not this
+    command's to stop. Both are refused the same way -- one SEL ``denied``
+    event whose reason names the kind of holder, a refusal that names the
+    lock path, the pid and the exact manual command, exit 1 -- and nothing is
+    signalled.
+    """
+    kirocrew = _is_kirocrew_process(pid)
+    kind = "kirocrew" if kirocrew else "foreign"
+    sel().log_api_access(
+        caller="cli",
+        operation=operation,
+        outcome="denied",
+        source="cli",
+        resources=f"pids=[{pid}] port={port} reason=lock_holder_{kind}",
+    )
+    lock_path = config_dir() / "gateway.lock"
+    manual = _manual_stop_command(pid)
+    tail = "\n   Not starting a replacement." if operation == "gateway_restart" else ""
+    if kirocrew:
+        print(
+            f"❌ {lock_path} is held by pid {pid}: a Kiro Crew gateway is running, but "
+            f"the port lookup and the authenticated shutdown could not reach it, so it is "
+            f"not signalled from here.\n"
+            f"   To stop it manually, run: {manual}{tail}"
+        )
+    else:
+        print(
+            f"❌ {lock_path} is held by pid {pid}, but it does not look like a Kiro Crew "
+            f"gateway process — refusing to stop it. If this is wrong, stop it manually: "
+            f"{manual}{tail}"
+        )
+    sys.exit(1)
+
+
 def _stop_mcp_gateway_daemon() -> None:
     """Take the MCP gateway daemon down with the gateway it served.
 
@@ -612,6 +721,52 @@ def _wait_for_pids_exit(pids: list[int], timeout: float) -> list[int]:
         if not alive or time.monotonic() >= deadline:
             return alive
         time.sleep(0.1)
+
+
+def _incumbent_from_lock_holder(port: int, *, shutdown_acknowledged: bool) -> list[int]:
+    """Name the gateway :func:`_restart` must outwait when the port lookup cannot.
+
+    ``_stop`` has just run without naming a pid: with ``lsof``/``netstat``
+    unavailable the port lookup is blind, so ``_stop`` requests a graceful
+    shutdown over the authenticated API and returns. The incumbent is now
+    exiting but still owns ``gateway.lock`` until its teardown finishes.
+    Waiting on an empty pid list returns at once, and a replacement spawned at
+    that moment loses the lock race to the exiting incumbent, exits, and
+    leaves NO gateway once the incumbent is gone. The lock itself knows who
+    the incumbent is, so ask it and wait on that pid with the same timeout
+    ladder as the port-lookup path.
+
+    *shutdown_acknowledged* says whether ``_stop`` returned, i.e. a gateway
+    accepted the authenticated shutdown. Only then is a live Kiro Crew holder
+    the exiting incumbent, and only then is it returned as ``[holder_pid]`` to
+    be waited on. Returns ``[]`` when the lock is free or its recorded holder
+    is dead (nothing left to outwait). Every other live holder -- a foreign
+    process, or a Kiro Crew gateway that did not acknowledge the shutdown
+    (``_stop`` has already refused it) -- is refused through
+    :func:`_refuse_lock_holder` with a ``denied`` event: the lock names the
+    pid but never makes it safe to signal or to spawn against. An
+    indeterminate probe (:class:`LockProbeError`) refuses to spawn with the
+    existing indeterminate message: spawning against a lock whose holder
+    cannot be established is the exact no-gateway outcome this guard exists
+    to prevent.
+    """
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError as exc:
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_restart",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=lock_probe_indeterminate",
+        )
+        print(f"❌ {exc}. Not signalling anything and not starting a replacement.")
+        sys.exit(1)
+    if holder.pid is None or not holder.alive:
+        return []
+    if shutdown_acknowledged and _is_kirocrew_process(holder.pid):
+        return [holder.pid]
+    _refuse_lock_holder("gateway_restart", port, holder.pid)
 
 
 def _own_console_script() -> str | None:
@@ -991,8 +1146,10 @@ def _restart(cli_port: int | None = None) -> None:
     # Also enter _stop() when the lookup tool is absent: find_listening_pids()
     # returns [] both when nothing listens AND when lsof is missing, so guarding
     # only on a truthy result would skip the stop and double-spawn a second
-    # gateway on a lsof-less POSIX host. _stop() surfaces the distinct
-    # "lsof not found" diagnostic (and exits) in that case.
+    # gateway on a lsof-less POSIX host. _stop() tries the authenticated API
+    # and the lock-holder oracle first (neither needs the tool) and surfaces
+    # the distinct "lsof not found" diagnostic (and exits) only when both find
+    # nothing.
     #
     # Capture the incumbent pids HERE, before the stop, so we can wait for them
     # afterwards: the replacement must not start while the old gateway still owns
@@ -1015,12 +1172,26 @@ def _restart(cli_port: int | None = None) -> None:
         # lookup. _stop() raises SystemExit(1) when it finds nothing — for restart
         # that's the wrong behavior. Swallow SystemExit so we always proceed to
         # spawn a fresh gateway. The user asked for a restart; an exit-before-spawn
-        # here would leave them with no running gateway at all.
+        # here would leave them with no running gateway at all. _stop() also
+        # exits when it REFUSES (a live lock holder it does not signal); that
+        # case is re-read from the lock below, so the swallow does not turn a
+        # refusal into a spawn.
+        stop_returned = False
         try:
             _stop(cli_port)
+            stop_returned = True
         except SystemExit:
             pass
         wait_for_incumbents = True
+        if not incumbents:
+            # The port lookup named nobody to wait for. If _stop returned, a
+            # gateway acknowledged the authenticated shutdown (the one path that
+            # returns without a pid) and is exiting while still owning
+            # gateway.lock; an empty wait returns at once and the replacement
+            # loses the lock race to it. Resolve the pid through the lock so
+            # the wait below is a real one. If _stop exited instead, a live
+            # holder means it refused, and restart refuses too.
+            incumbents = _incumbent_from_lock_holder(port, shutdown_acknowledged=stop_returned)
     elif _report_authenticated_shutdown(port):
         sel().log_api_access(
             caller="cli",
@@ -1036,6 +1207,32 @@ def _restart(cli_port: int | None = None) -> None:
             "kirocrew restart"
         )
         sys.exit(1)
+    else:
+        # The port probe found nothing, but that is not how single-instance is
+        # actually enforced (see the matching note in _stop): a gateway
+        # reachable only over a unix socket, or one the probe simply missed,
+        # still holds gateway.lock. Spawning a replacement here would have it
+        # cold-refused by that lock a moment later — exactly the split-brain
+        # `kirocrew stop`/`kirocrew restart` reporting "nothing running" while
+        # `kirocrew gateway` refuses for a live pid. Ask the lock-owner oracle;
+        # a live holder is refused and named, never signalled, so the operator
+        # stops it by hand and retries.
+        try:
+            holder = lock_holder(config_dir())
+        except LockProbeError as exc:
+            # Indeterminate: neither signal the recorded pid (it may name an
+            # unrelated process) nor spawn a replacement the lock may refuse.
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} reason=lock_probe_indeterminate",
+            )
+            print(f"❌ {exc}. Not signalling anything and not starting a replacement.")
+            sys.exit(1)
+        if holder.pid is not None and holder.alive:
+            _refuse_lock_holder("gateway_restart", port, holder.pid)
 
     if wait_for_incumbents:
         alive = _wait_for_pids_exit(incumbents, _RESTART_STOP_TIMEOUT)
@@ -1060,6 +1257,13 @@ def _restart(cli_port: int | None = None) -> None:
                 f"   If the process is wedged, force it: kill -9 {pids}"
             )
             sys.exit(1)
+
+    # The incumbents are gone (or there were none), yet the lock is the oracle
+    # for "is something running": a child that inherited the descriptor keeps
+    # the flock alive after its parent's exit, and a replacement spawned into
+    # that lock is refused a moment later, reported here as success. Probe once
+    # more, right before the spawn, and refuse on a held or indeterminate lock.
+    _refuse_if_lock_held("gateway_restart", port)
 
     proc = _spawn_detached_gateway(port)
     pid = proc.pid
@@ -1769,6 +1973,27 @@ def _status(args: argparse.Namespace) -> None:
     print(f"  Subagents:   {data.get('subagents', 0)}")
     print(f"  Cron jobs:   {data.get('crons', 0)}")
     print(f"  Lessons:     {data.get('lessons', 0)}")
+    print(f"  Memory:      {_format_memory_line(data)}")
+
+
+def _format_memory_line(data: dict) -> str:
+    """``<gateway rss> MiB rss, session ceiling <n> MiB`` from a status payload.
+
+    Reads the two fields ``/api/status`` publishes for exactly this line
+    (``gateway_rss_mb`` / ``watchdog_rss_max_mb``). An older gateway that does
+    not publish them prints a dash rather than a fabricated zero, and a ceiling
+    of ``0`` is spelled out as disabled so "0 MiB" cannot read as a bound.
+    """
+    rss = data.get("gateway_rss_mb")
+    ceiling = data.get("watchdog_rss_max_mb")
+    rss_text = f"{rss} MiB rss" if isinstance(rss, (int, float)) and rss > 0 else "— rss"
+    if not isinstance(ceiling, (int, float)):
+        ceiling_text = "session ceiling —"
+    elif ceiling > 0:
+        ceiling_text = f"session ceiling {int(ceiling)} MiB"
+    else:
+        ceiling_text = "session ceiling disabled (session.watchdog_rss_max_mb = 0)"
+    return f"{rss_text}, {ceiling_text}"
 
 
 def _should_reconcile_launchd_launcher() -> bool:

@@ -2534,6 +2534,273 @@ class TestRestart:
             cli_server._restart(None)
         mock_spawn.assert_called_once()
 
+    @contextlib.contextmanager
+    def _probe_missed_gateway(self, holder_pid: int, *, kirocrew: bool):
+        """Patches for the tool-present path where the port probe finds nothing
+        and no gateway answers the authenticated shutdown, yet gateway.lock is
+        held by the live ``holder_pid``. Every way the command could signal a
+        pid is recorded so the tests can assert that none was used."""
+        from kiro_crew.gateway_lock import LockHolder
+
+        with (
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[],
+            ),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server._report_authenticated_shutdown", return_value=False),
+            patch(
+                "kiro_crew.cli_server.lock_holder",
+                return_value=LockHolder(pid=holder_pid, alive=True, source="flock_owner"),
+            ),
+            patch("kiro_crew.cli_server._is_kirocrew_process", return_value=kirocrew),
+            patch("kiro_crew.cli_server.os.kill") as mock_kill,
+            patch("kiro_crew.cli_server.platform_compat.kill_process_tree") as mock_tree,
+            patch("kiro_crew.cli_server._stop_mcp_gateway_daemon") as mock_daemon,
+            patch("kiro_crew.cli_server._wait_for_pids_exit") as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            yield {
+                "kill": mock_kill,
+                "tree": mock_tree,
+                "daemon": mock_daemon,
+                "wait": mock_wait,
+                "spawn": mock_spawn,
+            }
+
+    def test_lock_holder_alive_kirocrew_refuses_to_restart_and_names_the_pid(self, capsys):
+        """The split-brain this fixes: the port probe finds nothing (a
+        unix-socket-only gateway, or a blind spot) but gateway.lock is held by
+        a live Kiro Crew pid. Restart must not report "nothing running" and
+        must not spawn a replacement the lock would refuse -- and it must not
+        signal through the lock either: a gateway neither the port nor the
+        API could reach is refused and NAMED, with the manual command, so the
+        operator stops it by hand and retries."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._probe_missed_gateway(4242, kirocrew=True) as mocks,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mocks["kill"].assert_not_called()
+        mocks["tree"].assert_not_called()
+        mocks["daemon"].assert_not_called()
+        mocks["wait"].assert_not_called()
+        mocks["spawn"].assert_not_called()
+        out = capsys.readouterr().out
+        assert "gateway.lock" in out
+        assert "pid 4242" in out
+        assert "kill -TERM 4242" in out
+        assert "Not starting a replacement" in out
+        mock_sel.log_api_access.assert_called_once()
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["operation"] == "gateway_restart"
+        assert audit["outcome"] == "denied"
+        assert "pids=[4242]" in audit["resources"]
+        assert "reason=lock_holder_kirocrew" in audit["resources"]
+
+    def test_lock_holder_alive_but_foreign_refuses_without_stopping_it(self, capsys):
+        """A live holder that is not a Kiro Crew process must never be signaled
+        -- refuse with the same wording ``kirocrew gateway`` would give for this
+        holder, audited as denied, rather than silently spawning a competitor
+        the lock refuses."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._probe_missed_gateway(99, kirocrew=False) as mocks,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mocks["kill"].assert_not_called()
+        mocks["tree"].assert_not_called()
+        mocks["spawn"].assert_not_called()
+        out = capsys.readouterr().out
+        assert "does not look like a Kiro Crew gateway" in out
+        assert "kill -TERM 99" in out
+        mock_sel.log_api_access.assert_called_once()
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["operation"] == "gateway_restart"
+        assert audit["outcome"] == "denied"
+        assert "reason=lock_holder_foreign" in audit["resources"]
+
+    @contextlib.contextmanager
+    def _tool_absent_acked_shutdown(
+        self, holder_pid: int, lock_probe_error=None, *, acknowledged: bool = True
+    ):
+        """Patches for the port-tool-absent path with an acknowledged shutdown.
+
+        ``find_listening_pids`` is blind (tool missing), so ``_restart`` enters
+        ``_stop`` with an EMPTY incumbent list; ``_stop`` gets the gateway to
+        acknowledge a graceful shutdown over the API and returns without naming
+        a pid. The lock still names the exiting gateway as ``holder_pid`` --
+        unless ``lock_probe_error`` is given, in which case the probe raises it.
+        ``acknowledged=False`` drives the same entry with NO gateway answering
+        the API, so ``_stop`` reaches the lock holder instead.
+        """
+        from kiro_crew.gateway_lock import LockHolder
+
+        holder_kwargs = (
+            {"side_effect": lock_probe_error}
+            if lock_probe_error is not None
+            else {"return_value": LockHolder(pid=holder_pid, alive=True, source="flock_owner")}
+        )
+        with (
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.listening_pid_tool_available",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[],
+            ),
+            patch("kiro_crew.cli_server.platform_compat.IS_WINDOWS", False),
+            patch("kiro_crew.cli_server.service_controller.stop_service", return_value=False),
+            patch(
+                "kiro_crew.cli_server._report_authenticated_shutdown",
+                return_value=acknowledged,
+            ),
+            patch("kiro_crew.cli_server.lock_holder", **holder_kwargs),
+            patch("kiro_crew.cli_server._is_kirocrew_process", return_value=True),
+        ):
+            yield
+
+    def test_tool_absent_unacked_shutdown_live_holder_refuses_to_restart(self, capsys):
+        """Port tool absent, no gateway answers the API, yet the lock is held by
+        a live Kiro Crew pid: ``_stop`` refuses (its exit is swallowed, as for
+        "nothing running") and restart must NOT read that as a free lock --
+        it re-reads the holder, refuses too, waits on nothing and spawns
+        nothing. Both refusals are audited under their own operation."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._tool_absent_acked_shutdown(4242, acknowledged=False),
+            patch("kiro_crew.cli_server.os.kill") as mock_kill,
+            patch("kiro_crew.cli_server._wait_for_pids_exit") as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mock_kill.assert_not_called()
+        mock_wait.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "kill -TERM 4242" in out
+        assert "Not starting a replacement" in out
+        audits = [c.kwargs for c in mock_sel.log_api_access.call_args_list]
+        assert [(a["operation"], a["outcome"]) for a in audits] == [
+            ("gateway_stop", "denied"),
+            ("gateway_restart", "denied"),
+        ]
+        assert all("reason=lock_holder_kirocrew" in a["resources"] for a in audits)
+
+    def test_tool_absent_acked_shutdown_waits_for_lock_holder_before_spawning(self):
+        """Port tool absent + graceful shutdown acknowledged: the port lookup
+        names no incumbent, so without the lock-holder resolution the wait is
+        on an empty list and the replacement spawns while the exiting gateway
+        still owns gateway.lock -- it loses the race and NO gateway remains.
+        The spawn must happen only after the lock holder's pid is gone."""
+        from kiro_crew.cli_server import _restart
+
+        order: list[str] = []
+
+        def _wait(pids, timeout):
+            order.append(f"wait:{pids}")
+            return []
+
+        from kiro_crew.gateway_lock import LockHolder
+
+        def _probe(_home):
+            # The holder is named before the wait; once it has exited, the
+            # pre-spawn re-probe finds the lock free.
+            order.append("probe")
+            if "wait:[4242]" in order:
+                return LockHolder(pid=None, alive=False, source="none")
+            return LockHolder(pid=4242, alive=True, source="flock_owner")
+
+        with (
+            self._mock_sel(),
+            self._tool_absent_acked_shutdown(4242),
+            patch("kiro_crew.cli_server.lock_holder", side_effect=_probe),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", side_effect=_wait),
+            patch(
+                "kiro_crew.cli_server._spawn_detached_gateway",
+                side_effect=lambda port: (order.append("spawn"), self._fake_proc(4321))[1],
+            ),
+        ):
+            _restart(None)
+        assert order == ["probe", "wait:[4242]", "probe", "spawn"]
+
+    def test_tool_absent_acked_shutdown_holder_still_alive_refuses_to_spawn(self, capsys):
+        """Same entry, holder never exits within the wait: refuse with the same
+        'still running' message the port-lookup path prints, non-zero exit, no
+        spawn -- a replacement the lock would refuse is worse than none."""
+        from kiro_crew.cli_server import _restart
+
+        mock_sel = MagicMock()
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            self._tool_absent_acked_shutdown(4242),
+            patch("kiro_crew.cli_server._wait_for_pids_exit", return_value=[4242]) as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mock_wait.assert_called_once()
+        assert mock_wait.call_args.args[0] == [4242]
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Gateway (pid 4242) did not exit within" in out
+        assert "Not starting a replacement" in out
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["outcome"] == "denied"
+        assert "reason=incumbent_still_running" in audit["resources"]
+
+    def test_tool_absent_indeterminate_lock_refuses_to_spawn(self, capsys):
+        """Port tool absent and the lock probe cannot say who holds the lock:
+        neither signal a guessed pid nor spawn a replacement the lock may
+        refuse -- print the existing indeterminate message and exit 1."""
+        from kiro_crew.cli_server import _restart
+        from kiro_crew.gateway_lock import LockProbeError
+
+        with (
+            self._mock_sel(),
+            self._tool_absent_acked_shutdown(
+                4242,
+                lock_probe_error=LockProbeError(
+                    Path("/nowhere/gateway.lock"), OSError("probe failed")
+                ),
+            ),
+            patch("kiro_crew.cli_server._wait_for_pids_exit") as mock_wait,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+        assert exc.value.code == 1
+        mock_wait.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "could not determine whether a gateway holds the lock" in out
+        assert "not starting a replacement" in out
+
     def test_no_service_no_running_gateway_spawns_fresh(self, capsys):
         # Restart should be tolerant of a crashed gateway: if the user runs
         # ``kirocrew restart`` after the gateway died, they should still

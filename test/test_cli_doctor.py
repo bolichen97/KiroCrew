@@ -13,6 +13,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -694,6 +696,199 @@ class TestMemoryPressure:
         out = capsys.readouterr().out
         assert "not applicable" in out
         assert issues == []
+
+    def test_ceiling_and_rss_print_on_every_platform(self, monkeypatch, capsys) -> None:
+        """The Linux-only freeze check must not hide the two readings a Windows
+        or macOS operator asking "what bounds a runaway tree?" needs."""
+        monkeypatch.setattr(cli_doctor.sys, "platform", "win32")
+        monkeypatch.setattr(
+            cli_doctor,
+            "_gateway_memory_lines",
+            lambda: ["  session ceiling: ✅ 1536 MiB", "  gateway rss:     412 MiB (pid 4242)"],
+        )
+        issues: list[str] = []
+
+        cli_doctor._doctor_memory_pressure(issues)
+
+        out = capsys.readouterr().out
+        assert out.index("session ceiling") < out.index("gateway rss") < out.index(
+            "not applicable"
+        )
+        assert issues == []
+
+
+class TestRuntimeTmpfs:
+    """`kirocrew doctor` Runtime tmpfs section — early warning before the
+    sandbox's mount-source roots run out of space or inodes and every tool
+    spawn degrades to a bare ``rc=1``."""
+
+    @staticmethod
+    def _arrange(monkeypatch, usage_by_root: dict) -> list[str]:
+        monkeypatch.setattr(cli_doctor.sys, "platform", "linux")
+        monkeypatch.setattr(cli_doctor, "_runtime_tmpfs_roots", lambda: list(usage_by_root))
+        monkeypatch.setattr(cli_doctor, "_tmpfs_usage", lambda root: usage_by_root[root])
+        return ["pre-existing"]
+
+    def test_healthy_roots_pass(self, monkeypatch, capsys) -> None:
+        issues = self._arrange(
+            monkeypatch,
+            {"/run/user/1000": (80.0, 95.0, 50000, 3), "/dev/shm": (99.0, 99.0, 900000, 0)},
+        )
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        out = capsys.readouterr().out
+        assert "Runtime tmpfs" in out
+        assert "/run/user/1000: ✅" in out and "3 kirocrew_sb_* entries" in out
+        assert "⚠️" not in out
+        assert issues == ["pre-existing"]
+
+    def test_low_inodes_warns_with_entry_count_and_fails_doctor(self, monkeypatch, capsys) -> None:
+        # The observed incident: plenty of bytes, no inodes, thousands of leaked dirs.
+        issues = self._arrange(monkeypatch, {"/run/user/1000": (97.0, 2.0, 400, 18231)})
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        out = capsys.readouterr().out
+        assert "/run/user/1000: ⚠️  low on inodes" in out
+        assert "18231 kirocrew_sb_* entries" in out and "rc=1" in out
+        assert len(issues) == 2 and "low on inodes" in issues[1]
+
+    def test_inode_floor_warns_even_above_ten_percent(self, monkeypatch, capsys) -> None:
+        # A tiny tmpfs at 12% free inodes can be a few hundred dirs from failure.
+        issues = self._arrange(monkeypatch, {"/run/user/1000": (90.0, 12.0, 600, 5)})
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        assert "low on inodes" in capsys.readouterr().out
+        assert len(issues) == 2
+
+    def test_low_space_warns(self, monkeypatch, capsys) -> None:
+        issues = self._arrange(monkeypatch, {"/dev/shm": (4.0, 90.0, 90000, 0)})
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        assert "low on space" in capsys.readouterr().out
+        assert len(issues) == 2
+
+    def test_both_low_names_both(self, monkeypatch, capsys) -> None:
+        issues = self._arrange(monkeypatch, {"/dev/shm": (1.0, 1.0, 10, 0)})
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        assert "low on space and inodes" in capsys.readouterr().out
+        assert len(issues) == 2
+
+    def test_missing_root_is_skipped(self, monkeypatch, capsys) -> None:
+        issues = self._arrange(monkeypatch, {"/run/user/1000": None})
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        assert "not present or unreadable" in capsys.readouterr().out
+        assert issues == ["pre-existing"]
+
+    def test_non_linux_is_a_silent_noop(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(cli_doctor.sys, "platform", "win32")
+        called: list[str] = []
+        monkeypatch.setattr(cli_doctor, "_runtime_tmpfs_roots", lambda: called.append("x") or [])
+        issues: list[str] = []
+        cli_doctor._doctor_runtime_tmpfs(issues)
+        assert capsys.readouterr().out == ""
+        assert called == [] and issues == []
+
+    def test_roots_come_from_the_sandbox_chooser(self, monkeypatch) -> None:
+        from kiro_crew import sandbox
+
+        monkeypatch.setattr(
+            sandbox, "_mount_source_candidate_roots", lambda: ["/run/user/7", "/dev/shm", "/tmp"]
+        )
+        assert cli_doctor._runtime_tmpfs_roots() == ["/run/user/7", "/dev/shm", "/tmp"]
+
+    def test_usage_reads_statvfs_and_counts_sandbox_entries(self, monkeypatch, tmp_path) -> None:
+        # Only the sandbox launcher's own mount-source dirs count; a foreign
+        # ``tmp*`` entry is somebody else's and must not inflate the advice.
+        for name in ("kirocrew_sb_41_a", "kirocrew_sb_42_b", "tmpabc", "other"):
+            (tmp_path / name).mkdir()
+        # A plain namespace rather than ``os.statvfs_result``: neither that type
+        # nor ``os.statvfs`` exists on Windows, and the production code only
+        # reads the four fields below.
+        fake = SimpleNamespace(f_blocks=1000, f_bavail=50, f_files=2000, f_favail=200)
+        monkeypatch.setattr(cli_doctor.os, "statvfs", lambda root: fake, raising=False)
+        free_space_pct, free_inode_pct, free_inodes, tmp_entries = cli_doctor._tmpfs_usage(
+            str(tmp_path)
+        )
+        assert free_space_pct == 5.0  # f_bavail / f_blocks
+        assert free_inode_pct == 10.0  # f_favail / f_files
+        assert free_inodes == 200
+        assert tmp_entries == 2
+
+    def test_usage_without_inode_accounting_is_not_low(self, monkeypatch, tmp_path) -> None:
+        # btrfs-style statvfs: f_files == 0 means the filesystem does not
+        # count inodes, so it must read as unconstrained on both axes and never
+        # trip the absolute floor.
+        fake = SimpleNamespace(f_blocks=1000, f_bavail=900, f_files=0, f_favail=0)
+        monkeypatch.setattr(cli_doctor.os, "statvfs", lambda root: fake, raising=False)
+        usage = cli_doctor._tmpfs_usage(str(tmp_path))
+        assert usage is not None
+        _, free_inode_pct, free_inodes, _ = usage
+        assert free_inode_pct == 100.0
+        assert free_inodes >= cli_doctor._TMPFS_FREE_INODES_FLOOR
+
+    def test_usage_unreadable_root_is_none(self, monkeypatch) -> None:
+        def _boom(root):
+            raise FileNotFoundError(root)
+
+        monkeypatch.setattr(cli_doctor.os, "statvfs", _boom, raising=False)
+        assert cli_doctor._tmpfs_usage("/nope") is None
+
+    def test_usage_is_none_without_statvfs(self, monkeypatch, tmp_path) -> None:
+        # The Windows shape: ``os`` has no ``statvfs`` at all.
+        monkeypatch.delattr(cli_doctor.os, "statvfs", raising=False)
+        assert cli_doctor._tmpfs_usage(str(tmp_path)) is None
+
+
+class TestGatewayMemoryLines:
+    """`_gateway_memory_lines`: the configured ceiling plus the live gateway's RSS."""
+
+    @staticmethod
+    def _cfg(monkeypatch, ceiling: int) -> None:
+        cfg = MagicMock()
+        cfg.session.watchdog_rss_max_mb = ceiling
+        monkeypatch.setattr(cli_doctor.KiroCrewConfig, "load", lambda: cfg)
+
+    def test_reports_ceiling_and_live_rss(self, monkeypatch) -> None:
+        self._cfg(monkeypatch, 1536)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: 4242)
+        monkeypatch.setattr(
+            cli_doctor.platform_compat,
+            "proc_rss_bytes_for_pid",
+            lambda pid: 412 * 1024 * 1024 if pid == 4242 else None,
+        )
+        ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "1536 MiB" in ceiling and "watchdog_rss_max_mb" in ceiling
+        assert "412 MiB" in rss and "4242" in rss
+
+    def test_disabled_ceiling_is_called_out(self, monkeypatch) -> None:
+        self._cfg(monkeypatch, 0)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+        ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "disabled" in ceiling and "nothing bounds" in ceiling
+        assert "not running" in rss
+
+    def test_unreadable_rss_and_config_never_raise(self, monkeypatch) -> None:
+        monkeypatch.setattr(cli_doctor.KiroCrewConfig, "load", MagicMock(side_effect=OSError))
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: 7)
+        monkeypatch.setattr(cli_doctor.platform_compat, "proc_rss_bytes_for_pid", lambda pid: None)
+        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_system_bin", lambda name: None)
+        ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "could not read" in ceiling
+        assert "unreadable" in rss and "7" in rss
+
+    def test_falls_back_to_trusted_ps_when_the_shim_has_no_route(self, monkeypatch) -> None:
+        """macOS: the shim answers None, so the doctor reads ``ps -o rss=`` (KiB)."""
+        self._cfg(monkeypatch, 1536)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: 4242)
+        monkeypatch.setattr(cli_doctor.platform_compat, "proc_rss_bytes_for_pid", lambda pid: None)
+        monkeypatch.setattr(cli_doctor.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_system_bin", lambda name: "/bin/ps")
+        calls: list[list[str]] = []
+
+        def _ps(argv, timeout):
+            calls.append(argv)
+            return b" 421888\n"
+
+        monkeypatch.setattr(cli_doctor.subprocess, "check_output", _ps)
+        _ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "412 MiB" in rss and "4242" in rss
+        assert calls == [["/bin/ps", "-o", "rss=", "-p", "4242"]]
 
 
 class TestDoctorAgentAuth:

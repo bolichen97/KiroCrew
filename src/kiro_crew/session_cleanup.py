@@ -107,6 +107,11 @@ PeriodicPidSweep = Callable[[int, set[int]], tuple[set[str], list[int]]]
 PidWriteback = Callable[[int, list[int], set[str]], int]
 
 
+def _no_attached_subagents(key: str) -> bool:
+    """Default sub-agent probe: a manager with no dashboard has no children."""
+    return False
+
+
 @dataclass(slots=True)
 class CleanupState:
     """Mutable state exclusively owned by :class:`SessionCleanup`."""
@@ -156,6 +161,12 @@ class CleanupDeps:
     get_stuck_turn_report_secs: Callable[[], float]
     get_pycache_gc_interval_secs: Callable[[], float]
     get_session_idle_expired_event: Callable[[], str]
+    # Whether *key* has sub-agent work attached (running, queued, or a
+    # completion delivery in flight). With session sharing on, children run on
+    # the parent's runtime after the parent's own turn ends, so the busy
+    # semaphore alone cannot see them. Defaults to "no children" so a manager
+    # without a dashboard keeps its existing behaviour.
+    has_attached_subagents: Callable[[str], bool] = _no_attached_subagents
 
 
 class SessionCleanup:
@@ -344,6 +355,20 @@ class SessionCleanup:
 
         for key, rss, session in victims:
             try:
+                # A free semaphore only proves the parent's OWN turn is over.
+                # Sub-agents spawned by that turn keep running on this session's
+                # runtime, so a reset here discards their work. reset() only
+                # re-checks the semaphore under its lock; this is the sole
+                # guard for attached children, so it runs as late as possible.
+                if self._has_attached_subagents(key):
+                    self._deps.logger.debug(
+                        "RSS recycle: session %s tree rss=%dMB exceeds %dMB "
+                        "but has attached sub-agent work; skipping",
+                        key,
+                        rss,
+                        self.state.rss_max_mb,
+                    )
+                    continue
                 # reset revalidates both object identity and the busy semaphore
                 # under its own lock after the unlocked RSS measurement.
                 recycled = await self._owner.reset(
@@ -367,6 +392,23 @@ class SessionCleanup:
             except Exception:
                 # One victim cannot suppress the rest of this tick.
                 self._deps.logger.exception("RSS recycle failed for session %s", key)
+
+    def _has_attached_subagents(self, key: str) -> bool:
+        """Fail-closed wrapper around the injected sub-agent probe.
+
+        A probe that raises is a probe that cannot see the children, not a
+        session with none; recycling on that answer is exactly the hazard the
+        guard exists to prevent, so an error keeps the session.
+        """
+        try:
+            return bool(self._deps.has_attached_subagents(key))
+        except Exception:
+            self._deps.logger.debug(
+                "RSS recycle: sub-agent probe failed for session %s; keeping it",
+                key,
+                exc_info=True,
+            )
+            return True
 
     async def _stuck_turn_check(self) -> None:
         try:

@@ -742,7 +742,7 @@ def effective_session_key(slot: _ChatSlot) -> str:
 
 
 def subagents_attached(
-    state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
+    state: DashboardState, slot: _ChatSlot | None, session_key: str, operation: str
 ) -> bool:
     """Whether sub-agent children are attached to *session_key*.
 
@@ -750,6 +750,10 @@ def subagents_attached(
     would discard a child's work. Every such caller shares THIS predicate: a
     second copy is how the probes diverge, and both callers must fail toward
     keeping a child's work.
+
+    *slot* may be ``None`` when no tab displays the session: the in-flight
+    delivery probe then reads as 0 (``getattr`` on ``None`` returns its
+    default) and the two registry probes still decide.
 
     Three probes, none optional:
 
@@ -781,6 +785,24 @@ def subagents_attached(
             queued = 1
     inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
     return bool(running is None or running or queued or inflight)
+
+
+def wire_session_subagent_probe(state: DashboardState) -> None:
+    """Hand ``SessionManager`` the sub-agent probe its RSS ceiling consults.
+
+    The manager cannot see the dashboard's sub-agent registry or slots, so the
+    predicate is built here, over :func:`subagents_attached`, and installed via
+    ``set_subagent_probe``. The slot is resolved through
+    :func:`dashboard_slot_key` (the same mapping the recycle notice uses); a
+    session with no open tab passes ``None``, which the predicate accepts.
+    """
+
+    def _probe(session_key: str) -> bool:
+        slot_key = dashboard_slot_key(session_key)
+        slot = state.get_slot(slot_key) if slot_key else None
+        return subagents_attached(state, slot, session_key, "rss_recycle")
+
+    state.sessions.set_subagent_probe(_probe)
 
 
 def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:

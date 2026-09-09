@@ -1055,7 +1055,7 @@
         "pool_ttl_secs": 1800,
         "eager_spawn": true,
         "archive_retention_days": 30,
-        "watchdog_rss_max_mb": 0
+        "watchdog_rss_max_mb": 1536
       }
     },
     {
@@ -1194,10 +1194,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Watchdog RSS Limit (MiB)",
-      "help": "Recycle a session when its process tree resident memory exceeds this many MiB. 0 disables (default). Busy sessions (turn in flight) are never recycled.",
+      "help": "Recycle a session when its process tree resident memory exceeds this many MiB (default 1536). 0 disables. Busy sessions (turn in flight) are never recycled.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 0
+      "defaultValue": 1536
     },
     {
       "path": "taskrunner",

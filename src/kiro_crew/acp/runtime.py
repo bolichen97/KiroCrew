@@ -173,6 +173,21 @@ _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
 # _send_and_await timeout — naming what was in flight at the drop makes that
 # timeout attributable instead of a mystery. Capped so the line stays bounded.
 _DROP_IDS_IN_LOG = 8
+
+# Cap on the stderr text folded into a process-exit death reason. The reason
+# is what the chat error card shows, so it must stay one readable line: the
+# LAST non-empty stderr line the drain captured, truncated to this many
+# characters -- roughly one card line. The 20-line ring itself is unchanged.
+_STDERR_REASON_TAIL_CHARS = 200
+# The one stderr signature that names a host fault rather than a kiro-cli
+# fault: every sandboxed spawn fails with it once the runtime tmpfs the
+# launcher stages mount sources on runs out of space or inodes. Point the
+# operator at the doctor check that measures that filesystem.
+_ENOSPC_MARKER = "no space left on device"
+_ENOSPC_HINT = (
+    "the runtime tmp filesystem is out of space or inodes; run `kirocrew doctor` "
+    "(Runtime tmpfs section)"
+)
 # JSON-RPC 2.0 "Method not found" — the reader loop answers an ownerless
 # server→client request with this itself (see _answer_ownerless_request);
 # mirrors the private constant AcpClient keeps for its own dispatch sites.
@@ -2185,7 +2200,7 @@ class AcpRuntime:
 
                 if not line:
                     rc = self._process.returncode if self._process else "?"
-                    self._mark_dead(f"process exited (rc={rc})")
+                    self._mark_dead(self._exit_reason(rc))
                     return
 
                 self._last_activity = time.monotonic()
@@ -2590,6 +2605,38 @@ class AcpRuntime:
         Reads the latch, not the ring buffer: see ``_saw_auth_failure``.
         """
         return self._saw_auth_failure
+
+    def _exit_reason(self, rc: object) -> str:
+        """The death reason for a process that exited: rc plus what it last said.
+
+        A bare ``rc=1`` told the operator nothing when every tool started
+        failing because the runtime tmpfs had run out of inodes. The last
+        non-empty stderr line the drain captured is appended (bounded by
+        ``_STDERR_REASON_TAIL_CHARS``), and an ENOSPC signature in it earns a
+        pointer at the doctor check that measures that filesystem. Best-effort:
+        the stderr drain is a separate task, so a line still in flight when
+        stdout closed is not seen here, and the reason then stays ``rc=N``.
+        """
+        reason = f"process exited (rc={rc})"
+        last = next((ln for ln in reversed(self._stderr_lines) if ln.strip()), "")
+        if not last:
+            return reason
+        # The marker is matched on the whole line, so a signature past the cap
+        # still earns the hint; only what the card shows is cut.
+        enospc = _ENOSPC_MARKER in last.lower()
+        # A child's stderr is untrusted text that can echo a token or an
+        # authority-bearing URL (a failed login prints the header it sent), and
+        # the reason travels to the session card and the SEL, so it is redacted
+        # before the cut; the cut then cannot split a secret into a half the
+        # redactor cannot recognise.
+        last, _ = redact_credentials(last)
+        last, _ = redact_exfiltration_urls(last)
+        if len(last) > _STDERR_REASON_TAIL_CHARS:
+            last = last[:_STDERR_REASON_TAIL_CHARS] + "…"
+        reason = f"{reason}: {last}"
+        if enospc:
+            reason = f"{reason} — {_ENOSPC_HINT}"
+        return reason
 
     def _mark_dead(self, reason: str, *, expected: bool = False) -> None:
         """Mark runtime dead, fail all pending requests, poison all session queues.

@@ -29,6 +29,7 @@ import pytest
 from kiro_crew import cli_server, platform_compat
 from kiro_crew.config.loader import _DEFAULT_PORT
 from kiro_crew.dashboard.handlers.core import DASHBOARD_HTML_NOT_FOUND_MARKER
+from kiro_crew.gateway_lock import LockHolder, LockProbeError
 from kiro_crew.platform.update_layout import InstallLayout
 from kiro_crew.service import linux as svc_linux
 from kiro_crew.service import macos as svc_macos
@@ -221,11 +222,231 @@ class TestStopViaService:
 
         monkeypatch.setattr(cli_server.service_controller, "stop_service", unreachable)
         monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
+        monkeypatch.setattr(
+            cli_server, "lock_holder", lambda home: LockHolder(pid=None, alive=False, source="none")
+        )
         with pytest.raises(SystemExit) as exc:
             cli_server._stop(8123)
         assert exc.value.code == 1
         assert "No Kiro Crew gateway currently running on port 8123" in capsys.readouterr().out
         assert sel_rec.calls[-1]["outcome"] == "no_target"
+
+
+class TestStopLockHolderFallback:
+    """The port probe is not how single-instance is enforced -- gateway.lock
+    is (gateway_lock.py). A gateway the port probe misses (unix-socket-only,
+    or a probe blind spot) must still be VISIBLE through the lock, or
+    `kirocrew stop` reports "nothing running" the same moment `kirocrew
+    gateway` refuses to start for a live pid -- the split-brain this fixes.
+    The lock is an oracle, not a signalling path: a live holder is refused
+    and named (lock path, pid, manual command) with one ``denied`` event, and
+    nothing is signalled, whoever holds it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _arrange(self, monkeypatch):
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
+        monkeypatch.setattr(cli_server.service_controller, "stop_service", lambda: False)
+        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
+        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(cli_server, "_report_authenticated_shutdown", lambda port: False)
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(cli_server, "_pid_exited", lambda pid: True)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+    @pytest.fixture
+    def signals(self, monkeypatch) -> list[int]:
+        """Record every pid the command would signal, on either platform."""
+        sent: list[int] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
+        monkeypatch.setattr(platform_compat, "kill_process_tree", lambda pid, sig: sent.append(pid))
+        return sent
+
+    def test_live_kirocrew_lock_holder_is_refused_and_named(
+        self, monkeypatch, sel_rec, capsys, signals
+    ) -> None:
+        monkeypatch.setattr(
+            cli_server,
+            "lock_holder",
+            lambda home: LockHolder(pid=4242, alive=True, source="flock_owner"),
+        )
+        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
+        daemon_stops: list[int] = []
+        monkeypatch.setattr(cli_server, "_stop_mcp_gateway_daemon", lambda: daemon_stops.append(1))
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        assert signals == []
+        assert daemon_stops == []
+        out = capsys.readouterr().out
+        assert "gateway.lock" in out
+        assert "pid 4242" in out
+        assert "could not reach it" in out
+        assert "kill -TERM 4242" in out
+        assert len(sel_rec.calls) == 1
+        assert sel_rec.calls[0]["operation"] == "gateway_stop"
+        assert sel_rec.calls[0]["outcome"] == "denied"
+        assert "pids=[4242]" in sel_rec.calls[0]["resources"]
+        assert "reason=lock_holder_kirocrew" in sel_rec.calls[0]["resources"]
+
+    def test_live_kirocrew_lock_holder_on_windows_names_taskkill(
+        self, monkeypatch, sel_rec, capsys, signals
+    ) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(
+            cli_server,
+            "lock_holder",
+            lambda home: LockHolder(pid=4242, alive=True, source="flock_owner"),
+        )
+        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        assert signals == []
+        assert "taskkill /PID 4242 /T" in capsys.readouterr().out
+        assert [c["outcome"] for c in sel_rec.calls] == ["denied"]
+
+    def test_dead_lock_holder_still_reports_no_target(self, monkeypatch, sel_rec, capsys) -> None:
+        monkeypatch.setattr(
+            cli_server,
+            "lock_holder",
+            lambda home: LockHolder(pid=4242, alive=False, source="flock_owner"),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        assert "No Kiro Crew gateway currently running" in capsys.readouterr().out
+        assert sel_rec.calls[-1]["outcome"] == "no_target"
+
+    def test_live_lock_holder_is_refused_without_a_port_tool(
+        self, monkeypatch, sel_rec, capsys, signals
+    ) -> None:
+        """The lock file needs no `lsof`: with the port tool unavailable and a
+        live Kiro Crew holder, stop names the holder instead of exiting on the
+        tool diagnostic. The diagnostic is for the case where nothing found a
+        gateway, not a gate in front of the fallbacks that need no tool."""
+        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: False)
+        monkeypatch.setattr(platform_compat, "listening_pid_tool", lambda: "lsof")
+        monkeypatch.setattr(platform_compat, "tool_outside_trusted_dirs", lambda tool: None)
+        monkeypatch.setattr(
+            cli_server,
+            "lock_holder",
+            lambda home: LockHolder(pid=4242, alive=True, source="flock_owner"),
+        )
+        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
+        daemon_stops: list[int] = []
+        monkeypatch.setattr(cli_server, "_stop_mcp_gateway_daemon", lambda: daemon_stops.append(1))
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert signals == []
+        assert daemon_stops == []
+        assert "not found" not in out and "Install lsof" not in out
+        assert "kill -TERM 4242" in out
+        assert len(sel_rec.calls) == 1
+        assert sel_rec.calls[0]["outcome"] == "denied"
+        assert "reason=lock_holder_kirocrew" in sel_rec.calls[0]["resources"]
+
+    def test_no_holder_and_no_port_tool_keeps_the_tool_diagnostic(
+        self, monkeypatch, sel_rec, capsys
+    ) -> None:
+        """Both tool-free fallbacks find nothing: the tool-absent exit is still
+        what the operator sees, because "nothing running" cannot be proven
+        without the port lookup."""
+        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: False)
+        monkeypatch.setattr(platform_compat, "listening_pid_tool", lambda: "lsof")
+        monkeypatch.setattr(platform_compat, "tool_outside_trusted_dirs", lambda tool: None)
+        monkeypatch.setattr(
+            cli_server, "lock_holder", lambda home: LockHolder(pid=None, alive=False, source="none")
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        assert "Install lsof and retry." in capsys.readouterr().out
+        assert "reason=lsof_not_found" in sel_rec.calls[-1]["resources"]
+
+    def test_non_kirocrew_lock_holder_is_refused_not_stopped(
+        self, monkeypatch, sel_rec, capsys, signals
+    ) -> None:
+        monkeypatch.setattr(
+            cli_server,
+            "lock_holder",
+            lambda home: LockHolder(pid=99, alive=True, source="flock_owner"),
+        )
+        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: False)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        assert signals == []
+        out = capsys.readouterr().out
+        assert "does not look like a Kiro Crew gateway" in out
+        assert "kill -TERM 99" in out
+        assert len(sel_rec.calls) == 1
+        assert sel_rec.calls[0]["operation"] == "gateway_stop"
+        assert sel_rec.calls[0]["outcome"] == "denied"
+        assert "pids=[99]" in sel_rec.calls[0]["resources"]
+        assert "reason=lock_holder_foreign" in sel_rec.calls[0]["resources"]
+
+    def test_indeterminate_probe_signals_nothing_and_exits_non_zero(
+        self, monkeypatch, sel_rec, capsys, signals
+    ) -> None:
+        # The probe could not say held-or-free. Signalling the pid the file
+        # records could hit an unrelated process that reused the number, so
+        # `stop` names the problem and exits 1 without touching any pid.
+        lock_path = Path("/var/lib/kirocrew/gateway.lock")
+
+        def indeterminate(home):
+            raise LockProbeError(lock_path, OSError("flock unsupported"))
+
+        monkeypatch.setattr(cli_server, "lock_holder", indeterminate)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._stop(None)
+        assert exc.value.code == 1
+        assert signals == []
+        out = capsys.readouterr().out
+        assert f"could not determine whether a gateway holds the lock at {lock_path}" in out
+        assert "flock unsupported" in out
+        assert sel_rec.calls[-1]["outcome"] == "denied"
+        assert "lock_probe_indeterminate" in sel_rec.calls[-1]["resources"]
+
+
+class TestRestartIndeterminateLock:
+    """``restart`` on an indeterminate lock probe must neither signal the
+    recorded pid nor spawn a replacement the lock may refuse."""
+
+    def test_indeterminate_probe_signals_nothing_spawns_nothing(
+        self, monkeypatch, sel_rec, capsys
+    ) -> None:
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
+        monkeypatch.setattr(cli_server.service_controller, "restart_service", lambda: False)
+        monkeypatch.setattr(cli_server.service_controller, "is_service_active", lambda: False)
+        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
+        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(cli_server, "_report_authenticated_shutdown", lambda port: False)
+        monkeypatch.setattr(cli_server.run_marker, "read_pid", lambda port: None)
+        lock_path = Path("/var/lib/kirocrew/gateway.lock")
+
+        def indeterminate(home):
+            raise LockProbeError(lock_path, OSError("flock unsupported"))
+
+        monkeypatch.setattr(cli_server, "lock_holder", indeterminate)
+        stopped: list[int] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: stopped.append(pid))
+        spawned: list[int] = []
+        monkeypatch.setattr(
+            cli_server, "_spawn_detached_gateway", lambda port: spawned.append(port)
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._restart(None)
+        assert exc.value.code == 1
+        assert stopped == []
+        assert spawned == []
+        out = capsys.readouterr().out
+        assert f"could not determine whether a gateway holds the lock at {lock_path}" in out
+        assert "not starting a replacement" in out
+        assert sel_rec.calls[-1]["operation"] == "gateway_restart"
+        assert sel_rec.calls[-1]["outcome"] == "denied"
 
 
 class TestStopOnWindows:
@@ -1632,3 +1853,39 @@ class TestUpdateWheelInstaller:
         monkeypatch.setattr(subprocess, "run", unreachable)
         cli_server._update_wheel(_LAYOUT)
         assert "Already on the latest version" in capsys.readouterr().out
+
+
+class TestStatusMemoryLine:
+    """`kirocrew status` prints the gateway RSS and the session ceiling from the
+    two fields `/api/status` publishes for it."""
+
+    def test_formats_rss_and_ceiling(self) -> None:
+        line = cli_server._format_memory_line({"gateway_rss_mb": 412, "watchdog_rss_max_mb": 1536})
+        assert line == "412 MiB rss, session ceiling 1536 MiB"
+
+    def test_zero_ceiling_reads_as_disabled_not_as_a_bound(self) -> None:
+        line = cli_server._format_memory_line({"gateway_rss_mb": 412, "watchdog_rss_max_mb": 0})
+        assert "disabled" in line and "watchdog_rss_max_mb" in line
+        assert "0 MiB" not in line
+
+    def test_older_gateway_without_the_fields_prints_dashes(self) -> None:
+        line = cli_server._format_memory_line({"uptime": "1h"})
+        assert line == "— rss, session ceiling —"
+
+    def test_status_prints_the_line(self, monkeypatch, capsys) -> None:
+        import io
+        import json
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        payload = {"uptime": "1h", "gateway_rss_mb": 412, "watchdog_rss_max_mb": 1536}
+
+        @contextmanager
+        def _urlopen(url, timeout):
+            yield io.BytesIO(json.dumps(payload).encode())
+
+        monkeypatch.setattr(cli_server, "loopback_urlopen", _urlopen)
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 7777)
+        cli_server._status(SimpleNamespace(port=None))
+        out = capsys.readouterr().out
+        assert "Memory:      412 MiB rss, session ceiling 1536 MiB" in out

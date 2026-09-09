@@ -108,6 +108,13 @@ DEFAULT_POOL_SIZE = 0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
+# Per-session process-tree RSS ceiling (MiB) the cleanup watchdog recycles an
+# idle session at. Non-zero by default so a runaway session tree is bounded
+# out of the box: fleet gateways were observed at several hundred MB with
+# nothing bounding them. 1536 leaves a healthy kiro-cli plus its MCP servers
+# (typically 300-600 MiB) a wide margin while still catching a leak before
+# it takes the host with it. 0 disables.
+DEFAULT_WATCHDOG_RSS_MAX_MB = 1536
 
 
 def normalize_agent_model(model: object) -> str:
@@ -1508,11 +1515,11 @@ class SessionConfig:
         ),
     )
     watchdog_rss_max_mb: int = field(
-        default=0,
+        default=DEFAULT_WATCHDOG_RSS_MAX_MB,
         metadata=_meta(
             "Watchdog RSS Limit (MiB)",
             "Recycle a session when its process tree resident memory exceeds "
-            "this many MiB. 0 disables (default). Busy sessions (turn in "
+            "this many MiB (default 1536). 0 disables. Busy sessions (turn in "
             "flight) are never recycled.",
         ),
     )

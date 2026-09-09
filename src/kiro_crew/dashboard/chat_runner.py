@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import mcp_apps_render, model_registry, session_directive
+from kiro_crew import mcp_apps_render, model_registry, resource_status, session_directive
 from kiro_crew.acp.client import (
     AcpAuthRequired,
     AcpError,
@@ -4308,24 +4308,62 @@ _RESUME_PREFETCH_TTL_SECS = 600.0
 # processes: restored resumable tabs flipped through after a gateway restart,
 # or slots created/reconfigured in sequence, each stack one full kiro-cli
 # process (RSS, plus the session's own MCP servers; the native session lock
-# too when resumed) until the TTL or idle sweep fires. Arming a new
-# speculative session beyond the cap evicts the OLDEST unclaimed one via the
-# conditional remove_if_unclaimed — a claimed session is never touched, it
-# just falls out of the accounting.
-_RESUME_PREFETCH_MAX_LIVE = 3
+# too when resumed) until the TTL or idle sweep fires. The cap is HOST-
+# DERIVED (``resource_status.prewarm_allowance``): the fixed ceiling below
+# on an ample host, one session when memory is tight, none when it is
+# critical — so a host that cannot afford idle agent processes stops
+# pre-warming them instead of stacking one per slot and then evicting. The
+# allowance is applied twice: as ADMISSION before the spawn (room is made by
+# evicting the oldest unclaimed session first, or the spawn is skipped when
+# the allowance is zero or making room fails) and, PROBED AFRESH, as
+# EVICTION after registration, for an allowance that shrank while the
+# handshake ran. A claimed session is never touched by either — it just
+# falls out of the accounting.
+_RESUME_PREFETCH_MAX_LIVE = resource_status.PREWARM_MAX_LIVE
 # Insertion-ordered arm registry (loop-owned, like all chat_runner state):
 # session_key -> None. Entries leave on TTL fire, on eviction, or lazily when
 # an eviction attempt finds the session already claimed/gone.
-_armed_prefetches: "dict[str, None]" = {}
+_armed_prefetches: "dict[str, object]" = {}
+
+# Registry value for a key whose spawn is admitted but not yet registered. It
+# counts against the allowance like a live entry -- the process is about to
+# exist -- but there is nothing to evict yet, so eviction skips it. Two slot
+# signals admitted concurrently against an allowance of one would otherwise
+# both pass (each seeing an empty registry) and both spawn.
+_RESERVED = object()
 
 
-async def _cap_armed_prefetches(sessions: Any, new_key: str) -> None:
-    """Register *new_key* as armed and evict oldest unclaimed beyond the cap."""
-    _armed_prefetches.pop(new_key, None)  # re-arm moves the key to newest
-    _armed_prefetches[new_key] = None
-    while len(_armed_prefetches) > _RESUME_PREFETCH_MAX_LIVE:
-        oldest = next(iter(_armed_prefetches))
-        _armed_prefetches.pop(oldest, None)
+def _prewarm_allowance() -> int:
+    """Host-derived cap on idle pre-warmed sessions (see ``resource_status``).
+
+    Reads ``/proc/meminfo`` (or the platform equivalent), so callers on the
+    loop run it via ``asyncio.to_thread``. One seam for tests to pin a host
+    shape without making the population tests host-dependent.
+    """
+    return resource_status.prewarm_allowance()
+
+
+async def _evict_prefetches_beyond(sessions: Any, limit: int, *, keep: str | None = None) -> bool:
+    """Evict oldest unclaimed prefetches until at most *limit* remain.
+
+    *keep* is a key exempt from eviction AND from the count — the session being
+    (re-)armed, whose own registration is accounted for by the caller.
+
+    Returns ``True`` once the population is within *limit*. A failed removal
+    returns ``False`` at once and LEAVES the entry registered: the process is
+    still live, so it still counts, and the caller must not treat the room as
+    made. The entry is retried by the next eviction and drops out lazily when
+    that attempt finds the session already claimed or gone.
+    """
+    while len([k for k in _armed_prefetches if k != keep]) > limit:
+        evictable = [k for k, v in _armed_prefetches.items() if k != keep and v is not _RESERVED]
+        if not evictable:
+            # Every entry over the limit is a reservation: an admitted spawn
+            # whose process does not exist yet, so there is nothing to remove.
+            # Room cannot be made; the caller treats this like a failed
+            # eviction and the reservation's owner registers or rolls back.
+            return False
+        oldest = evictable[0]
         try:
             # Shielded for the same reason as the TTL removal: an interrupted
             # removal leaks the process holding the native lock.
@@ -4333,7 +4371,7 @@ async def _cap_armed_prefetches(sessions: Any, new_key: str) -> None:
                 logger.info(
                     "Resume prefetch: evicted oldest unclaimed %s (cap %d)",
                     oldest,
-                    _RESUME_PREFETCH_MAX_LIVE,
+                    limit,
                 )
             # False = claimed or already gone — either way it no longer
             # counts against the cap; dropping the registry entry suffices.
@@ -4341,6 +4379,74 @@ async def _cap_armed_prefetches(sessions: Any, new_key: str) -> None:
             raise
         except Exception:
             logger.warning("Resume prefetch: eviction failed for %s", oldest, exc_info=True)
+            return False
+        _armed_prefetches.pop(oldest, None)
+    return True
+
+
+async def _admit_prefetch(sessions: Any, new_key: str, allowance: int) -> bool:
+    """Make room for *new_key* BEFORE it spawns; ``False`` when it must not.
+
+    A zero allowance refuses, and first evicts every idle pre-warm already
+    live: the host is in the critical band, so the idle population must fall
+    to zero, not merely stop growing. Otherwise the oldest
+    unclaimed sessions are evicted until *new_key* fits, so the live
+    population never exceeds the allowance even transiently — spawning first
+    and evicting after would overshoot by one full process for the length of
+    the handshake. An eviction that FAILS refuses too: the room was not made,
+    so admitting on top of it would exceed the allowance just the same.
+
+    Admission RESERVES *new_key* in the registry before returning ``True``: the
+    eviction above awaits, and two slot signals admitted in the same window
+    would otherwise each see the room the other is about to fill. The
+    reservation counts against every later admission's allowance and is
+    converted by ``_cap_armed_prefetches`` at registration; the caller rolls
+    it back (``_release_prefetch_reservation``) on every path that ends
+    without one. A key already registered is re-armed in place and is not
+    reserved again, so a rollback cannot drop a live entry.
+    """
+    if allowance <= 0:
+        # The band that refuses a new pre-warm also has no room for the ones
+        # already idle, *new_key*'s own earlier pre-warm included -- a re-arm
+        # in this band gets no exemption. A failed eviction is logged by the
+        # helper and the next signal retries it.
+        await _evict_prefetches_beyond(sessions, 0)
+        return False
+    if not await _evict_prefetches_beyond(sessions, allowance - 1, keep=new_key):
+        return False
+    if new_key not in _armed_prefetches:
+        _armed_prefetches[new_key] = _RESERVED
+    return True
+
+
+def _release_prefetch_reservation(new_key: str) -> None:
+    """Drop *new_key*'s admission reservation if registration never converted it."""
+    if _armed_prefetches.get(new_key) is _RESERVED:
+        del _armed_prefetches[new_key]
+
+
+async def _cap_armed_prefetches(
+    sessions: Any, new_key: str, cap: int = _RESUME_PREFETCH_MAX_LIVE
+) -> None:
+    """Register *new_key* as armed and evict oldest unclaimed beyond *cap*.
+
+    The just-registered key is the newest and is never the one evicted, so the
+    bound applies to the OTHER entries: at most ``cap - 1`` of them stay. A
+    failed eviction here is logged and left registered for the next attempt;
+    the new session is already live, so there is no spawn left to refuse.
+
+    A *cap* of zero is the critical band (see ``_prewarm_allowance``): the host
+    tightened while the handshake ran and no unclaimed pre-warm may stay, the
+    one just spawned included. Every entry is evicted, *new_key* too; the
+    first real turn on that slot cold-starts, exactly as if the allowance had
+    read zero before the spawn and ``_admit_prefetch`` had refused.
+    """
+    _armed_prefetches.pop(new_key, None)  # re-arm moves the key to newest
+    _armed_prefetches[new_key] = None
+    if cap <= 0:
+        await _evict_prefetches_beyond(sessions, 0)
+        return
+    await _evict_prefetches_beyond(sessions, cap - 1, keep=new_key)
 
 
 def schedule_eager_spawn(
@@ -4434,6 +4540,25 @@ async def _recover_app_agent_binding(
     return bindings
 
 
+def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str]:
+    """The slot bindings an eager handshake bakes into the session it registers.
+
+    ONE definition, because two exist to be compared: ``_eager_spawn`` snapshots
+    this before the handshake and ``_spawn_admitted_prefetch`` re-reads it after,
+    tearing the session down if they differ. A second, hand-written tuple on
+    either side is not a copy of this contract, it is a silent inversion of it —
+    a field present here and missing there makes the comparison unequal on every
+    call, so the guard removes the session it is supposed to keep.
+    """
+    return (
+        slot.agent,
+        slot.model,
+        slot.project,
+        slot.reasoning_effort,
+        slot.memory_store,
+    )
+
+
 async def _eager_spawn(
     state: "DashboardState", slot: "_ChatSlot", *, allow_resume: bool = False
 ) -> None:
@@ -4502,16 +4627,7 @@ async def _eager_spawn(
             # in the wrong workspace). Agent/project changes re-arm through
             # schedule_eager_spawn and cancel this task, but the other
             # switches don't — the snapshot covers them all uniformly.
-            def _slot_binding() -> tuple[str, str, str, str, str]:
-                return (
-                    slot.agent,
-                    slot.model,
-                    slot.project,
-                    slot.reasoning_effort,
-                    slot.memory_store,
-                )
-
-            _bound = _slot_binding()
+            _bound = _slot_binding(slot)
             kiro_agent: str | None = None
             # Canonical crew identity for watchdog overrides. Seeded from the
             # slot, replaced by the resolver's alias below: an EMPTY slot runs
@@ -4655,103 +4771,163 @@ async def _eager_spawn(
             # turn or a slot mutation may therefore have landed after the
             # initial gate. Nothing is registered yet, so simply stand down;
             # the current owner will allocate from its current bindings.
-            if state.get_slot(slot.key) is not slot or slot.running or _slot_binding() != _bound:
+            if (
+                state.get_slot(slot.key) is not slot
+                or slot.running
+                or _slot_binding(slot) != _bound
+            ):
+                return
+            # ADMISSION, before the process exists: the live-population cap is
+            # host-derived, and on a host that cannot afford another idle
+            # agent process the right move is to not spawn it — the first
+            # message cold-starts exactly as if eager spawn never ran. Room
+            # is made first (oldest unclaimed evicted) so the population never
+            # overshoots during the handshake. Off the loop: it reads procfs.
+            allowance = await asyncio.to_thread(_prewarm_allowance)
+            if not await _admit_prefetch(sessions, session_key, allowance):
+                logger.info(
+                    "Eager spawn: host memory admits %d pre-warmed session(s) and "
+                    "%d are live; leaving slot %s to first turn",
+                    allowance,
+                    len(_armed_prefetches),
+                    slot.key,
+                )
                 return
             _t0 = time.monotonic()
             try:
-                # speculative=True keeps the one-shot first-turn flag armed for
-                # the real first message (atomically, at registration) and
-                # refuses resumable keys — unless allow_resume opted in, in
-                # which case the speculative session/load runs here and the
-                # resumed=True observation is armed for the real turn. See
-                # get_or_create's docstring.
-                _, is_new, resumed = await sessions.get_or_create(
+                await _spawn_admitted_prefetch(
+                    state,
+                    slot,
+                    sessions,
                     session_key,
-                    agent=kiro_agent or slot.agent or None,
-                    # Canonical crew identity — the resolver's alias, which
-                    # covers the default crew on an empty slot; plumbed to the
-                    # session so per-agent watchdog windows never depend on a
-                    # cross-namespace name match. "" is authoritative: no
-                    # alias applied, so no override applies.
-                    crew_agent=crew_alias,
-                    model=slot.model or agent_model or default_model or None,
-                    cwd=slot.project or None,
-                    speculative=True,
-                    speculative_resume=allow_resume,
-                    reasoning_effort_override=slot.reasoning_effort or None,
+                    _t0,
+                    kiro_agent=kiro_agent,
+                    crew_alias=crew_alias,
+                    agent_model=agent_model,
+                    default_model=default_model,
+                    allow_resume=allow_resume,
+                    _bound=_bound,
                 )
-            except SpeculativeResumeRefused:
-                # Two sources: the entry gate (resumable key, resume not
-                # opted in — fresh eager spawn leaves it to the first turn)
-                # or a failed speculative LOAD (allow_resume path: F2 fell
-                # back / mapping vanished / provider switch), rejected before
-                # registration so no claimable fallback session exists. Both
-                # end the same way: the first real message handles it.
-                logger.info("Eager spawn: %s left to first turn (refused)", session_key)
-                return
-            sessions.release(session_key)
-            # The cleanup below may only tear down a session THIS task created.
-            # is_new=False means another creator won the same-key race (or the
-            # claim attached to an already-registered session): a real turn
-            # owns that runtime, may have finished its turn already, and may
-            # have background work (subagents) still attached — removing it
-            # here would terminate the winner's session out from under it. The
-            # winner registered with its own current bindings, so the stale-
-            # bindings hazard these guards exist for does not apply to it.
-            if not is_new:
-                logger.info(
-                    "Eager spawn: another creator won %s, leaving session alone", session_key
-                )
-                return
-            # The slot can be deleted while the handshake ran; the delete
-            # handler's sessions.remove() may have executed before this task
-            # registered the session, which would leave an orphan that a
-            # recreated slot with the same key would silently reuse with THIS
-            # slot's (now stale) agent/cwd bindings. Tear it down.
-            if state.get_slot(slot.key) is not slot:
-                logger.info(
-                    "Eager spawn: slot %s vanished mid-handshake, removing session", slot.key
-                )
-                await sessions.remove(session_key)
-                return
-            # Same shape for a binding change: a switch handler's reset ran
-            # before registration and found nothing, so the session we just
-            # registered carries stale bindings. Remove it — the first real
-            # message cold-starts with the current bindings, exactly as if
-            # eager spawn never ran.
-            if _slot_binding() != _bound:
-                logger.info(
-                    "Eager spawn: slot %s bindings changed mid-handshake, removing session",
-                    slot.key,
-                )
-                await sessions.remove(session_key)
-                return
-            logger.info(
-                "Eager spawn: session ready for %s in %.0fms (new=%s resumed=%s)",
-                session_key,
-                (time.monotonic() - _t0) * 1000.0,
-                is_new,
-                resumed,
-            )
-            if allow_resume and resumed:
-                _schedule_prefetch_ttl(state, slot, session_key)
-            # Fresh and resumed sessions alike count against the live-
-            # population cap: without this, sequential slot signals (create,
-            # agent/project set) stack one unclaimed agent process per slot
-            # until the idle sweep — the semaphore above only bounds
-            # concurrent handshakes. The TTL stays resume-only; fresh
-            # sessions hold no native session lock.
-            await _cap_armed_prefetches(sessions, session_key)
-            # allow_resume and not resumed cannot happen: a speculative
-            # resume whose load fell back is rejected BEFORE registration
-            # (SpeculativeResumeRefused, caught above) precisely so no
-            # claimable fallback session ever exists — a real turn queued
-            # during the load would otherwise claim it and strand its
-            # exchanges behind the preserved old sid.
+            finally:
+                # Every exit that is not a registration -- refused, another
+                # creator won, slot vanished, bindings changed, spawn raised,
+                # cancelled -- gives the reserved allowance back.
+                _release_prefetch_reservation(session_key)
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.warning("Eager spawn failed for slot %s", slot.key, exc_info=True)
+
+
+async def _spawn_admitted_prefetch(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    sessions: Any,
+    session_key: str,
+    _t0: float,
+    *,
+    kiro_agent: str | None,
+    crew_alias: str,
+    agent_model: str,
+    default_model: str,
+    allow_resume: bool,
+    _bound: tuple,
+) -> None:
+    """The admitted half of ``_eager_spawn``: handshake, guards, registration.
+
+    Split out so the caller can bracket it in one ``try/finally`` that releases
+    the admission reservation; a ``return`` from any guard below lands there.
+    """
+    try:
+        # speculative=True keeps the one-shot first-turn flag armed for
+        # the real first message (atomically, at registration) and
+        # refuses resumable keys — unless allow_resume opted in, in
+        # which case the speculative session/load runs here and the
+        # resumed=True observation is armed for the real turn. See
+        # get_or_create's docstring.
+        _, is_new, resumed = await sessions.get_or_create(
+            session_key,
+            agent=kiro_agent or slot.agent or None,
+            # Canonical crew identity — the resolver's alias, which
+            # covers the default crew on an empty slot; plumbed to the
+            # session so per-agent watchdog windows never depend on a
+            # cross-namespace name match. "" is authoritative: no
+            # alias applied, so no override applies.
+            crew_agent=crew_alias,
+            model=slot.model or agent_model or default_model or None,
+            cwd=slot.project or None,
+            speculative=True,
+            speculative_resume=allow_resume,
+            reasoning_effort_override=slot.reasoning_effort or None,
+        )
+    except SpeculativeResumeRefused:
+        # Two sources: the entry gate (resumable key, resume not
+        # opted in — fresh eager spawn leaves it to the first turn)
+        # or a failed speculative LOAD (allow_resume path: F2 fell
+        # back / mapping vanished / provider switch), rejected before
+        # registration so no claimable fallback session exists. Both
+        # end the same way: the first real message handles it.
+        logger.info("Eager spawn: %s left to first turn (refused)", session_key)
+        return
+    sessions.release(session_key)
+    # The cleanup below may only tear down a session THIS task created.
+    # is_new=False means another creator won the same-key race (or the
+    # claim attached to an already-registered session): a real turn
+    # owns that runtime, may have finished its turn already, and may
+    # have background work (subagents) still attached — removing it
+    # here would terminate the winner's session out from under it. The
+    # winner registered with its own current bindings, so the stale-
+    # bindings hazard these guards exist for does not apply to it.
+    if not is_new:
+        logger.info("Eager spawn: another creator won %s, leaving session alone", session_key)
+        return
+    # The slot can be deleted while the handshake ran; the delete
+    # handler's sessions.remove() may have executed before this task
+    # registered the session, which would leave an orphan that a
+    # recreated slot with the same key would silently reuse with THIS
+    # slot's (now stale) agent/cwd bindings. Tear it down.
+    if state.get_slot(slot.key) is not slot:
+        logger.info("Eager spawn: slot %s vanished mid-handshake, removing session", slot.key)
+        await sessions.remove(session_key)
+        return
+    # Same shape for a binding change: a switch handler's reset ran
+    # before registration and found nothing, so the session we just
+    # registered carries stale bindings. Remove it — the first real
+    # message cold-starts with the current bindings, exactly as if
+    # eager spawn never ran.
+    if _slot_binding(slot) != _bound:
+        logger.info(
+            "Eager spawn: slot %s bindings changed mid-handshake, removing session",
+            slot.key,
+        )
+        await sessions.remove(session_key)
+        return
+    logger.info(
+        "Eager spawn: session ready for %s in %.0fms (new=%s resumed=%s)",
+        session_key,
+        (time.monotonic() - _t0) * 1000.0,
+        is_new,
+        resumed,
+    )
+    if allow_resume and resumed:
+        _schedule_prefetch_ttl(state, slot, session_key)
+    # Fresh and resumed sessions alike count against the live-
+    # population cap: without this, sequential slot signals (create,
+    # agent/project set) stack one unclaimed agent process per slot
+    # until the idle sweep — the semaphore above only bounds
+    # concurrent handshakes. The TTL stays resume-only; fresh
+    # sessions hold no native session lock. The allowance is probed
+    # AGAIN here rather than reusing the admission value: the host
+    # may have tightened while the handshake ran, and a cap read
+    # before the spawn cannot see that.
+    allowance = await asyncio.to_thread(_prewarm_allowance)
+    await _cap_armed_prefetches(sessions, session_key, cap=allowance)
+    # allow_resume and not resumed cannot happen: a speculative
+    # resume whose load fell back is rejected BEFORE registration
+    # (SpeculativeResumeRefused, caught above) precisely so no
+    # claimable fallback session ever exists — a real turn queued
+    # during the load would otherwise claim it and strand its
+    # exchanges behind the preserved old sid.
 
 
 def _schedule_prefetch_ttl(state: "DashboardState", slot: "_ChatSlot", session_key: str) -> None:

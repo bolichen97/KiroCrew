@@ -1185,6 +1185,9 @@ class SessionManager:
             get_stuck_turn_report_secs=lambda: _STUCK_TURN_REPORT_SECS,
             get_pycache_gc_interval_secs=lambda: PYCACHE_GC_INTERVAL_SECS,
             get_session_idle_expired_event=lambda: SESSION_IDLE_EXPIRED,
+            # Resolved per call, not captured: the dashboard installs the probe
+            # after this manager (and possibly its cleanup boundary) exists.
+            has_attached_subagents=lambda key: self._has_attached_subagents(key),
         )
 
     def _cleanup_boundary(self) -> SessionCleanup:
@@ -1577,6 +1580,9 @@ class SessionManager:
         # whatever the last load in this process happened to publish.
         self._adopted_autocompact_pct = published_autocompact_pct()
         self._provider_factory = provider_factory
+        # Installed by the dashboard once its state exists (set_subagent_probe);
+        # None means "no dashboard, so no children can be attached".
+        self._subagent_probe: Callable[[str], bool] | None = None
         self._allocation_state = SessionRegistryState(
             start_sem=asyncio.Semaphore(_MAX_CONCURRENT_COLD_STARTS)
         )
@@ -2222,6 +2228,27 @@ class SessionManager:
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the lifecycle recycle callback."""
         self._lifecycle_boundary().set_recycle_callback(cb)
+
+    def set_subagent_probe(self, fn: Callable[[str], bool] | None) -> None:
+        """Install the "does *key* have sub-agent work attached?" predicate.
+
+        The RSS ceiling consults it before recycling an idle session: with
+        session sharing on, a parent's sub-agents run on the parent's runtime
+        after its own turn ends, so the busy semaphore alone cannot see them.
+        ``None`` uninstalls the probe (no dashboard, no children).
+        """
+        self._subagent_probe = fn
+
+    def _has_attached_subagents(self, key: str) -> bool:
+        """Answer the installed sub-agent probe, or False when none is installed.
+
+        A raising probe propagates: the cleanup boundary treats that as
+        "attached" so the session is kept.
+        """
+        probe = self._subagent_probe
+        if probe is None:
+            return False
+        return bool(probe(key))
 
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Delegate the ordered compaction gate ladder."""

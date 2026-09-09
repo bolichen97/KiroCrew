@@ -424,3 +424,48 @@ class TestServedBundleId:
         snap = state.status_snapshot()
         assert "bundle_id" in snap
         assert isinstance(snap["bundle_id"], str)
+
+
+class TestGatewayMemoryFields:
+    """`/api/status` publishes the gateway's own RSS and the session ceiling so
+    `kirocrew status` can show what is bounding memory."""
+
+    def test_fields_read_rss_and_the_configured_ceiling(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import handlers_system
+
+        monkeypatch.setattr(
+            handlers_system.platform_compat, "proc_rss_bytes", lambda: 321 * 1024 * 1024 + 7
+        )
+        cfg = MagicMock()
+        cfg.session.watchdog_rss_max_mb = 1536
+        monkeypatch.setattr(handlers_system.KiroCrewConfig, "load", lambda: cfg)
+        assert handlers_system._gateway_memory_fields() == (321, 1536)
+
+    def test_each_reading_degrades_alone(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import handlers_system
+
+        def _boom():
+            raise OSError("no procfs")
+
+        monkeypatch.setattr(handlers_system.platform_compat, "proc_rss_bytes", _boom)
+        cfg = MagicMock()
+        cfg.session.watchdog_rss_max_mb = 1536
+        monkeypatch.setattr(handlers_system.KiroCrewConfig, "load", lambda: cfg)
+        assert handlers_system._gateway_memory_fields() == (0, 1536)
+
+        monkeypatch.setattr(handlers_system.platform_compat, "proc_rss_bytes", lambda: 2**30)
+        monkeypatch.setattr(
+            handlers_system.KiroCrewConfig, "load", MagicMock(side_effect=RuntimeError)
+        )
+        assert handlers_system._gateway_memory_fields() == (1024, 0)
+
+    def test_api_status_publishes_both_fields_off_loop(self) -> None:
+        import inspect
+
+        from kiro_crew.dashboard import handlers_system
+
+        source = inspect.getsource(handlers_system.api_status)
+        assert '"gateway_rss_mb": gateway_rss_mb' in source
+        assert '"watchdog_rss_max_mb": watchdog_rss_max_mb' in source
+        # procfs + config read: never inline on the event loop.
+        assert "to_thread(_gateway_memory_fields)" in source

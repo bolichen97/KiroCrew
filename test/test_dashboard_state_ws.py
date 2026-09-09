@@ -711,6 +711,78 @@ class TestChatSlotStopState:
         assert d["stopping"] is True
 
 
+class TestSubagentProbeWiring:
+    """Tests for chat_utils.wire_session_subagent_probe.
+
+    The RSS ceiling in SessionManager consults this probe before recycling an
+    idle session; the probe must reach the dashboard's sub-agent registry and
+    the slot displaying the session, and both boot paths must install it.
+    """
+
+    def _installed_probe(self, state: DashboardState):
+        from kiro_crew.dashboard.chat_utils import wire_session_subagent_probe
+
+        wire_session_subagent_probe(state)
+        state.sessions.set_subagent_probe.assert_called_once()
+        probe = state.sessions.set_subagent_probe.call_args[0][0]
+        assert callable(probe)
+        return probe
+
+    def test_wire_installs_probe_on_sessions(self, state: DashboardState) -> None:
+        self._installed_probe(state)
+
+    def test_probe_reports_running_children(self, state: DashboardState) -> None:
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = [{"id": "a1"}]
+        state.subagents._queued_depth.return_value = 0
+        probe = self._installed_probe(state)
+
+        assert probe("dashboard:chat-1") is True
+        state.subagents.running_agents_for.assert_called_once_with("dashboard:chat-1")
+
+    def test_probe_without_a_tab_answers_from_the_registry(self, state: DashboardState) -> None:
+        """No open tab means no slot: the registry probes alone decide."""
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = []
+        state.subagents._queued_depth.return_value = 0
+        probe = self._installed_probe(state)
+
+        assert state.get_slot("chat-1") is None
+        assert probe("dashboard:chat-1") is False
+
+        state.subagents._queued_depth.return_value = 1
+        assert probe("dashboard:chat-1") is True
+
+    def test_probe_sees_in_flight_delivery_on_the_slot(self, state: DashboardState) -> None:
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = []
+        state.subagents._queued_depth.return_value = 0
+        slot = state.get_or_create_slot("chat-1")
+        probe = self._installed_probe(state)
+
+        assert probe("dashboard:chat-1") is False
+        slot._subagent_deliveries_inflight = 1
+        assert probe("dashboard:chat-1") is True
+
+    def test_probe_without_registry_reports_no_children(self, state: DashboardState) -> None:
+        state.subagents = None
+        probe = self._installed_probe(state)
+        assert probe("dashboard:chat-1") is False
+
+    def test_both_boot_paths_install_the_probe(self) -> None:
+        """start_dashboard AND start_api_server wire the probe after the state exists."""
+        import inspect
+
+        from kiro_crew.dashboard import server
+
+        for fn in (server.start_dashboard, server.start_api_server):
+            src = inspect.getsource(fn)
+            assert "wire_session_subagent_probe(state)" in src, fn.__name__
+            assert src.index("state = DashboardState(") < src.index(
+                "wire_session_subagent_probe(state)"
+            ), fn.__name__
+
+
 class TestCompactCallbackWiring:
     """Tests for DashboardState.wire_session_compact_callback.
 

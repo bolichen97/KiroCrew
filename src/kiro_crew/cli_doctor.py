@@ -37,6 +37,7 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.cli_perf import _read_gateway_pid
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     CRED_DISCORD_BOT_TOKEN,
@@ -99,7 +100,7 @@ from kiro_crew.platform import (
 from kiro_crew.platform.capability_bound import bind_capability_manager
 from kiro_crew.platform.defaults import DefaultCapabilityManager
 from kiro_crew.platform.governance import CU_MCP_SERVER, may_skip_gate_now
-from kiro_crew.sandbox import warm_backend
+from kiro_crew.sandbox import _MOUNT_SOURCE_PREFIX, warm_backend
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 from kiro_crew.service import apparmor
@@ -2057,6 +2058,70 @@ def _detect_userspace_oom_killer() -> str | bool | None:
     return False if determined else None
 
 
+def _gateway_rss_bytes(pid: int) -> int | None:
+    """Resident set size of *pid* in bytes, or None when no route can read it.
+
+    ``platform_compat.proc_rss_bytes_for_pid`` serves Linux (``/proc``) and
+    Windows (``GetProcessMemoryInfo``) but has no ctypes-only path on macOS and
+    answers None there, so this falls through to ``ps -o rss=`` resolved via
+    ``trusted_system_bin`` (ps reports KiB). Without the fallback the doctor
+    line reads "RSS unreadable" on every Mac.
+    """
+    rss = platform_compat.proc_rss_bytes_for_pid(pid)
+    if rss is not None or platform_compat.IS_WINDOWS:
+        return rss
+    ps_bin = platform_compat.trusted_system_bin("ps")
+    if ps_bin is None:
+        return None
+    try:
+        out = subprocess.check_output([ps_bin, "-o", "rss=", "-p", str(pid)], timeout=2)
+        return int(out.decode().strip()) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _gateway_memory_lines() -> list[str]:
+    """The ``session ceiling`` and ``gateway rss`` lines of the Memory Pressure section.
+
+    The ceiling is ``session.watchdog_rss_max_mb`` from the loaded config (``0``
+    = disabled, called out as such because an operator reading this section is
+    usually asking "what stops a runaway session tree?"). The RSS is read from
+    the live gateway's pid via the lock-holder oracle ``cli_perf`` already uses,
+    so a stale recorded pid can never be reported as the gateway's memory; no
+    live gateway prints "not running". Every failure degrades to a line saying
+    so — this is advisory and must never abort doctor.
+    """
+    lines: list[str] = []
+    try:
+        ceiling = int(KiroCrewConfig.load().session.watchdog_rss_max_mb)
+    except Exception:
+        lines.append("  session ceiling: ⚠️  could not read session.watchdog_rss_max_mb")
+    else:
+        if ceiling > 0:
+            lines.append(
+                f"  session ceiling: ✅ {ceiling} MiB per session process tree "
+                "(session.watchdog_rss_max_mb; idle sessions above it are recycled)"
+            )
+        else:
+            lines.append(
+                "  session ceiling: ⏹ disabled (session.watchdog_rss_max_mb = 0) — "
+                "nothing bounds a runaway session tree"
+            )
+    try:
+        pid = _read_gateway_pid()
+        if pid is None:
+            lines.append("  gateway rss:     ⏹ not running")
+        else:
+            rss = _gateway_rss_bytes(pid)
+            if rss is None:
+                lines.append(f"  gateway rss:     ⚠️  pid {pid} alive but RSS unreadable")
+            else:
+                lines.append(f"  gateway rss:     {rss // (1024 * 1024)} MiB (pid {pid})")
+    except Exception:
+        lines.append("  gateway rss:     ⚠️  could not determine (probe failed)")
+    return lines
+
+
 def _doctor_memory_pressure(issues: list[str]) -> None:
     """Report whether the host can degrade gracefully under memory pressure.
 
@@ -2076,6 +2141,12 @@ def _doctor_memory_pressure(issues: list[str]) -> None:
     """
     del issues  # advisory-only diagnostic; keeps the call-site signature uniform
     print("\nMemory Pressure")
+    # What is bounding memory right now, on every platform: the gateway's own
+    # resident set and the per-session tree ceiling the cleanup watchdog
+    # recycles at. Printed before the Linux-only freeze check so a Windows or
+    # macOS operator still sees the numbers that matter for a runaway tree.
+    for line in _gateway_memory_lines():
+        print(line)
     if not sys.platform.startswith("linux"):
         print(
             f"  freeze risk: ⏹ not applicable ({sys.platform} — the swap/OOM-killer "
@@ -2112,6 +2183,106 @@ def _doctor_memory_pressure(issues: list[str]) -> None:
     print("               thrashes file-backed pages and the host can livelock before")
     print("               the kernel OOM killer intervenes.")
     print("               Fix: add swap, enable systemd-oomd, or install earlyoom.")
+
+
+# ── Runtime tmpfs headroom (sandbox mount-source roots) ──────────────────────
+# Warn thresholds for the tmpfs roots the sandbox launcher stages bind-mount
+# sources on. Leaked ``tmp*`` mount dirs once filled ``/run/user/$UID`` until its
+# inodes ran out, at which point every tool spawn failed with a bare ``rc=1``.
+# Inode exhaustion is the more likely face on a tmpfs (each leaked dir is tiny
+# but costs an inode), so both free-space and free-inode fractions are checked,
+# plus an absolute inode floor: a small tmpfs at 11% free inodes can still be a
+# few hundred dirs from failure.
+_TMPFS_FREE_PCT_WARN = 10.0
+_TMPFS_FREE_INODES_FLOOR = 1000
+
+
+def _runtime_tmpfs_roots() -> list[str]:
+    """The roots the sandbox would stage mount sources on, in launcher order.
+
+    Reuses the sandbox's own chooser rather than hardcoding ``/run/user`` so a
+    change to the launcher's fallback chain moves this check with it.
+    """
+    return sandbox._mount_source_candidate_roots()
+
+
+def _tmpfs_usage(root: str) -> tuple[float, float, int, int] | None:
+    """``(free_space_pct, free_inode_pct, free_inodes, tmp_entries)`` for *root*.
+
+    ``None`` when the root does not exist or cannot be measured, or when the
+    platform has no ``os.statvfs`` (Windows; the doctor section that calls this
+    is Linux-only, so this is belt-and-braces for direct callers). ``tmp_entries``
+    counts the names carrying the sandbox launcher's mount-source prefix
+    (``kirocrew_sb_<pid>_``), so a warning can say how much of the pressure is
+    Kiro Crew's own; every other temporary entry belongs to somebody else and
+    is deliberately not counted, so the cleanup advice never points at it. A
+    filesystem that reports no inode accounting (``f_files == 0``) reads as
+    100% free inodes rather than as exhausted.
+    """
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        return None
+    try:
+        st = statvfs(root)
+    except OSError:
+        return None
+    free_space_pct = 100.0 * st.f_bavail / st.f_blocks if st.f_blocks else 100.0
+    if st.f_files:
+        free_inode_pct = 100.0 * st.f_favail / st.f_files
+        free_inodes = int(st.f_favail)
+    else:
+        # No inode accounting (btrfs, some FUSE mounts): both readings say
+        # "not a constraint" so neither the percentage nor the absolute floor
+        # below can fire on a filesystem that cannot run out of inodes.
+        free_inode_pct = 100.0
+        free_inodes = _TMPFS_FREE_INODES_FLOOR
+    try:
+        with os.scandir(root) as it:
+            tmp_entries = sum(1 for e in it if e.name.startswith(_MOUNT_SOURCE_PREFIX))
+    except OSError:
+        tmp_entries = 0
+    return free_space_pct, free_inode_pct, free_inodes, tmp_entries
+
+
+def _doctor_runtime_tmpfs(issues: list[str]) -> None:
+    """Warn when a sandbox tmp root is close to running out of space or inodes.
+
+    The failure this pre-empts is silent until total: leaked mount-source dirs
+    accumulate in the runtime tmpfs, and once its inodes are gone every sandboxed
+    tool spawn fails with nothing more than ``rc=1``. Reclaim runs on the
+    gateway, but an operator looking at a wall of ``rc=1`` needs somewhere that
+    names the disk. Appended to *issues*: a full tmp root breaks every tool, so
+    it is a fault, not host trivia. Linux only -- the launcher is.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    print("\nRuntime tmpfs")
+    for root in _runtime_tmpfs_roots():
+        usage = _tmpfs_usage(root)
+        if usage is None:
+            print(f"  {root}: ⏭  not present or unreadable")
+            continue
+        free_space_pct, free_inode_pct, free_inodes, tmp_entries = usage
+        detail = (
+            f"{free_space_pct:.0f}% space free, {free_inode_pct:.0f}% inodes free "
+            f"({free_inodes} inodes), {tmp_entries} {_MOUNT_SOURCE_PREFIX}* entries"
+        )
+        low_space = free_space_pct < _TMPFS_FREE_PCT_WARN
+        low_inodes = free_inode_pct < _TMPFS_FREE_PCT_WARN or free_inodes < _TMPFS_FREE_INODES_FLOOR
+        if low_space or low_inodes:
+            what = "inodes" if low_inodes and not low_space else "space"
+            if low_space and low_inodes:
+                what = "space and inodes"
+            print(f"  {root}: ⚠️  low on {what} — {detail}")
+            print(
+                "               Sandboxed tool spawns fail with rc=1 once this fills. "
+                f"Kiro Crew's own leaked mount dirs are the {_MOUNT_SOURCE_PREFIX}* "
+                "entries; a gateway restart reclaims them. Other entries there "
+                "belong to other applications: leave them alone."
+            )
+            issues.append(f"runtime tmpfs {root} low on {what} ({detail})")
+        else:
+            print(f"  {root}: ✅ {detail}")
 
 
 # ── kiro-cli installer residue ────────────────────────────────────────────────
@@ -3345,6 +3516,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Memory pressure preparedness (swap / userspace OOM killer) ──
     _doctor_memory_pressure(issues)
+
+    # ── Runtime tmpfs headroom (sandbox mount-source roots; Linux only) ──
+    _doctor_runtime_tmpfs(issues)
 
     # ── kiro-cli installer residue (silent unless residue is on disk) ──
     _doctor_cli_installer_residue(issues)

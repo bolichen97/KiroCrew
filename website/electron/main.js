@@ -62,6 +62,21 @@ function reopenCrewCompanionAfterUpdate() {
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
+const { installEarlyBootGuard } = require("./early-boot-guard");
+
+// Everything from here to `app.whenReady()` runs synchronously at module load,
+// before Chromium is ready and before any window, tray, or crash reporter
+// exists. The guard turns a throw anywhere in that span into a log entry, a
+// native error box, and exit(1) instead of a silent process death. `glog` and
+// `gatewayLogPath` are function declarations further down; they hoist, so the
+// guard can call them when it fires. The ready handler releases it once the
+// post-ready safety net below can take over.
+const releaseEarlyBootGuard = installEarlyBootGuard({
+  app,
+  dialog,
+  glog,
+  logPath: gatewayLogPath,
+});
 
 // Carry settings across the npm name rename before electron-store opens the
 // destination. Construction writes defaults, after which the seed could no
@@ -464,6 +479,10 @@ process.on("unhandledRejection", (reason) => {
 });
 
 app.whenReady().then(async () => {
+  // The crash reporter and the keep-alive safety net above are armed; from
+  // here on an exception is recovered, not fatal.
+  releaseEarlyBootGuard();
+
   const frameDecision = windows.platform.linuxFrameDecision;
   if (frameDecision) {
     glog(

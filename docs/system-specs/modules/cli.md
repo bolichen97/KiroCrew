@@ -1314,7 +1314,12 @@ non-destructive way to apply it.
 ## Status Command
 
 `kirocrew status` queries the running gateway's `/api/status` endpoint
-and prints uptime, sessions, messages, tool calls, subagents, crons, lessons.
+and prints uptime, sessions, messages, tool calls, subagents, crons, lessons,
+and a memory line: the gateway's own resident set (`gateway_rss_mb`) and the
+per-session tree ceiling the cleanup watchdog recycles at
+(`watchdog_rss_max_mb`, spelled out as disabled when `0`). Both fields are
+published by `/api/status` for this line; `kirocrew doctor` prints the same two
+readings at the top of its Memory Pressure section, on every platform.
 
 ## App Dev Mode
 

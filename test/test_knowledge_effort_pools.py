@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -110,7 +111,8 @@ class TestKnowledgeFetchPoolWiring:
         fetch_pool = object()
         app = web.Application()
         app["state"] = SimpleNamespace(knowledge_store=store)
-        app["knowledge_pipeline"] = object()
+        # The handler holds the pipeline's ingestion gate while the task claims.
+        app["knowledge_pipeline"] = SimpleNamespace(ingestion_in_flight=contextlib.nullcontext)
         app["knowledge_sync"] = SimpleNamespace(get_connector=lambda _type: None)
         app["knowledge_extraction_pool"] = extraction_pool
         app["knowledge_fetch_pool"] = fetch_pool
@@ -119,8 +121,10 @@ class TestKnowledgeFetchPoolWiring:
         observed: dict[str, object] = {}
         done = asyncio.Event()
 
-        async def _fake_sync(source_id, url, name, store, pipeline, pool):
+        async def _fake_sync(source_id, url, name, store, pipeline, pool, *, claim_settled=None):
             observed["pool"] = pool
+            if claim_settled is not None:
+                claim_settled.set()
             done.set()
 
         monkeypatch.setattr(kh, "_background_agent_sync", _fake_sync)

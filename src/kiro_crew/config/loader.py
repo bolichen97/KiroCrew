@@ -3455,7 +3455,10 @@ class KiroCrewConfig:
                 ),
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
                 archive_retention_days=_archive_retention_days(session_data),
-                watchdog_rss_max_mb=_safe_int(session_data.get("watchdog_rss_max_mb", 0), 0),
+                watchdog_rss_max_mb=_safe_int(
+                    session_data.get("watchdog_rss_max_mb", _sections.DEFAULT_WATCHDOG_RSS_MAX_MB),
+                    _sections.DEFAULT_WATCHDOG_RSS_MAX_MB,
+                ),
             ),
             taskrunner=TaskRunnerConfig(
                 max_parallel_steps=taskrunner_data.get(

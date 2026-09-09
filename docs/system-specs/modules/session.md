@@ -505,10 +505,19 @@ send time.
   path — is recorded in
   `../../architecture/design-notes/tool-stall-watchdog-placement.md`.
 - **RSS-threshold recycle** (`_rss_threshold_check`, config
-  `session.watchdog_rss_max_mb`, default 0 = disabled): recycles non-busy
+  `session.watchdog_rss_max_mb`, default 1536 MiB via
+  `DEFAULT_WATCHDOG_RSS_MAX_MB`; 0 disables): recycles non-busy
   sessions whose `/proc` process-tree RSS (MiB) exceeds the ceiling. Skips
   persistent (`_PERSISTENT_KEYS`) and `channel:`-prefixed keys — the same
   protected set as the idle sweep — and any session whose turn is in flight.
+  A parent with attached sub-agent work — running or queued children, or a
+  completion delivery still landing — is never recycled by the ceiling: with
+  session sharing on those children run on the parent's runtime after its own
+  turn ended, so the check consults `CleanupDeps.has_attached_subagents`
+  (installed by `chat_utils.wire_session_subagent_probe()` from both
+  `server.py` start paths via `SessionManager.set_subagent_probe`, built over
+  the shared `subagents_attached` predicate) right before `reset`, and a probe
+  that raises counts as attached.
   The `/proc` parent→child map is built ONCE per tick off-loop
   (`_build_child_map` on the maintenance executor) and shared across
   candidate trees (`_rss_mb_from_tree`); resident pages are summed across the

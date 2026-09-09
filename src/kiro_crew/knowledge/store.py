@@ -6,7 +6,10 @@ import base64
 import json
 import logging
 import threading
+import time
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +42,96 @@ AUTO_ADDED_PROP = "auto_added"
 # confirm and resume endpoints when the user adopts one; its presence is what keeps a
 # later refusal from undoing that decision.
 AUTO_REGISTRATION_RETIRED_PROP = "auto_registration_retired"
+
+#: How long ``maintenance_window`` waits for in-flight ingestion to drain
+#: before giving the sweep up for this launch.
+MAINTENANCE_WAIT_SECS = 600.0
+
+
+class IngestionGate:
+    """Reader/writer gate between ingestion and store maintenance.
+
+    Ingestion writes a source in several autocommit steps -- the source row,
+    its ingestion job, its items, its entities and their mentions -- and the
+    orphan sweep's predicates read exactly those half-states as orphans: a
+    source without items, an entity without a mention. The sweep runs after the
+    listener is up, concurrently with requests, so the two need an ordering
+    that is not a clock: ``ingestion_in_flight()`` brackets one whole ingest
+    (many may hold it at once) and ``maintenance_window()`` waits until no
+    holder remains, then holds the sweep's turn, during which a NEW ingest
+    waits at its entry rather than starting under the sweep.
+
+    The wait is bounded. Ingestion that never drains inside ``timeout`` makes
+    the window yield ``False`` -- the caller skips its sweep and the next
+    launch retries -- rather than either side killing the other. While the
+    window is waiting, new ingestion is already held back, so a steady stream
+    of ingests cannot starve the sweep indefinitely; a single long ingest can,
+    and that is the bounded case.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._ingesting = 0
+        self._maintenance = False
+
+    @contextmanager
+    def ingestion_in_flight(self, *, admitted: bool = False) -> Iterator[None]:
+        """Hold the gate for one ingest.
+
+        *admitted* is for a hold handed on from a current holder to a task it
+        starts: the holder's own hold means no sweep is running, so the new
+        hold joins it without waiting for a maintenance window that may have
+        begun waiting in between -- waiting there would hold the parent's
+        release hostage to the window's timeout (the window waits for the
+        parent; the parent waits for this entry). An admitted hold still counts,
+        so the window keeps waiting for it like any other.
+        """
+        with self._cond:
+            while self._maintenance and not admitted:
+                self._cond.wait()
+            self._ingesting += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._ingesting -= 1
+                if self._ingesting == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def maintenance_window(self, timeout: float = MAINTENANCE_WAIT_SECS) -> Iterator[bool]:
+        """Yield ``True`` with the store quiescent, ``False`` if it never drained."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._maintenance:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    break
+            if self._maintenance:
+                logger.warning(
+                    "Knowledge maintenance skipped: another maintenance window "
+                    "held for %.0fs", timeout)
+                yield False
+                return
+            self._maintenance = True
+            while self._ingesting > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    break
+            if self._ingesting > 0:
+                self._maintenance = False
+                self._cond.notify_all()
+                logger.warning(
+                    "Knowledge maintenance skipped: %d ingestion(s) still in flight "
+                    "after %.0fs", self._ingesting, timeout)
+                yield False
+                return
+        try:
+            yield True
+        finally:
+            with self._cond:
+                self._maintenance = False
+                self._cond.notify_all()
 
 
 @dataclass(frozen=True)
@@ -452,6 +545,10 @@ _OWNERSHIP_HASH_COL: dict[str, str] = {
 # ``text_hash`` and the row becomes correct for transformed documents too.
 
 
+#: Orphan sources deleted per writer transaction by :meth:`KnowledgeStore.reclaim_orphans`.
+_RECLAIM_CHUNK = 200
+
+
 class KnowledgeStore:
     def __init__(self, db_path: str, *, read_only: bool = False):
         self._db_path = db_path
@@ -500,20 +597,23 @@ class KnowledgeStore:
         self._graph = SimpleDiGraph()
         self._graph_loaded = False
         self._graph_lock = threading.RLock()
+        # Orders ingestion against the deferred orphan sweep -- see
+        # `IngestionGate`, `ingestion_in_flight` and `maintenance_window`.
+        self._ingestion_gate = IngestionGate()
         # This constructor runs on the event-loop thread by documented design
         # (see the thread-affinity note above). It is not an edge case:
         # `setup_knowledge_routes()` reads the gateway's lazy `knowledge_store`
         # property at route registration, which `start_dashboard` runs BEFORE
         # the socket binds, so construction happens on the loop on every
         # launch. The take is deliberate, so the on-loop guard -- which exists
-        # to police reader/writer query paths -- warned spuriously on every
-        # boot. Deliberate is not free, though: `_migrate()` runs an
-        # unconditional writer-locked orphan sweep, which is data-scaled and
-        # still runs here. `_load_graph()` does not: it is deferred to the
-        # first graph reader (`ensure_graph_loaded`), the same shape the FTS
-        # rebuild already uses, which takes roughly half the construction cost
-        # off the boot path. Gating the sweep as well would change when
-        # the writer lock is taken, so it stays.
+        # to police reader/writer query paths -- would warn spuriously on every
+        # boot. Deliberate is not free, though, so neither data-scaled piece of
+        # construction sits on the boot path: `_load_graph()` is deferred to
+        # the first graph reader (`ensure_graph_loaded`), the same shape the
+        # FTS rebuild uses, and the writer-locked orphan sweep is
+        # `reclaim_orphans()`, kicked from a worker thread by `start_dashboard`
+        # once the listener is up. What remains here is the schema DDL and the
+        # per-column ALTERs, which are O(schema), not O(data).
         # The suppression ends with the block: the six non-constructor
         # `_load_graph()` call sites and every query path stay fully guarded.
         if read_only:
@@ -769,14 +869,21 @@ class KnowledgeStore:
         # source_locations predates being an identity table: pre-existing DBs have
         # neither the (item_id, source_id) uniqueness nor any index. De-duplicate
         # first so the unique index can be created, then add both lookup indexes.
-        self.db.execute("""
-            DELETE FROM source_locations WHERE id NOT IN (
-                SELECT MIN(id) FROM source_locations GROUP BY item_id, source_id
-            )
-        """)
-        self.db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_locations_item_source "
-            "ON source_locations(item_id, source_id)")
+        # The de-dup is a full GROUP BY over the table, so it is gated on the
+        # unique index NOT existing yet: once the index is in place duplicates
+        # are impossible, and the scan would run on every open for nothing.
+        has_unique = self.db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'index' "
+            "AND name = 'idx_source_locations_item_source'").fetchone()
+        if has_unique is None:
+            self.db.execute("""
+                DELETE FROM source_locations WHERE id NOT IN (
+                    SELECT MIN(id) FROM source_locations GROUP BY item_id, source_id
+                )
+            """)
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_locations_item_source "
+                "ON source_locations(item_id, source_id)")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_source_locations_item_id "
             "ON source_locations(item_id)")
@@ -930,6 +1037,64 @@ class KnowledgeStore:
         if "merged_into_source_id" not in agent_cols:
             self.db.execute(
                 "ALTER TABLE agent_item_state ADD COLUMN merged_into_source_id TEXT")
+        # The orphan sweep is NOT here any more -- see `reclaim_orphans`. The
+        # constructor runs on the event loop before the socket binds, and the
+        # sweep is data-scaled and writer-locked, so on a large store it
+        # stalled boot long enough for runtime timeouts to kill the gateway.
+        # `start_dashboard` kicks it from a worker thread once the listener is
+        # up (`_kick_knowledge_orphan_reclaim`).
+
+    def ingestion_in_flight(self, *, admitted: bool = False):
+        """Bracket one whole ingest so the deferred sweep never sees it half-written.
+
+        Held from the source row through the last mention commit; entering
+        waits while :meth:`maintenance_window` holds the sweep's turn.
+        """
+        return self._ingestion_gate.ingestion_in_flight(admitted=admitted)
+
+    def maintenance_window(self, timeout: float = MAINTENANCE_WAIT_SECS):
+        """Wait for ingestion to drain, then hold new ingestion off for the body.
+
+        Yields ``True`` once the store is quiescent; ``False`` -- logged -- when
+        ingestion does not drain within ``timeout``, in which case the caller
+        skips its sweep. See :class:`IngestionGate`.
+        """
+        return self._ingestion_gate.maintenance_window(timeout)
+
+    def reclaim_orphans(self) -> None:
+        """Delete orphan sources, entities and stale relations -- off the boot path.
+
+        Formerly the tail of :meth:`_migrate`, so it ran inside ``__init__`` on
+        the event-loop thread on every launch, before the socket bound. The
+        body is data-scaled (every predicate is a full scan over ``sources``,
+        ``items`` and the state tables) and takes SQLite's writer lock, so a
+        large knowledge store stalled the gateway for long enough to trip the
+        runtime's boot timeouts. ``start_dashboard`` now runs this from a
+        worker thread AFTER the listener is accepting, via
+        ``_kick_knowledge_orphan_reclaim``; the store is readable throughout
+        (WAL readers do not wait on the writer).
+
+        Running after the listener is up means a request can be ingesting
+        concurrently: :meth:`add_source` commits the source row on its own, and
+        the rows that protect it from the orphan predicate (its ingestion job,
+        its items, its entities' mentions) are written by the caller's pipeline
+        some time later. A sweep observing that half state would delete a
+        source the user just added. The deferred worker therefore runs this
+        inside :meth:`maintenance_window`, which waits for every
+        :meth:`ingestion_in_flight` holder to finish and holds new ingestion
+        off for the duration; this method itself sweeps every row it finds.
+
+        A caller that looks up an existing source and ingests into it later
+        holds ``pipeline.ingestion_in_flight()`` across the whole span, so the
+        sweep waits for it rather than racing it.
+
+        Thread-safe by the same rules as every other write path: the calling
+        thread gets its own connection through :attr:`db`, and the sweep runs
+        as a series of short ``BEGIN IMMEDIATE`` transactions (see the body). Because it may now run after a reader
+        has materialised the graph, it refreshes the in-memory graph when one is
+        loaded -- the constructor-time sweep never had to, since it always ran
+        before the first load.
+        """
         # Clean orphan sources (no items), entities (no mentions/relations), and stale relations
         #
         # Folder sources are EXCLUDED: a watched folder with zero discovered
@@ -937,31 +1102,73 @@ class KnowledgeStore:
         # user-set state -- notably a paused empty folder would be dropped on
         # restart and then re-created as active by auto-discovery, silently
         # un-pausing it. The row is user-registered configuration, not derived
-        # data, so only its items are reclaimable.
+        # data, so only its items are reclaimable. The agent-document and
+        # artifact aggregate sources are containers of the same kind: each is
+        # created empty ('active', no items, no state rows) the moment its
+        # feature first needs it and filled by a later write, so an empty one
+        # is a feature waiting for its first document, not garbage.
+        orphan_pred = (
+            "id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
+            "AND source_type NOT IN ('local_folder', 'obsidian_vault', 'quip', 'agent', 'artifact') "
+            "AND id NOT IN (SELECT source_id FROM ingestion_jobs WHERE status IN ('pending', 'processing')) "
+            # Only a source whose ingest has run to an end state is reclaimable.
+            # Every other status is a claim on the row: 'pending' (the column
+            # default a fresh add_source row carries until its background ingest
+            # writes its gate holder and job row), 'pending_confirmation',
+            # 'syncing', 'active' (a producible initial status for a source a
+            # feature fills later) and 'paused' (user-set) all mean somebody
+            # still intends to write under it. The allowlist is written by the
+            # row's own INSERT or by the ingest that finished, so there is no
+            # window in which a live source reads as an orphan.
+            "AND COALESCE(sync_status, '') IN ('synced', 'error', 'missing') "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM folder_file_state) "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM artifact_item_state) "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM agent_item_state) "
+            # A source can hold documents it does not OWN: after a duplicate
+            # collapse it is a location of the surviving copy. Reaping it here
+            # would delete the very rows that record co-ownership, on every
+            # gateway start, and the document would stop being reachable from it.
+            "AND id NOT IN (SELECT DISTINCT source_id FROM source_locations)"
+        )
+        # The candidate list is read outside any transaction, and the deletes run
+        # in chunks of short BEGIN IMMEDIATE transactions that re-check the
+        # predicate under the lock. A knowledge write issued on the event loop
+        # while the sweep runs waits for at most one chunk instead of the whole
+        # data-scaled sweep, so the post-bind sweep cannot stall the loop for
+        # the duration the pre-bind one did.
+        orphan_ids = [
+            row[0] for row in self.db.execute(f"SELECT id FROM sources WHERE {orphan_pred}").fetchall()
+        ]
+        for offset in range(0, len(orphan_ids), _RECLAIM_CHUNK):
+            chunk = orphan_ids[offset : offset + _RECLAIM_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            still_orphan = f"SELECT id FROM sources WHERE id IN ({marks}) AND {orphan_pred}"
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(f"DELETE FROM source_locations WHERE source_id IN ({still_orphan})", chunk)
+                self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({still_orphan})", chunk)
+                self.db.execute(f"DELETE FROM sources WHERE id IN ({still_orphan})", chunk)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            orphan_sources_q = (
-                "SELECT id FROM sources WHERE id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
-                "AND source_type NOT IN ('local_folder', 'obsidian_vault', 'quip') "
-                "AND id NOT IN (SELECT source_id FROM ingestion_jobs WHERE status IN ('pending', 'processing')) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM folder_file_state) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM artifact_item_state) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM agent_item_state) "
-                # A source can hold documents it does not OWN: after a duplicate
-                # collapse it is a location of the surviving copy. Reaping it here
-                # would delete the very rows that record co-ownership, on every
-                # gateway start, and the document would stop being reachable from it.
-                "AND id NOT IN (SELECT DISTINCT source_id FROM source_locations)"
-            )
-            self.db.execute(f"DELETE FROM source_locations WHERE source_id IN ({orphan_sources_q})")
-            self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({orphan_sources_q})")
-            self.db.execute(f"DELETE FROM sources WHERE id IN ({orphan_sources_q})")
             self.db.execute("DELETE FROM entity_relations WHERE source_id NOT IN (SELECT id FROM entities) OR target_id NOT IN (SELECT id FROM entities)")
             self._prune_orphan_entities()
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        # Only a graph somebody already materialised can be holding the entities
+        # just dropped; an unloaded one is built fresh by its first reader. The
+        # flag is read under ``_graph_lock`` so a first load racing this sweep
+        # cannot slip between the check and the refresh: a load that holds the
+        # lock finishes first and then reads as loaded (so it is refreshed), and
+        # a load that arrives later reads the tables after the prune committed.
+        with self._graph_lock:
+            if self._graph_loaded:
+                self._load_graph()
 
     def _prune_orphan_entities(self) -> None:
         """Delete entities nothing references any more -- no mention, no relation.
