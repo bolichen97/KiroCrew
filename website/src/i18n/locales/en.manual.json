@@ -5032,7 +5032,9 @@
       "secrets_pending_title": "Agent requested secrets",
       "secrets_section": "Vault secrets",
       "secrets_revoke_all": "Revoke all secrets",
-      "secrets_revoke_all_confirm": "Revoke all?"
+      "secrets_revoke_all_confirm": "Revoke all?",
+      "retried_n_times_one": "Retried {{count}} time",
+      "retried_n_times_other": "Retried {{count}} times"
     },
     "servicesTab": {
       "channels": "Channels",

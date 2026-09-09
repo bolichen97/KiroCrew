@@ -12729,7 +12729,11 @@
       "no_owning_session": "Нет сессии-владельца",
       "owning_session": "Сессия-владелец",
       "secrets_revoke_all": "Отозвать все секреты",
-      "secrets_revoke_all_confirm": "Отозвать все?"
+      "secrets_revoke_all_confirm": "Отозвать все?",
+      "retried_n_times_few": "{{count}} повторные попытки",
+      "retried_n_times_many": "{{count}} повторных попыток",
+      "retried_n_times_one": "{{count}} повторная попытка",
+      "retried_n_times_other": "{{count}} повторные попытки"
     },
     "servicesTab": {
       "channels": "Каналы",

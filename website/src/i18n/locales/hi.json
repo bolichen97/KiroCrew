@@ -12383,7 +12383,9 @@
       "no_owning_session": "कोई स्वामी सत्र नहीं",
       "owning_session": "स्वामी सत्र",
       "secrets_revoke_all": "सभी सीक्रेट रद्द करें",
-      "secrets_revoke_all_confirm": "सब निरस्त करें?"
+      "secrets_revoke_all_confirm": "सब निरस्त करें?",
+      "retried_n_times_one": "{{count}} बार पुनः प्रयास किया गया",
+      "retried_n_times_other": "{{count}} बार पुनः प्रयास किया गया"
     },
     "servicesTab": {
       "channels": "चैनल",

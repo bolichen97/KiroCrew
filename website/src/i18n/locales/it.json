@@ -12556,7 +12556,10 @@
       "no_owning_session": "Nessuna sessione proprietaria",
       "owning_session": "Sessione proprietaria",
       "secrets_revoke_all": "Revoca tutti i segreti",
-      "secrets_revoke_all_confirm": "Revocare tutto?"
+      "secrets_revoke_all_confirm": "Revocare tutto?",
+      "retried_n_times_many": "{{count}} nuovi tentativi",
+      "retried_n_times_one": "{{count}} nuovo tentativo",
+      "retried_n_times_other": "{{count}} nuovi tentativi"
     },
     "servicesTab": {
       "channels": "Canali",

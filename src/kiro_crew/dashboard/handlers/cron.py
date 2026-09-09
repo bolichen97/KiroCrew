@@ -2645,6 +2645,8 @@ async def api_crons(request: web.Request) -> web.Response:
             )[0]
             or None,
             "last_run_ts": j.last_run_ts,
+            "last_retry_count": j.last_retry_count,
+            "last_retry_run_ts": j.last_retry_run_ts,
             "has_result": bool(j.last_result),
             "has_slot": state.has_slot(f"cron-{j.id}"),
             "next_run_ts": compute_next_run_ts(j, now=now),

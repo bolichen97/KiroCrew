@@ -12210,7 +12210,8 @@
       "no_owning_session": "所有セッションなし",
       "owning_session": "所有セッション",
       "secrets_revoke_all": "すべてのシークレットを取り消す",
-      "secrets_revoke_all_confirm": "すべて取り消しますか？"
+      "secrets_revoke_all_confirm": "すべて取り消しますか？",
+      "retried_n_times_other": "{{count}}回再試行しました"
     },
     "servicesTab": {
       "channels": "チャネル",

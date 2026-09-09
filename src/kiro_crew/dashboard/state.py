@@ -3428,6 +3428,7 @@ class _ChatSlot:
         "total_messages",
         "_task",
         "_turn_generation",
+        "_chunk_seq",
         "event",
         "_pending",
         "_pending_consumers",
@@ -3663,6 +3664,11 @@ class _ChatSlot:
         # None after teardown, so consumers that span awaits cannot distinguish
         # "stayed idle" from "ran and finished" by comparing task references.
         self._turn_generation: int = 0
+        # Wire seq of the newest chat_chunk this slot has emitted, across turns:
+        # the counter never restarts, so a client's replay floor (the seq its
+        # transcript already holds) orders every later chunk above it without
+        # knowing where one turn ended and the next began.
+        self._chunk_seq: int = 0
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         # Number of readers currently treating ``_pending`` as their delivery

@@ -569,13 +569,99 @@ function hydrateQueuedBubbles(
   return base
 }
 
-/** Single-sourced "N chunk(s) missed" degradation marker. Shared by the reducer's
- *  defensive non-batched path and the useWebSocket flush buffer (the live path)
- *  so the marker text and gap arithmetic cannot drift between the two copies.
+/** Single-sourced "N chunk(s) missed" degradation marker. Used by the reducer's
+ *  defensive non-batched path and by `batchedTextAboveFloor` for the live
+ *  batched path, so the marker text and gap arithmetic cannot drift.
  *  Returns '' when the seqs are adjacent (no gap). */
 export const missedChunkMarker = (prevSeq: number, curSeq: number): string => {
   const missed = curSeq - prevSeq - 1
   return missed > 0 ? `\n[${missed} chunk(s) missed]\n` : ''
+}
+
+/** The chunk-seq floor a slot snapshot vouches for: the `seq` the server folded
+ *  onto the snapshot's trailing `streaming` row (chat_utils._prepare_messages),
+ *  i.e. the newest chunk whose text that snapshot already contains. A live
+ *  `chat_chunk` with a seq at or below it is a replay of text the snapshot
+ *  holds and must be dropped, not appended — the duplicated leading fragment
+ *  seen after a reconnect. Returns `undefined` for a snapshot without one (an
+ *  older gateway, or no stream in flight), which leaves the guard as it was. */
+export const snapshotChunkSeq = (messages: ChatMessage[]): number | undefined => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'streaming') return typeof m.seq === 'number' ? m.seq : undefined
+  }
+  return undefined
+}
+
+/** The generation a snapshot's trailing streaming row was numbered by (the
+ *  `gen` the server folds beside `seq`); `undefined` for an older gateway. */
+export const snapshotChunkGen = (messages: ChatMessage[]): string | undefined => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'streaming') return typeof m.gen === 'string' ? m.gen : undefined
+  }
+  return undefined
+}
+
+/** The seq floor to order an incoming chunk or snapshot against, given the
+ *  generation it carries. Seqs are a per-slot counter that continues across
+ *  turns but restarts with the gateway process, so a floor this generation
+ *  cannot vouch for says nothing about it: the floor is dropped (`undefined`)
+ *  rather than compared, which is what stops a pre-restart floor from
+ *  swallowing the new process's early chunks.
+ *
+ *  A floor with NO generation (`floorGen === undefined`) counts as unvouched
+ *  too, not as a match. It is what an older gateway's seq-only frames leave
+ *  behind, so after an upgrade or a reconnect the first generation-stamped chunk
+ *  arrives numbered from a restarted counter and sits below that stale floor —
+ *  treating "no generation" as compatible dropped the new process's reply text
+ *  and left every later snapshot reconciling against a floor from a dead
+ *  process.
+ *
+ *  An incoming frame with no generation keeps the floor: that is the same older
+ *  gateway still running, where seqs are the only ordering available. */
+export const floorForGen = (floor: number | undefined, floorGen: string | undefined, gen: string | undefined): number | undefined =>
+  gen !== undefined && gen !== floorGen ? undefined : floor
+
+/** Raise a chunk-seq floor to what a snapshot vouches for; never lower it. A
+ *  live frame may already have moved the floor past a snapshot taken earlier,
+ *  and lowering it would let the frames between the two be applied again. */
+export const raiseChunkSeq = (current: number | undefined, fromSnapshot: number | undefined): number | undefined => {
+  if (fromSnapshot === undefined) return current
+  return current === undefined || fromSnapshot > current ? fromSnapshot : current
+}
+
+/** One chunk inside a batched `sseChatMessage` frame: the text the hook
+ *  buffered for it and the seq the WS frame carried; gap markers are derived by
+ *  the reducer from the seqs, not carried in the text. */
+export type BatchedChunkPart = { seq?: number; text: string }
+
+/** The text of a batched frame that lies ABOVE a slot's chunk-seq floor, with
+ *  the gap markers recomputed over the parts that survive. The reducer is the
+ *  single owner of that floor (`lastChunkSeq`, raised by a snapshot's trailing
+ *  streaming row and by every applied chunk); the hook only batches per
+ *  animation frame and has no view of it. A part at or below the floor is text
+ *  a snapshot already holds — the duplicated leading fragment seen after a
+ *  reconnect or a mid-stream refresh — and is dropped; a part with no seq
+ *  cannot be placed against the floor and is kept. Markers are derived HERE,
+ *  from the floor and the kept seqs, rather than carried in the parts: a gap
+ *  the hook saw on the wire may be exactly what the snapshot filled in, and a
+ *  marker inlined at arrival would then flag a chunk that is on screen.
+ *  Returns `undefined` when nothing survives so the caller leaves the slot
+ *  untouched (no run-state bump, no streaming row). */
+export const batchedTextAboveFloor = (parts: BatchedChunkPart[], floor: number | undefined): string | undefined => {
+  const kept = parts.filter(p => p.seq === undefined || floor === undefined || p.seq > floor)
+  if (kept.length === 0) return undefined
+  let prev = floor
+  let text = ''
+  for (const p of kept) {
+    if (p.seq !== undefined) {
+      if (prev !== undefined) text += missedChunkMarker(prev, p.seq)
+      prev = p.seq
+    }
+    text += p.text
+  }
+  return text
 }
 
 /** Per-slot activity-panel open/closed state, persisted to localStorage so the
@@ -775,6 +861,10 @@ interface ChatState {
   /** Last older-history fetch was rejected; surfaced on the top-of-transcript bar. */
   slotOlderError: boolean
   lastChunkSeq: number | undefined
+  /** The gateway process generation `lastChunkSeq` was numbered by (see
+   *  chunk_generation server-side); a chunk or snapshot from a different
+   *  generation replaces the floor instead of being ordered against it. */
+  lastChunkGen: string | undefined
   _wsChunkedDuringFetch: boolean
   /** How many `chat_message` frames were dropped as redeliveries (see
    *  `isRedeliveredMessage`), across every slot, for the life of this tab.
@@ -941,7 +1031,7 @@ interface ChatState {
   thinkingOrphans: Record<string, Array<ParkedThinking<ChatMessage>>>
   /** Path B: per-slot live stream state so a non-active pane shows its own
    *  streaming/tool/idle indicator (mirrors slotActivity for tool events). */
-  slotRun: Record<string, { state: SlotState; lastChunkSeq?: number }>
+  slotRun: Record<string, { state: SlotState; lastChunkSeq?: number; lastChunkGen?: string }>
   /** Path B: per-slot one-time hydration guard so the server history is
    *  prepended exactly once even if a WS frame seeds slotMessages first. */
   slotHydrated: Record<string, boolean>
@@ -1044,6 +1134,7 @@ const initialState: ChatState = {
   loadingOlder: false,
   slotOlderError: false,
   lastChunkSeq: undefined,
+  lastChunkGen: undefined,
   _wsChunkedDuringFetch: false,
   _redeliveredFramesDropped: 0,
   history: [],
@@ -1150,9 +1241,10 @@ function loadSlotActivity(state: ChatState, key: string): void {
  */
 function applyNonActiveFrame(
   state: ChatState,
-  p: { slot: string; role: string; content: string; ts?: string; seq?: number; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean },
+  p: { slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] },
 ) {
-  const { slot, role, content, ts, seq, cls, meta, kind, batched } = p
+  const { slot, role, ts, seq, gen, cls, meta, kind, batched, parts } = p
+  let content = p.content
   if (isUnsafeKey(slot)) return  // never index a state map with __proto__/constructor/prototype
   const msgs = (state.slotMessages[safeKey(slot)] ??= [])
   const run = (state.slotRun[safeKey(slot)] ??= { state: 'idle' })
@@ -1173,10 +1265,20 @@ function applyNonActiveFrame(
     return
   }
   if (role === 'chunk') {
-    // Idempotency guard (direct/non-batched path): drop a replayed chunk so a
-    // redelivered seq is not appended twice. Batched frames are pre-deduped by
-    // the WS flush buffer (see useWebSocket), matching the missedChunkMarker
-    // `!batched` gating below.
+    // Replay floor, owned here. `run.lastChunkSeq` is raised by a snapshot's
+    // trailing streaming row (switchSlot / refreshSlot / warmSlotCache) and by
+    // every applied chunk. A batched frame carries each chunk's seq in `parts`;
+    // only the parts above the floor are appended, and a frame with nothing
+    // above it leaves the slot untouched. A direct (non-batched) chunk at or
+    // below the floor is a replayed seq and is dropped whole. A frame from
+    // another gateway generation replaces the floor first (floorForGen).
+    run.lastChunkSeq = floorForGen(run.lastChunkSeq, run.lastChunkGen, gen)
+    if (gen !== undefined) run.lastChunkGen = gen
+    if (batched && parts) {
+      const kept = batchedTextAboveFloor(parts, run.lastChunkSeq)
+      if (kept === undefined) return
+      content = kept
+    }
     if (!batched && seq !== undefined && run.lastChunkSeq !== undefined && seq <= run.lastChunkSeq) {
       return
     }
@@ -1205,13 +1307,14 @@ function applyNonActiveFrame(
     if (streamIdx >= 0) {
       const msg = msgs[streamIdx]
       // Share missedChunkMarker with the active path so the two cannot drift.
-      // Skip on batched frames: the live WS flush buffer already owns gap
-      // detection across the chunks it merges and inlines the marker into the
-      // batch content, and it dispatches each batch carrying only the batch's
-      // LAST seq. Comparing consecutive batches' last-seqs here would treat the
-      // batch size as a gap and fabricate a false "[N chunk(s) missed]" marker
-      // on every multi-chunk background-pane batch. Mirror the active path,
-      // which guards the identical branch with `!batched`.
+      // Skip on batched frames: `batchedTextAboveFloor` owns gap detection
+      // across the chunks a batch merges — it walks the batch's `parts`, calls
+      // `missedChunkMarker` between consecutive seqs and inlines the result into
+      // the text it returns — while the frame itself carries only the batch's
+      // LAST seq. Comparing consecutive batches' last-seqs HERE would therefore
+      // treat the batch size as a gap and fabricate a false "[N chunk(s)
+      // missed]" marker on every multi-chunk background-pane batch. Mirror the
+      // active path, which guards the identical branch with `!batched`.
       if (!batched && seq !== undefined && run.lastChunkSeq !== undefined) {
         msg.content += missedChunkMarker(run.lastChunkSeq, seq)
       }
@@ -3712,7 +3815,7 @@ const chatSlice = createSlice({
   initialState,
   reducers: {
     setActiveSlot(state, action: PayloadAction<string | null>) { state.activeSlot = action.payload; state.slotState = 'idle'; state.pendingTurnSlot = null },
-    clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
+    clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state.lastChunkGen = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
     setPendingInput(state, action: PayloadAction<string | null>) { state.pendingInput = action.payload },
     setAgentSwitchNotice(state, action: PayloadAction<string | null>) {
       // Always create a fresh value so repeating the same refusal restarts the
@@ -5313,8 +5416,9 @@ const chatSlice = createSlice({
       if (open?.role === 'thinking') { open.content += content; return }
       state.messages.splice(at, 0, { role: 'thinking', content, cls: '', meta: { clientTs: mintMsgId() } })
     },
-    sseChatMessage(state, action: PayloadAction<{ slot: string; role: string; content: string; ts?: string; seq?: number; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean }>) {
-      const { slot, role, content, ts, seq, cls, meta, kind, batched } = action.payload
+    sseChatMessage(state, action: PayloadAction<{ slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] }>) {
+      const { slot, role, ts, seq, gen, cls, meta, kind, batched, parts } = action.payload
+      let content = action.payload.content
       if (slot !== state.activeSlot) { applyNonActiveFrame(state, action.payload); return }
       // stop_event — replace in place by id, or insert new
       const effectiveKind = kind ?? (meta?.kind as string | undefined)
@@ -5332,10 +5436,21 @@ const chatSlice = createSlice({
       }
       // WS chunk — accumulate into streaming message, preserve rawText
       if (role === 'chunk') {
-        // Idempotency guard (direct/non-batched path): drop a replayed chunk so a
-        // redelivered seq is not appended twice. Batched frames are pre-deduped by
-        // the WS flush buffer (see useWebSocket), matching the missedChunkMarker
-        // `!batched` gating below.
+        // Replay floor, owned here. `state.lastChunkSeq` is raised by a
+        // snapshot's trailing streaming row (switchSlot / refreshSlot) and by
+        // every applied chunk. A batched frame carries each chunk's seq in
+        // `parts`; only the parts above the floor are appended, and a frame with
+        // nothing above it leaves the slot untouched. A direct (non-batched)
+        // chunk at or below the floor is a replayed seq and is dropped whole.
+        // A frame from another gateway generation replaces the floor first
+        // (floorForGen).
+        state.lastChunkSeq = floorForGen(state.lastChunkSeq, state.lastChunkGen, gen)
+        if (gen !== undefined) state.lastChunkGen = gen
+        if (batched && parts) {
+          const kept = batchedTextAboveFloor(parts, state.lastChunkSeq)
+          if (kept === undefined) return
+          content = kept
+        }
         if (!batched && seq !== undefined && state.lastChunkSeq !== undefined && seq <= state.lastChunkSeq) {
           return
         }
@@ -5363,9 +5478,10 @@ const chatSlice = createSlice({
           const msg = state.messages[streamIdx]
           // Defensive non-batched gap detection. The live WS path always sets
           // `batched` — the useWebSocket flush buffer owns gap detection across
-          // the chunks it merges and inlines the marker itself — so this branch
-          // only runs for a direct (test/legacy) non-batched chunk dispatch. It
-          // shares missedChunkMarker with the buffer so the two cannot drift.
+          // the chunks it merges and inlines the marker into each part's text —
+          // so this branch only runs for a direct (test/legacy) non-batched
+          // chunk dispatch. It shares missedChunkMarker with the buffer so the
+          // two cannot drift.
           if (!batched && seq !== undefined && state.lastChunkSeq !== undefined) {
             msg.content += missedChunkMarker(state.lastChunkSeq, seq)
           }
@@ -5734,6 +5850,22 @@ const chatSlice = createSlice({
         }
         // Restore target slot's activity (or empty)
         loadSlotActivity(state, target)
+        // The replay floor is per slot (each slot numbers its own chunks). Park
+        // the outgoing slot's floor on its background run entry (raise, never
+        // lower, so a frame that moved it past an earlier snapshot is not
+        // undone) and take over the target's, which its background frames
+        // maintain: carrying A's higher floor into a running B would drop B's
+        // opening chunks as replays.
+        const runs = (state.slotRun ??= {})
+        if (state.activeSlot !== null && state.activeSlot !== target && !isUnsafeKey(state.activeSlot)) {
+          const outgoing = (runs[safeKey(state.activeSlot)] ??= { state: 'idle' })
+          outgoing.lastChunkSeq = raiseChunkSeq(floorForGen(outgoing.lastChunkSeq, outgoing.lastChunkGen, state.lastChunkGen), state.lastChunkSeq)
+          if (state.lastChunkGen !== undefined) outgoing.lastChunkGen = state.lastChunkGen
+        }
+        if (target !== state.activeSlot) {
+          state.lastChunkSeq = runs[safeKey(target)]?.lastChunkSeq
+          state.lastChunkGen = runs[safeKey(target)]?.lastChunkGen
+        }
         // Set activeSlot immediately so WS events for the new slot are accepted.
         // Restore cached messages if available (instant switch), otherwise show loading.
         state.activeSlot = target
@@ -5850,6 +5982,21 @@ const chatSlice = createSlice({
         state.slotRunning = running
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
+        // Seed the replay guard from the PURE fetched page: its trailing
+        // streaming row carries the newest chunk seq the server folded into
+        // it, so a live chunk racing this snapshot is dropped, not re-appended.
+        // Seqs are the slot's and never restart, so a snapshot from an earlier
+        // turn can only sit at or below the live floor (raise, never lower). A
+        // snapshot of a slot that is NOT running says no stream is in flight:
+        // the floor is cleared, so a gateway restart (which does restart the
+        // counter) cannot leave a stale floor over the next turn's chunks.
+        if (running) {
+          const snapGen = snapshotChunkGen(messages)
+          state.lastChunkSeq = raiseChunkSeq(floorForGen(state.lastChunkSeq, state.lastChunkGen, snapGen), snapshotChunkSeq(messages))
+          if (snapGen !== undefined) state.lastChunkGen = snapGen
+        } else {
+          state.lastChunkSeq = undefined
+        }
         /* The cursor is a row OFFSET, not the array's first row, so keeping a head
          * above the page without shifting it made the next "load earlier" re-fetch
          * exactly the rows just kept. `loadOlderMessages` dedupes them, so the
@@ -5919,6 +6066,16 @@ const chatSlice = createSlice({
         // as transient below: the target is real, so keeping it selected with an
         // empty pane lets a retry succeed.
         if (!keepTarget && origin && origin.key !== target && isMissingSlotError(action.payload ?? action.error)) {
+          // The floor is per slot: park whatever the target accrued on its run
+          // entry and take the origin's back from where `pending` parked it.
+          const runs = (state.slotRun ??= {})
+          if (!isUnsafeKey(target)) {
+            const gone = (runs[safeKey(target)] ??= { state: 'idle' })
+            gone.lastChunkSeq = raiseChunkSeq(floorForGen(gone.lastChunkSeq, gone.lastChunkGen, state.lastChunkGen), state.lastChunkSeq)
+            if (state.lastChunkGen !== undefined) gone.lastChunkGen = state.lastChunkGen
+          }
+          state.lastChunkSeq = runs[safeKey(origin.key)]?.lastChunkSeq
+          state.lastChunkGen = runs[safeKey(origin.key)]?.lastChunkGen
           state.activeSlot = origin.key
           // Re-hydrate the cached page when one exists, [] otherwise. The cache
           // can be older than the pane was (a cleared or transiently-failed pane
@@ -6062,6 +6219,19 @@ const chatSlice = createSlice({
         state.slotRunning = running
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
+        // Same seeding as switchSlot: this refresh is the reconnect recovery,
+        // and the frames that raced it are exactly the ones it must not let
+        // through a second time (the duplicated leading fragment).
+        // A snapshot of a slot that is NOT running says no stream is in flight:
+        // the floor is cleared, so a lost `_done` cannot leave the closed
+        // turn's seq in place to swallow the next turn's opening chunks.
+        if (running) {
+          const snapGen = snapshotChunkGen(messages)
+          state.lastChunkSeq = raiseChunkSeq(floorForGen(state.lastChunkSeq, state.lastChunkGen, snapGen), snapshotChunkSeq(messages))
+          if (snapGen !== undefined) state.lastChunkGen = snapGen
+        } else {
+          state.lastChunkSeq = undefined
+        }
         setPagingCursor(state, keptCursor.hasMore, keptCursor.nextBefore)
         seedContextUsage(state, key, action.payload.context)
       })
@@ -6224,6 +6394,19 @@ const chatSlice = createSlice({
           // fulfillment landing mid-switch could mark a mid-turn origin idle
           // and the restore would unlock its composer. Only the ORDERED frame
           // writers in applyNonActiveFrame feed syncOriginRun.
+        } else {
+          // A running pane's warm carries the newest chunk seq its streaming
+          // row stands for; raise (never lower) the background replay floor so
+          // a live chunk that raced this warm is not applied a second time.
+          // Only the floor moves: run.state stays with the ordered frame
+          // writers for the reason given above.
+          const seeded = snapshotChunkSeq(messages)
+          if (seeded !== undefined) {
+            const run = (state.slotRun[safeKey(key)] ??= { state: 'idle' })
+            const snapGen = snapshotChunkGen(messages)
+            run.lastChunkSeq = raiseChunkSeq(floorForGen(run.lastChunkSeq, run.lastChunkGen, snapGen), seeded)
+            if (snapGen !== undefined) run.lastChunkGen = snapGen
+          }
         }
         seedContextUsage(state, key, action.payload.context)
       })
@@ -6258,6 +6441,15 @@ const chatSlice = createSlice({
           state.slotHistory = pushHistory(state.slotHistory, state.activeSlot)
         }
         state.activeSlot = action.payload.key
+        // The replay floor belongs to the slot that was streaming, not to this
+        // one. `state.lastChunkSeq` is the ACTIVE slot's floor, and a brand-new
+        // chat has no replay history at all — carrying the outgoing slot's floor
+        // in makes this slot's own opening chunks look like replays (they share
+        // the process generation, so `floorForGen` keeps the floor) and the
+        // reducer drops them. Cleared rather than parked-and-restored, because
+        // there is nothing to restore for a slot that has never streamed.
+        state.lastChunkSeq = undefined
+        state.lastChunkGen = undefined
         state.messages = []
         state.toolLog = []
         state.subagents = {}
@@ -6351,6 +6543,14 @@ const chatSlice = createSlice({
           // (see switchSlot for why 'files' is no longer one of these tabs).
           state.activityTab = (cached?.activityTab && !['tools', 'nav', 'files'].includes(cached.activityTab as string)) ? cached.activityTab : 'changes'
           state.activityOpen = cached?.activityOpen ?? false
+          // Same handover switchSlot performs: the floor is per-slot, so entering
+          // a slot restores ITS parked floor (undefined when it has none) instead
+          // of inheriting the one belonging to the slot being left. Without this a
+          // resume into a quiet slot kept the streaming slot's floor and discarded
+          // the resumed slot's first chunks.
+          const resumedRun = state.slotRun[safeKey(action.payload.key)]
+          state.lastChunkSeq = resumedRun?.lastChunkSeq
+          state.lastChunkGen = resumedRun?.lastChunkGen
           state.activeSlot = action.payload.key
           state.messages = mergePreservedPastes(state.messages, action.payload.messages)
           state.slotState = 'idle'

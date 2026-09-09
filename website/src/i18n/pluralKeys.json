@@ -175,6 +175,7 @@
   "pages.schedulePage.cronFolders.batch_move_failed",
   "pages.schedulePage.cronFolders.job_count",
   "pages.schedulePage.job_could_not_be_deleted",
+  "pages.schedulePage.retried_n_times",
   "pages.schedulePage.scheduled_job",
   "pages.schedulePage.this_permanently_removes_the_selected_job",
   "pages.sessionStorage.age_option",

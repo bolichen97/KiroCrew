@@ -69,6 +69,24 @@ from kiro_crew.validation import (
 
 logger = logging.getLogger(__name__)
 
+#: The generation every chat_chunk of this process carries (see chunk_generation).
+_CHUNK_GENERATION: str = uuid.uuid4().hex[:8]
+
+
+def chunk_generation() -> str:
+    """The ``gen`` stamped on every chat_chunk frame and window row this process
+    emits: one random value per gateway process.
+
+    Chunk ``seq`` numbers are a per-slot counter that continues across turns,
+    so a client's replay floor -- the newest seq its transcript holds -- orders
+    every later chunk above it. The counter lives in memory and restarts with
+    the gateway, so a floor from before a restart could sit above the new
+    process's early seqs; the client compares ``gen`` first and replaces its
+    floor when the generation changes, instead of dropping those chunks as
+    replays. Not a secret and not an identity: it only says "same process".
+    """
+    return _CHUNK_GENERATION
+
 
 async def run_config_write(fn, /, *args, **kwargs):
     """Run a blocking ``config.json`` writer under BOTH config locks.
@@ -2796,7 +2814,17 @@ def _collapse_wire_rows(messages: list[dict]) -> list[dict]:
         # One join across the run, not a new string per delta: a long reply is
         # hundreds of deltas, and pairwise concatenation copies the text
         # accumulated so far every time, which is quadratic in the reply size.
-        return {**run[0], "content": "".join(m.get("content", "") for m in run)}
+        merged = {**run[0], "content": "".join(m.get("content", "") for m in run)}
+        # The fold stands for every delta in the run, so it carries the run's
+        # NEWEST seq: that is the floor a client seeds its replay guard from,
+        # and the first delta's seq would let every later one be applied twice.
+        # Older rows carry no seq (legacy window); then the fold carries none.
+        seqs = [m["seq"] for m in run if isinstance(m.get("seq"), int)]
+        if seqs:
+            merged["seq"] = max(seqs)
+        else:
+            merged.pop("seq", None)
+        return merged
 
     out: list[dict] = []
     run: list[dict] = []
@@ -3000,7 +3028,20 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
             if text:
                 text, _ = redact_exfiltration_urls(text)
                 text, _ = redact_credentials(text)
-                out.append({"role": "streaming", "content": text, "cls": "msg msg-a"})
+                row: dict[str, Any] = {"role": "streaming", "content": text, "cls": "msg msg-a"}
+                # The newest chunk seq folded into this row (see
+                # _collapse_wire_rows). The client seeds its replay guard from
+                # it, so a live frame that races this snapshot and carries a
+                # seq at or below it is dropped instead of appended twice.
+                # Omitted when the window rows carry none: a client treats a
+                # missing seq as "apply as before".
+                if isinstance(m.get("seq"), int):
+                    row["seq"] = m["seq"]
+                    # The process that numbered it, so a client can tell a
+                    # floor from before a gateway restart apart (chunk_generation).
+                    if isinstance(m.get("gen"), str):
+                        row["gen"] = m["gen"]
+                out.append(row)
             continue
         text = m.get("content", "")
         # Gate is `!= "user"`, NOT `not in ("user", "system")`. This is the

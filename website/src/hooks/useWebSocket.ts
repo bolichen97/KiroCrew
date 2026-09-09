@@ -15,7 +15,7 @@ import { bindSlotReadSender, emitSlotRead, flushSlotRead } from '../lib/slotRead
 import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
 import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
-  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns
+  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
@@ -257,6 +257,16 @@ export function emitSlotFocused(slot: string | null): void {
   sendSlotFocusedImpl(slot)
 }
 
+/** One buffered chunk: its text (gap marker included) and the seq it carried,
+ *  kept apart so the reducer can hold each part against the slot's replay
+ *  floor and drop exactly the chunks a snapshot already covers. */
+type ChunkPart = { seq: number | undefined; text: string }
+type ChunkBufEntry = { parts: ChunkPart[]; lastSeq: number | undefined; gen: string | undefined; thinking: string }
+const newChunkBufEntry = (): ChunkBufEntry => {
+  return { parts: [], lastSeq: undefined, gen: undefined, thinking: '' }
+}
+const bufferedText = (entry: ChunkBufEntry): string => entry.parts.map((p) => p.text).join('')
+
 export function useWebSocket() {
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
@@ -324,7 +334,14 @@ export function useWebSocket() {
   // so both content types share one flush cycle and one lifecycle (reconnect
   // clear, chat_done delete, unmount cancel); the flush dispatches thinking
   // before content, matching a turn's thought-then-answer arrival order.
-  const chunkBufRef = useRef<Map<string, { content: string; lastSeq: number | undefined; thinking: string }>>(new Map())
+  const chunkBufRef = useRef<Map<string, ChunkBufEntry>>(new Map())
+  // A fresh entry (first frame of a turn, or the first after a reconnect cleared
+  // the buffer) starts with no seq. The buffer's lastSeq is about WS delivery
+  // only: a repeated delivery of the same seq and a forward gap between two
+  // deliveries. The snapshot replay floor (`lastChunkSeq`) is the reducer's;
+  // each flush hands it the buffered parts with their seqs and the reducer drops
+  // the ones a snapshot already holds. The hook has no view of that floor and
+  // needs none.
   const chunkFlushScheduledRef = useRef(false)
   const chunkRafRef = useRef<number | null>(null)
   const chunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -803,9 +820,12 @@ export function useWebSocket() {
         dispatch(sseThinkingChunk({ slot, content: entry.thinking }))
         entry.thinking = ''
       }
-      if (!entry.content) continue
-      dispatch(sseChatMessage({ slot, role: 'chunk', content: entry.content, seq: entry.lastSeq, batched: true }))
-      entry.content = ''
+      // The reducer holds each part against the slot's replay floor and drops
+      // what a snapshot already holds; the hook only batches.
+      const text = bufferedText(entry)
+      if (!text) continue
+      dispatch(sseChatMessage({ slot, role: 'chunk', content: text, seq: entry.lastSeq, gen: entry.gen, batched: true, parts: entry.parts }))
+      entry.parts = []
       if (slot === activeSlot) dispatchedActive = true
     }
     // Auto-speak the active slot's newly-streamed sentences once per flush,
@@ -1669,24 +1689,28 @@ export function useWebSocket() {
             if (cs) {
               const buf = chunkBufRef.current
               let entry = buf.get(cs)
-              if (!entry) { entry = { content: '', lastSeq: undefined, thinking: '' }; buf.set(cs, entry) }
-              // Idempotency guard: drop a replayed/repeated chunk (seq <= lastSeq).
+              if (!entry) { entry = newChunkBufEntry(); buf.set(cs, entry) }
+              // Idempotency guard: drop a repeated WS delivery (seq <= lastSeq).
               // WS delivery is at-least-once (reconnect replay, retry re-stream), so a
-              // chunk can arrive twice. missedChunkMarker below only flags FORWARD gaps
-              // (curSeq - prevSeq - 1 > 0), so a repeat slips through and its content is
-              // appended a second time with no marker — the silent mid-stream "stutter".
-              // chat_done deletes the buffer entry, so lastSeq resets each turn and a
-              // fresh turn's seq is never suppressed.
+              // chunk can arrive twice. The reducer's gap markers only flag FORWARD
+              // gaps (curSeq - prevSeq - 1 > 0), so a repeat would slip through and its
+              // content be appended a second time with no marker — the silent
+              // mid-stream "stutter".
+              // chat_done deletes the buffer entry; seqs are the slot's and never
+              // restart, so a later turn's chunks are never suppressed. This guard is about WS
+              // delivery only; a chunk a slot SNAPSHOT already holds is dropped
+              // by the reducer, which owns that floor and receives every part's
+              // seq at flush.
               if (entry.lastSeq !== undefined && data.seq !== undefined && data.seq <= entry.lastSeq) {
                 break
               }
-              // Cross-chunk gap detection via the shared missedChunkMarker,
-              // single-sourced with the reducer so the two copies can't drift.
-              if (entry.lastSeq !== undefined && data.seq !== undefined) {
-                entry.content += missedChunkMarker(entry.lastSeq, data.seq)
-              }
-              entry.content += data.content ?? ''
+              // No gap marker here: the reducer derives markers from the seqs
+              // of the parts it keeps, after filtering against the snapshot
+              // floor, so a gap the snapshot filled in is not flagged.
+              entry.parts.push({ seq: data.seq, text: data.content ?? '' })
               if (data.seq !== undefined) entry.lastSeq = data.seq
+              // The gateway generation that numbered the seqs (see floorForGen).
+              if (typeof data.gen === 'string') entry.gen = data.gen
               if (store.getState().chat.slotStatusDetail[cs]?.kind !== 'streaming') {
                 dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', text: 'Streaming', ts: Date.now() }))
               }
@@ -1981,7 +2005,7 @@ export function useWebSocket() {
             if (thinkSlot && thinkText) {
               const buf = chunkBufRef.current
               let entry = buf.get(thinkSlot)
-              if (!entry) { entry = { content: '', lastSeq: undefined, thinking: '' }; buf.set(thinkSlot, entry) }
+              if (!entry) { entry = newChunkBufEntry(); buf.set(thinkSlot, entry) }
               entry.thinking += thinkText
               scheduleChunkFlush()
             }

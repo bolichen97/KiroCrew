@@ -12093,7 +12093,9 @@
       "secrets_pending_title": "[Àğèñţ ŕèǫùèşţèð şèçŕèţş ················]",
       "secrets_section": "[Ṽàùĺţ şèçŕèţş ············]",
       "secrets_revoke_all": "[Ŕèṽøķè àĺĺ şèçŕèţş ················]",
-      "secrets_revoke_all_confirm": "[Ŕèṽøķè àĺĺ? ··········]"
+      "secrets_revoke_all_confirm": "[Ŕèṽøķè àĺĺ? ··········]",
+      "retried_n_times_one": "[Ŕèţŕìèð {{count}} ţìɱè ············]",
+      "retried_n_times_other": "[Ŕèţŕìèð {{count}} ţìɱèş ·············]"
     },
     "servicesTab": {
       "connected": "[Çøññèçţèð ··············]",

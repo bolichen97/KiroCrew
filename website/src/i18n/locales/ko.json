@@ -12210,7 +12210,8 @@
       "no_owning_session": "소유 세션 없음",
       "owning_session": "소유 세션",
       "secrets_revoke_all": "모든 시크릿 회수",
-      "secrets_revoke_all_confirm": "모두 철회하시겠습니까?"
+      "secrets_revoke_all_confirm": "모두 철회하시겠습니까?",
+      "retried_n_times_other": "{{count}}회 재시도했습니다"
     },
     "servicesTab": {
       "channels": "채널",

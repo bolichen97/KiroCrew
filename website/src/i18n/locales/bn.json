@@ -12383,7 +12383,9 @@
       "no_owning_session": "কোনো মালিক সেশন নেই",
       "owning_session": "মালিক সেশন",
       "secrets_revoke_all": "সব সিক্রেট প্রত্যাহার করুন",
-      "secrets_revoke_all_confirm": "সব প্রত্যাহার করবেন?"
+      "secrets_revoke_all_confirm": "সব প্রত্যাহার করবেন?",
+      "retried_n_times_one": "{{count}} বার পুনরায় চেষ্টা করা হয়েছে",
+      "retried_n_times_other": "{{count}} বার পুনরায় চেষ্টা করা হয়েছে"
     },
     "servicesTab": {
       "channels": "চ্যানেল",

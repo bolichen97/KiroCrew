@@ -361,6 +361,36 @@ class TestRelayReplay:
         assert all(c.args[1]["slot"] == slot.key for c in chunk_calls)
 
     @pytest.mark.asyncio
+    async def test_a_second_relayed_turn_continues_the_slot_counter(self, tmp_path):
+        """The numbers come from the slot's own counter, so a second relayed
+        turn is numbered above the first (and above any local turn on the same
+        slot): a client's replay floor from the earlier turn orders every chunk
+        of the later one above it without seeing the boundary."""
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _remote_slot()
+
+        def seqs() -> list[int]:
+            return [
+                c.args[1]["seq"]
+                for c in state.broadcast_ws.call_args_list
+                if c.args[0] == "chat_chunk"
+            ]
+
+        for text in ("first", "second"):
+            await relay_remote_turn(
+                state,
+                slot,
+                text,
+                chunks=_stream(
+                    _sse({"type": "chunk", "content": text, "cls": "chunk"}),
+                    b"data: [DONE]\n\n",
+                ),
+            )
+        assert seqs() == [1, 2]
+        assert slot._chunk_seq == 2
+
+    @pytest.mark.asyncio
     async def test_a_mirrored_frame_is_rebroadcast_under_the_local_key(self, tmp_path):
         state = _make_state(tmp_path)
         state.broadcast_ws = MagicMock()
@@ -3381,7 +3411,7 @@ class TestRelayCarriesToolRowMeta:
                 "cls": "tool",
                 "meta": {"tool": "fs_read", "call_id": "c1", "mid": "peer-mid"},
             },
-            _ChunkSequencer(),
+            _ChunkSequencer(slot),
         )
         row = slot.messages[-1]
         assert row["meta"]["tool"] == "fs_read"

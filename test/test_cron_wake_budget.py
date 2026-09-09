@@ -242,6 +242,11 @@ class TestCronTransientRetry:
         assert result == "recovered"
         assert acquire_calls == 2
         assert job.consecutive_failures == 0
+        # The callback leaves the attempt count on the job for
+        # `CronService._execute` to read, persist and clear -- it writes none of
+        # the persisted telemetry itself (see TestRetryTelemetryOwner).
+        assert job._transient_attempts == 1  # type: ignore[attr-defined]
+        assert job.last_retry_count == 0
 
     def test_transient_retries_exhausted_still_counts(
         self, gw_and_cb: tuple[Any, Any, Any]
@@ -270,8 +275,50 @@ class TestCronTransientRetry:
         assert acquire_calls == 1 + _CRON_TRANSIENT_RETRIES
         # Exactly ONE failure for the whole chain, not one per attempt.
         assert job.consecutive_failures == 1
-        # Counter cleared for the next scheduled run.
+        # The whole spent budget is left on the job for `_execute` to persist
+        # and clear: an outage that ate every retry and still failed is not
+        # "no retry happened".
+        assert job._transient_attempts == _CRON_TRANSIENT_RETRIES  # type: ignore[attr-defined]
+
+    def test_no_retry_needed_leaves_no_counter_behind(
+        self, gw_and_cb: tuple[Any, Any, Any]
+    ) -> None:
+        """A clean run leaves nothing for `_execute` to report as a retry."""
+
+        async def clean_acquire(*a: Any, **kw: Any) -> Any:
+            return (MagicMock(), True, False)
+
+        async def mock_stream(*a: Any, **kw: Any) -> str:
+            return "ok"
+
+        job = _job("jt3")
+        result = self._run(gw_and_cb, job, get_or_create=clean_acquire, mock_stream=mock_stream)
+        assert result == "ok"
         assert getattr(job, "_transient_attempts", 0) == 0
+
+    def test_a_wake_the_fire_time_gate_refuses_touches_no_telemetry(
+        self, gw_and_cb: tuple[Any, Any, Any]
+    ) -> None:
+        """A denied wake is not a run: the callback neither retries nor writes
+        any of the persisted retry fields."""
+
+        async def clean_acquire(*a: Any, **kw: Any) -> Any:
+            return (MagicMock(), True, False)
+
+        async def mock_stream(*a: Any, **kw: Any) -> str:
+            return "ok"
+
+        async def denied_gate(*a: Any, **kw: Any) -> Any:
+            return ("policy: cron capability disabled", False)
+
+        job = _job("jt4")
+        job.last_retry_count = 2
+        job.last_retry_run_ts = 1770000000.0
+        with patch("kiro_crew.slack.gateway._await_cron_fire_time_gate", side_effect=denied_gate):
+            result = self._run(gw_and_cb, job, get_or_create=clean_acquire, mock_stream=mock_stream)
+        assert result is None
+        assert getattr(job, "_transient_attempts", 0) == 0
+        assert (job.last_retry_count, job.last_retry_run_ts) == (2, 1770000000.0)
 
     def test_post_dispatch_transient_error_does_not_retry(
         self, gw_and_cb: tuple[Any, Any, Any]
@@ -319,8 +366,14 @@ class TestCronTransientRetry:
         assert acquire_calls == 1
         assert job.consecutive_failures == 1
 
-    def test_transient_counter_resets_between_runs(self, gw_and_cb: tuple[Any, Any, Any]) -> None:
-        """Attempts do not accumulate across separate scheduled runs."""
+    def test_transient_counter_resets_between_runs(
+        self, gw_and_cb: tuple[Any, Any, Any], tmp_path: Path
+    ) -> None:
+        """Attempts do not accumulate across separate scheduled runs.
+
+        Driven through the real ``CronService._execute`` because that is the
+        owner of the clear: the callback alone leaves the count on the job.
+        """
         gw, get_cb, capture_cron = gw_and_cb
         acquire_calls = 0
 
@@ -348,18 +401,21 @@ class TestCronTransientRetry:
             patch("kiro_crew.slack.gateway.transient_retry_delay", return_value=0.0),
         ):
 
-            async def _two_runs() -> tuple[Any, Any]:
+            async def _two_runs() -> tuple[int, int]:
                 await gw._init_cron()
                 cb = get_cb()
-                r1 = await cb(job)
-                r2 = await cb(job)
-                return r1, r2
+                svc = CronService(base_dir=tmp_path, on_job=cb)
+                await svc._execute(job)
+                first = job.last_retry_count
+                await svc._execute(job)
+                return first, job.last_retry_count
 
-            r1, r2 = asyncio.run(_two_runs())
+            first, second = asyncio.run(_two_runs())
 
-        assert (r1, r2) == ("ok", "ok")
+        assert (first, second) == (1, 1)  # each run reports ITS one retry, not 1 then 2
         assert acquire_calls == 4  # two runs x (1 transient failure + 1 retry)
         assert job.consecutive_failures == 0
+        assert getattr(job, "_transient_attempts", 0) == 0
 
 
 class TestCronPostTokenResume:
@@ -471,9 +527,7 @@ class TestCronPostTokenResume:
         assert stream_calls == 1
         assert job.consecutive_failures == 1
 
-    def test_posttoken_resume_is_one_shot_per_turn(
-        self, gw_and_cb: tuple[Any, Any, Any]
-    ) -> None:
+    def test_posttoken_resume_is_one_shot_per_turn(self, gw_and_cb: tuple[Any, Any, Any]) -> None:
         """A transient error during the continuation propagates: the one shot
         is spent, and the unrecovered cycle records the error exactly as
         before (one failure, no third prompt)."""
@@ -574,8 +628,12 @@ class TestWakeBudgetSubprocessGuard:
         svc._load()
         with pytest.raises(ValueError, match="wake budget"):
             svc.add_job(
-                name="t", message="m", every_secs=300, command="true",
-                timeout=600, timeout_secs=60,
+                name="t",
+                message="m",
+                every_secs=300,
+                command="true",
+                timeout=600,
+                timeout_secs=60,
             )
 
     def test_update_rejects_budget_below_default_command_timeout(self, tmp_path: Path) -> None:
@@ -588,13 +646,15 @@ class TestWakeBudgetSubprocessGuard:
         # Rejected update leaves the job untouched.
         assert svc.list_jobs()[0].timeout_secs == _JOB_TIMEOUT_SECS
 
-    def test_update_rejects_raising_subprocess_timeout_above_budget(
-        self, tmp_path: Path
-    ) -> None:
+    def test_update_rejects_raising_subprocess_timeout_above_budget(self, tmp_path: Path) -> None:
         svc = CronService(base_dir=tmp_path)
         svc._load()
         job = svc.add_job(
-            name="t", message="m", every_secs=300, command="true", timeout_secs=400,
+            name="t",
+            message="m",
+            every_secs=300,
+            command="true",
+            timeout_secs=400,
         )
         with pytest.raises(ValueError, match="wake budget"):
             svc.update_job(job.id, timeout=500)
@@ -628,7 +688,10 @@ class TestWakeBudgetSubprocessGuard:
         svc = CronService(base_dir=tmp_path)
         svc._load()
         job = svc.add_job(
-            name="t", message="m", every_secs=300,
-            script="~/.kiro/crew/crons/x.py:f", timeout_secs=60,
+            name="t",
+            message="m",
+            every_secs=300,
+            script="~/.kiro/crew/crons/x.py:f",
+            timeout_secs=60,
         )
         assert job.timeout_secs == 60

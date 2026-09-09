@@ -148,9 +148,7 @@ class TestCronCreateModel:
 
     @pytest.mark.asyncio
     async def test_valid_model_accepted(self):
-        request = self._make_request(
-            {"name": "t", "message": "m", "every": 300, "model": "sonnet"}
-        )
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": "sonnet"})
         resp = await api_crons_create(request)
         assert resp.status == 200
         _, kwargs = request.app["state"].crons.add_job_async.call_args
@@ -158,9 +156,7 @@ class TestCronCreateModel:
 
     @pytest.mark.asyncio
     async def test_empty_model_accepted(self):
-        request = self._make_request(
-            {"name": "t", "message": "m", "every": 300, "model": ""}
-        )
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": ""})
         resp = await api_crons_create(request)
         assert resp.status == 200
 
@@ -204,9 +200,7 @@ class TestCronCreateModel:
     async def test_non_string_model_rejected(self):
         # A numeric/bool JSON `model` must be rejected as a clean 400, not raise
         # AttributeError on .strip() and leak an HTTP 500.
-        request = self._make_request(
-            {"name": "t", "message": "m", "every": 300, "model": 123}
-        )
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": 123})
         resp = await api_crons_create(request)
         assert resp.status == 400
         body = json.loads(resp.body)
@@ -232,6 +226,12 @@ class TestCronListFields:
         mock_job.schedule = CronSchedule(kind="every", every_secs=300)
         mock_job.last_run_ts = None
         mock_job.last_result = None
+        mock_job.last_retry_count = 0
+        # Set explicitly, like every other field here: an unset attribute on a
+        # MagicMock answers with a MagicMock, which the JSON response cannot
+        # serialize — so a field added to the payload fails this test until the
+        # stub names it.
+        mock_job.last_retry_run_ts = 0.0
         mock_job.created_ts = None
         mock_job.timezone = ""
         mock_job.skip_dates = []

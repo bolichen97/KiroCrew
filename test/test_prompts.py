@@ -208,6 +208,8 @@ class _Slot:
         self.model = None
         self._queue = []
         self._stop_generation = 0
+        # Mirrors _ChatSlot._chunk_seq: the per-slot chunk counter _run_chat continues.
+        self._chunk_seq = 0
         self.linked_session_key = ""
         # Mirrors _ChatSlot.project: the per-slot local project @mention/​/prompts
         # resolve against. "" means no project (global prompts only), matching

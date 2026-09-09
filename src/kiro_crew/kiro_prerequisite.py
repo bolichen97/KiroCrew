@@ -474,6 +474,16 @@ class PrerequisiteStatus:
     # time (such a host records ``probe_version`` events in SEL with
     # ``outcome=failed error=timeout`` and nothing else to go on).
     probe_timed_out: bool = False
+    # Why the last version probe did not verify the CLI when NONE of the typed
+    # conditions above (sandbox refusal, timeout) explains it: the probe's own
+    # failure text, or the tail of its output when it exited non-zero. Empty
+    # when the probe passed, never ran (no candidate) or a typed field carries
+    # the cause. Shown verbatim, untranslated — the desktop's "Setup Check
+    # Unavailable" screen otherwise has NOTHING to say about why.
+    probe_error: str = ""
+    # The failed probe's exit status, ``None`` when it did not exit (never ran,
+    # timed out, sandbox refused) or when it passed.
+    probe_status: int | None = None
     # Kiro Crew's own agent specs (~/.kiro/agents/kirocrew*.json). ``ready``
     # requires these on disk, not merely a viable binary and a good ``whoami``:
     # without them kiro-cli answers every ``session/set_mode`` with
@@ -585,6 +595,41 @@ def _terminal_audit_detail(result: ProcessResult, succeeded: bool) -> str:
     if result.timed_out:
         return "timeout"
     return "nonzero exit"
+
+
+#: Longest ``probe_error`` served. The value is a diagnostic line for a status
+#: screen, not a log: the tail of a failing ``--version`` is where the CLI names
+#: its own complaint, and anything longer is a stack trace the screen cannot use.
+_PROBE_ERROR_MAX_CHARS = 400
+
+
+def _probe_failure_text(result: ProcessResult | None) -> str:
+    """What a failed version probe has to say for itself, bounded.
+
+    The typed failures (sandbox refusal, timeout) are reported through their own
+    fields and never reach here. What remains is a probe that RAN and did not
+    verify. The CLI's own output is the text: that is where a launcher wrapper
+    or a broken install names its complaint, and it is what the operator can act
+    on. The spawn layer's ``error`` is only a fallback for a probe that printed
+    nothing -- for an ordinary non-zero exit it is just the generic exit code,
+    which ``probe_status`` already carries and the gate already renders as
+    ``(exit N)``, so appending it here would say the exit code twice. Empty
+    when there is nothing to say (no probe ran, or it passed).
+    """
+
+    if result is None or result.ok:
+        return ""
+    text = (result.output or "").strip() or (result.error or "").strip()
+    # The probe's stdout/stderr is untrusted text that can echo a token or an
+    # authority-bearing URL (a launcher wrapper printing the environment it
+    # sees), and this string travels to the status payload and the setup
+    # screen, so it is redacted BEFORE the cut: truncating first could leave
+    # the recognisable half of a secret in the kept tail.
+    text, _ = redact_credentials(text)
+    text, _ = redact_exfiltration_urls(text)
+    if len(text) > _PROBE_ERROR_MAX_CHARS:
+        text = text[-_PROBE_ERROR_MAX_CHARS:]
+    return text
 
 
 def _canonical_candidate(path: str) -> str:
@@ -855,9 +900,7 @@ def _project_identity_database(source: Path, destination: Path) -> bool:
                     if not table_rows:
                         continue
                     placeholders = ",".join("?" * len(table_rows[0]))
-                    staged.executemany(
-                        f'INSERT INTO "{table}" VALUES ({placeholders})', table_rows
-                    )
+                    staged.executemany(f'INSERT INTO "{table}" VALUES ({placeholders})', table_rows)
     except sqlite3.Error:
         with contextlib.suppress(OSError):
             os.unlink(str(destination))
@@ -1185,9 +1228,7 @@ def _auth_store_mappings(
         # them from overwriting each other. macOS/Linux have a single location
         # per product, so no group. (The env-var source-side honouring and the
         # fixed staged side are already applied by ``store_mappings``.)
-        group = (
-            f"win32:{row.product.value}" if platform_name == "win32" else None
-        )
+        group = f"win32:{row.product.value}" if platform_name == "win32" else None
         mappings.append(
             _AuthStoreMapping(
                 source=row.source,
@@ -1219,7 +1260,9 @@ def _ensure_auth_staging_parent(home: Path) -> Path:
             # private directory. Only abort if a non-directory we cannot clear is
             # STILL sitting here; otherwise fall through to the idempotent mkdir.
             # (#561, concurrent-boot race)
-            if staging_parent.is_symlink() or (staging_parent.exists() and not staging_parent.is_dir()):
+            if staging_parent.is_symlink() or (
+                staging_parent.exists() and not staging_parent.is_dir()
+            ):
                 raise OSError(
                     f"Kiro auth staging root {staging_parent} is not a private "
                     "directory and could not be reset"
@@ -2721,11 +2764,7 @@ class KiroPrerequisiteService:
                     )
                     self._stamp_probe(probe_identity)
                     return self._status
-                if (
-                    version_probe is not None
-                    and version_probe.timed_out
-                    and candidate_runnable
-                ):
+                if version_probe is not None and version_probe.timed_out and candidate_runnable:
                     # A probe that never answered is not evidence of absence. The
                     # spawn was accepted and raised no typed failure, so the
                     # sandbox branch above cannot claim it, and falling through to
@@ -2783,9 +2822,15 @@ class KiroPrerequisiteService:
                     self._last_probe_at = self._clock()
                     self._has_probed = True
                     return self._status
+                # Neither typed condition explains the failure, so carry the
+                # probe's own account of it: without this the bare default below
+                # says only installed=False and the gate has no diagnostic to
+                # show (the desktop "Setup Check Unavailable" dead end).
                 self._status = PrerequisiteStatus(
                     platform=_platform_label(self._platform),
                     initial_setup_complete=self._initial_setup_complete,
+                    probe_error=_probe_failure_text(version_probe),
+                    probe_status=version_probe.returncode if version_probe else None,
                 )
                 self._stamp_probe(probe_identity)
                 return self._status
@@ -2802,9 +2847,7 @@ class KiroPrerequisiteService:
             # cannot even resolve itself without its real-home registry — so the
             # isolated probe reported such CLIs signed-out even though a real
             # session authenticates fine.
-            whoami = await self._audited_identity_probe(
-                self._viable_binary, isolate_home=False
-            )
+            whoami = await self._audited_identity_probe(self._viable_binary, isolate_home=False)
             if whoami.ok:
                 await asyncio.to_thread(self._mark_setup_complete)
             # Acceptance is checked here, on the probe path, because it costs a
@@ -2817,9 +2860,7 @@ class KiroPrerequisiteService:
             rejection_detail = ""
             acp_supported = True
             if whoami.ok:
-                rejected, rejection_detail = await self._probe_spec_acceptance(
-                    self._viable_binary
-                )
+                rejected, rejection_detail = await self._probe_spec_acceptance(self._viable_binary)
                 acp_supported = await self._probe_acp_support(self._viable_binary)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
@@ -2995,9 +3036,7 @@ class KiroPrerequisiteService:
             # deliberately omitted because `update` fetches a binary, it does
             # not authenticate.
             update_environment = dict(probe_environment)
-            update_environment.update(
-                _allowlisted_env(self._environ, _IDENTITY_PROXY_ENV_KEYS)
-            )
+            update_environment.update(_allowlisted_env(self._environ, _IDENTITY_PROXY_ENV_KEYS))
             await self._audit(
                 action="update_cli",
                 outcome="invoked",
@@ -3018,9 +3057,7 @@ class KiroPrerequisiteService:
                     extra_hidden_dirs=self._hidden_probe_dirs,
                 )
             except asyncio.CancelledError:
-                await self._set_terminal_audit(
-                    "update_cli", "failed", "gateway-setup", "cancelled"
-                )
+                await self._set_terminal_audit("update_cli", "failed", "gateway-setup", "cancelled")
                 raise
             except Exception as exc:
                 logger.warning("kiro-cli update failed to run", exc_info=True)

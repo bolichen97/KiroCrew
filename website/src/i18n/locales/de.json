@@ -12383,7 +12383,9 @@
       "no_owning_session": "Keine besitzende Sitzung",
       "owning_session": "Besitzende Sitzung",
       "secrets_revoke_all": "Alle Secrets widerrufen",
-      "secrets_revoke_all_confirm": "Alle widerrufen?"
+      "secrets_revoke_all_confirm": "Alle widerrufen?",
+      "retried_n_times_one": "{{count}} Mal erneut versucht",
+      "retried_n_times_other": "{{count}} Mal erneut versucht"
     },
     "servicesTab": {
       "channels": "Kanäle",
