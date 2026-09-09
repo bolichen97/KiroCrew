@@ -8316,6 +8316,7 @@
       "transcription_request_failed": "ट्रांसक्रिप्शन अनुरोध विफल रहा।"
     },
     "useWebSocket": {
+      "response_ready": "जवाब तैयार है",
       "a_task_needs_your_decision": "एक कार्य को तुम्हारे फ़ैसले की ज़रूरत है",
       "approval_required": "स्वीकृति आवश्यक",
       "tool_approval": "टूल की मंज़ूरी: {{name}}",
@@ -13088,6 +13089,9 @@
         "enable_via_setting": "वैकल्पिक रूप से, <settingRef/> सेट करें, फिर <restartCmd/> चलाएँ।"
       },
       "notificationsPanel": {
+        "desktop_alerts": "डेस्कटॉप सूचनाएँ",
+        "notify_when_a_background_chat_finishes": "बैकग्राउंड चैट पूरी होने पर सूचित करें",
+        "notify_when_a_background_chat_finishes_description": "जो चैट पूरी हुई उसका नाम बताते हुए सिस्टम सूचना दिखाता है, लेकिन सिर्फ़ तब जब यह विंडो मिनिमाइज़ हो या किसी दूसरे ऐप के पीछे हो।",
         "always_interrupts_cannot_be_muted_or_lowered": "हमेशा टोकता है — इसे म्यूट या कम नहीं किया जा सकता",
         "app": "app",
         "category_agent": "एजेंट के अपने आप भेजे गए संदेश",

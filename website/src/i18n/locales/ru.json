@@ -8540,6 +8540,7 @@
       "transcription_request_failed": "Запрос расшифровки не удался."
     },
     "useWebSocket": {
+      "response_ready": "Ответ готов",
       "a_task_needs_your_decision": "Задача требует твоего решения",
       "approval_required": "Требуется подтверждение",
       "tool_approval": "Подтверждение инструмента: {{name}}",
@@ -13438,6 +13439,9 @@
         "enable_via_setting": "Или задайте <settingRef/>, затем выполните <restartCmd/>."
       },
       "notificationsPanel": {
+        "desktop_alerts": "Уведомления на рабочем столе",
+        "notify_when_a_background_chat_finishes": "Уведомлять о завершении фонового чата",
+        "notify_when_a_background_chat_finishes_description": "Показывает системное уведомление с названием завершившегося чата, но только пока это окно свёрнуто или закрыто другим приложением.",
         "always_interrupts_cannot_be_muted_or_lowered": "Всегда прерывает — нельзя отключить или понизить",
         "app": "приложение",
         "category_agent": "Проактивные сообщения агента",

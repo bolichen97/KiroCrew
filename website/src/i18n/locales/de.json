@@ -8316,6 +8316,7 @@
       "transcription_request_failed": "Transkriptionsanfrage fehlgeschlagen."
     },
     "useWebSocket": {
+      "response_ready": "Antwort ist bereit",
       "a_task_needs_your_decision": "Eine Aufgabe braucht deine Entscheidung",
       "approval_required": "Genehmigung erforderlich",
       "tool_approval": "Werkzeuggenehmigung: {{name}}",
@@ -13087,6 +13088,9 @@
         "enable_via_setting": "Alternativ setzen Sie <settingRef/> und führen Sie dann <restartCmd/> aus."
       },
       "notificationsPanel": {
+        "desktop_alerts": "Desktop-Benachrichtigungen",
+        "notify_when_a_background_chat_finishes": "Benachrichtigen, wenn ein Chat im Hintergrund fertig ist",
+        "notify_when_a_background_chat_finishes_description": "Zeigt eine Systembenachrichtigung mit dem Namen des fertigen Chats, aber nur solange dieses Fenster minimiert ist oder hinter einer anderen App liegt.",
         "always_interrupts_cannot_be_muted_or_lowered": "Unterbricht immer — kann nicht stummgeschaltet oder herabgesetzt werden",
         "app": "App",
         "category_agent": "Proaktive Agentennachrichten",

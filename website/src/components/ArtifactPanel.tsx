@@ -15,6 +15,7 @@ import { copyToClipboard } from '../utils/clipboard'
 import { offlineProps } from '../utils/offline'
 import { api } from '../api/client'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useArtifactLiveReload } from '../hooks/useArtifactLiveReload'
 import type { Artifact } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -146,6 +147,10 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     staleTime: 10_000,
   })
   const artifact = detailQuery.data
+  // File-backed artifacts: an agent rewriting the backing file never passes
+  // through a handler, so the artifact_update WS event does not fire for it.
+  // Watch the live pointer and refetch through the shared cache instead.
+  useArtifactLiveReload(slug, artifact?.source_path)
   const effectiveKind = artifact?.kind ?? kind
   const effectiveContent = artifact?.content ?? content
   const name = artifact?.name ?? slug

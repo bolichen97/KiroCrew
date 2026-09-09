@@ -3044,6 +3044,7 @@
       "transcription_request_failed": "Transcription request failed."
     },
     "useWebSocket": {
+      "response_ready": "Response ready",
       "a_task_needs_your_decision": "A task needs your decision",
       "approval_required": "Approval Required",
       "tool_approval": "Tool approval: {{name}}",
@@ -5274,6 +5275,9 @@
         "recordMetricsStatusUnavailable": "Could not load the metric-recording setting. The switch is locked until it loads."
       },
       "notificationsPanel": {
+        "desktop_alerts": "Desktop alerts",
+        "notify_when_a_background_chat_finishes": "Notify when a background chat finishes",
+        "notify_when_a_background_chat_finishes_description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
         "always_interrupts_cannot_be_muted_or_lowered": "Always interrupts — cannot be muted or lowered",
         "channel_not_active_app_disabled_setting_retained": "Channel not active (app disabled) — setting retained",
         "default_priority": "Default priority: {{priority}}",

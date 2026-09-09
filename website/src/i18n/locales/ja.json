@@ -8204,6 +8204,7 @@
       "transcription_request_failed": "転写リクエストが失敗しました。"
     },
     "useWebSocket": {
+      "response_ready": "応答の準備ができました",
       "a_task_needs_your_decision": "タスクが決定を必要としています",
       "approval_required": "承認が必要です",
       "tool_approval": "ツールの承認：{{name}}",
@@ -12912,6 +12913,9 @@
         "enable_via_setting": "または、<settingRef/> を設定してから、<restartCmd/> を実行してください。"
       },
       "notificationsPanel": {
+        "desktop_alerts": "デスクトップ通知",
+        "notify_when_a_background_chat_finishes": "バックグラウンドのチャットが完了したら通知する",
+        "notify_when_a_background_chat_finishes_description": "完了したチャットの名前を含むシステム通知を表示します。ただし、このウィンドウが最小化されているか他のアプリの背後にあるときのみです。",
         "always_interrupts_cannot_be_muted_or_lowered": "常に割り込み — ミュートまたは低下させることはできません",
         "app": "アプリ",
         "category_agent": "エージェントからの自発的なメッセージ",

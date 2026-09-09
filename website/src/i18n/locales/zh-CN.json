@@ -8204,6 +8204,7 @@
       "transcription_request_failed": "转写请求失败。"
     },
     "useWebSocket": {
+      "response_ready": "回复已就绪",
       "a_task_needs_your_decision": "有任务需要你决策",
       "approval_required": "需要审批",
       "tool_approval": "工具审批：{{name}}",
@@ -12912,6 +12913,9 @@
         "enable_via_setting": "或者，设置 <settingRef/>，然后运行 <restartCmd/>。"
       },
       "notificationsPanel": {
+        "desktop_alerts": "桌面通知",
+        "notify_when_a_background_chat_finishes": "后台聊天完成时通知",
+        "notify_when_a_background_chat_finishes_description": "显示一条系统通知，其中包含已完成聊天的名称；仅在此窗口最小化或被其他应用遮挡时显示。",
         "always_interrupts_cannot_be_muted_or_lowered": "始终打断 — 无法静音或降低优先级",
         "app": "应用",
         "category_agent": "代理主动发送的消息",

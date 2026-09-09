@@ -1479,6 +1479,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Heartbeat task results"
   },
   {
+    "id": "notifications.notify-when-a-background-chat-finishes",
+    "label": "Notify when a background chat finishes",
+    "labelKey": "pages.settings.notificationsPanel.notify_when_a_background_chat_finishes",
+    "description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "notifications.play-sound-on-new-notifications",
     "label": "Play sound on new notifications",
     "labelKey": "pages.settings.notificationsPanel.play_sound_on_new_notifications",

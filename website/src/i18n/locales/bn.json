@@ -8316,6 +8316,7 @@
       "transcription_request_failed": "ট্রান্সক্রিপশন রিকোয়েস্ট ব্যর্থ হয়েছে।"
     },
     "useWebSocket": {
+      "response_ready": "উত্তর তৈরি",
       "a_task_needs_your_decision": "একটা কাজের জন্য তোমার সিদ্ধান্ত দরকার",
       "approval_required": "অনুমোদন দরকার",
       "tool_approval": "টুল অনুমোদন: {{name}}",
@@ -13088,6 +13089,9 @@
         "enable_via_setting": "বিকল্পভাবে, <settingRef/> সেট করুন, তারপর <restartCmd/> চালান।"
       },
       "notificationsPanel": {
+        "desktop_alerts": "ডেস্কটপ বিজ্ঞপ্তি",
+        "notify_when_a_background_chat_finishes": "ব্যাকগ্রাউন্ডের চ্যাট শেষ হলে জানান",
+        "notify_when_a_background_chat_finishes_description": "যে চ্যাট শেষ হয়েছে তার নাম জানিয়ে একটি সিস্টেম বিজ্ঞপ্তি দেখায়, তবে কেবল যখন এই উইন্ডো মিনিমাইজ করা থাকে বা অন্য কোনো অ্যাপের পিছনে থাকে।",
         "always_interrupts_cannot_be_muted_or_lowered": "সব সময় বাধা দেয় — মিউট বা কমানো যায় না",
         "app": "app",
         "category_agent": "এজেন্টের নিজে থেকে পাঠানো বার্তা",
