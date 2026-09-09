@@ -1763,7 +1763,38 @@ honor the grant for eligible events: the approve decision consumes no
 agent-authored event data, only the arguments remain unverified (the same
 blindness the interactive card has; the identity split changes WHO approves,
 not what any gate can scan). Shell events never qualify: their deny gates need
-the command bytes the event lacks.
+the command bytes the event lacks. **Identity-keyed grants** are the second
+kind an identity-verified child may take, and the reason a user's NARROW
+allowance still means something for a fan-out: a grant whose matched input is
+that same verified `_meta.kiro` pair and nothing the agent authors. Three
+paths qualify — the TrustDropdown's non-shell grant (`approval_command` keys it
+on `mcp-trust:v1:<server>:<tool>`, so the dashboard runner admits an
+identity-verified child to the `_trusted_patterns` match), the hook gate's
+app-own-server grant, and an `auto_approve_tools` pattern matched against the identity as
+`Running: @server/tool` / `@server/tool` (never the lossy `mcp__server__tool`
+wire form, under which two identities can collide) INSTEAD of the title, for every caller, and only when the caller also
+threads the event's `mcp_identity_trusted` provenance flag (an identity that is
+present but unproven keeps the title match). The user's `auto_deny_tools` globs
+— and only those, never the shipped shell regexes — are also matched against
+the same `@server/tool` / `Running: @server/tool` / `@server` spellings whenever
+the server name is present, so a deny written in the spelling the approve loop
+teaches binds on the identity plane and deny still beats approve there. The hook reports the last two with
+`ToolHookResult.identity_grant`, and the child-admission rule lives in two
+places only: `hooks.identity_grant_covers_child`, which both the dashboard
+runner and the subagent manager consult before letting a hook auto-approve
+stand for a low-fidelity child, and `AcpEvent.child_unconditional_grant_eligible`,
+which the dashboard runner already binds for the unconditional grants and now
+also gates the TrustDropdown match (a full-fidelity event, or a low-fidelity
+child whose identity verified — the same boolean, no second spelling). When an
+approve pattern matches only the title of an identity-verified MCP call, the gate
+logs once per (pattern, identity) which `@server/tool` rewrite restores the grant. A
+side effect of threading the identity to every caller: the governance deny
+floor now sees `canonical_mcp_name` on the Slack, Discord, Telegram, messaging
+and task-runner surfaces too, so an MCP-keyed governance deny binds there as
+it already did on the dashboard (a tightening toward `POLICY ∩ PROFILE`). Every
+grant that read the title, the payload's `kind` or a command — the read-only
+kind allow-list, the `_is_read_only_tool` title heuristic, trust-reads —
+stays downgraded for such a child exactly as before.
 
 ### SEL Audit Logging (`sel.py`)
 

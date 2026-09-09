@@ -100,6 +100,13 @@ verified. The transport signal instead feeds the identity-only lane: the
 `_meta.kiro` identity caches (below) carry it to the permission event, where
 `AcpEvent.child_mcp_identity_trusted` and the CLI consumer's
 `_unverifiable_shell` escape consume it without ever minting a classification.
+The same identity is what an identity-keyed grant matches for such a child —
+the hook gate's `auto_approve_tools` pattern (matched against
+`@server/tool` rendered from the identity, never the title, for an
+MCP-identified call) and app-own-server grant, reported as
+`ToolHookResult.identity_grant`, and the TrustDropdown's `approval_command`
+key — so the user's narrow allowance covers the child's call to that tool
+without a session-wide trust grant (`security.md` § Child-fidelity split).
 A miss keeps reading as an absent classification, and a frame reporting
 `kind: "execute"` caches `True` whatever its `_meta` says — the transport
 identity never waives a shell check.

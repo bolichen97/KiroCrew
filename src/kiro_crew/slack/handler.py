@@ -3524,6 +3524,9 @@ async def handle_message(
                         session_key=session_key,
                         agent=_agent or "",
                         command=event.shell_command,
+                        mcp_server_name=event.mcp_server_name,
+                        mcp_tool_name=event.tool_name,
+                        mcp_identity_trusted=event.mcp_identity_trusted,
                     )
                     if tool_result.action == TOOL_DENY:
                         # event.title is LLM-authored (select_tool_title prefers
@@ -3628,6 +3631,9 @@ async def handle_message(
                         diff_path=event.diff_path,
                         command=event.shell_command,
                         is_shell=event.is_shell,
+                        mcp_server_name=event.mcp_server_name,
+                        mcp_tool_name=event.tool_name,
+                        mcp_identity_trusted=event.mcp_identity_trusted,
                     )
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         # The hook granted this by NAME (its `auto_approve_tools`

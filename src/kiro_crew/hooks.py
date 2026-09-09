@@ -146,6 +146,18 @@ class ToolHookResult:
     #: and deny-by-default-shell messages do not), so matching on it would
     #: classify a sensitive-path or exfiltration deny as non-security.
     security_deny: bool = True
+    #: True when a TOOL_AUTO_APPROVE was decided by the call's VERIFIED MCP
+    #: identity (``_meta.kiro`` server + tool, read from the client's own
+    #: tool_call cache) and by nothing the agent authors -- the app-own-server
+    #: grant, or an ``auto_approve_tools`` pattern matched against that
+    #: identity. False for every grant that read the title, the payload's
+    #: ``kind``, or a command. A consumer holding a backend-subagent request
+    #: whose ARGUMENTS are unverified but whose identity is
+    #: (``AcpEvent.child_mcp_identity_trusted``) may honor exactly these grants:
+    #: their matched input is the same trusted identity, so a forged title
+    #: cannot reach them. Any other auto-approve stays downgraded for that
+    #: request, as before.
+    identity_grant: bool = False
 
     @staticmethod
     def _count(action: str, security_deny: bool) -> None:
@@ -186,9 +198,9 @@ class ToolHookResult:
         return ToolHookResult(action=TOOL_ALLOW)
 
     @staticmethod
-    def auto_approve() -> ToolHookResult:
+    def auto_approve(*, identity_grant: bool = False) -> ToolHookResult:
         ToolHookResult._count(TOOL_AUTO_APPROVE, False)
-        return ToolHookResult(action=TOOL_AUTO_APPROVE)
+        return ToolHookResult(action=TOOL_AUTO_APPROVE, identity_grant=identity_grant)
 
     @staticmethod
     def deny(reason: str) -> ToolHookResult:
@@ -565,6 +577,7 @@ class HookManager:
         is_shell: bool = False,
         mcp_server_name: str = "",
         mcp_tool_name: str = "",
+        mcp_identity_trusted: bool = False,
         resolved_agent: str = "",
     ) -> ToolHookResult:
         """Check if a tool should be auto-approved, denied, or handled normally.
@@ -938,6 +951,25 @@ class HookManager:
             )
             if reason:
                 return ToolHookResult.deny(reason)
+        # The user's own ``auto_deny_tools`` GLOBS, and only those, are also
+        # matched against the identity in the ``@server/tool`` spelling the
+        # approve loop below uses (plus ``Running: @server/tool`` and the bare
+        # ``@server``, so a server-level rule binds to every tool). A user who
+        # writes both lists in one spelling -- ``auto_approve_tools:
+        # ["@ops/*"]``, ``auto_deny_tools: ["@ops/delete_*"]`` -- otherwise gets
+        # an approve keyed on the verified identity while the deny rides the
+        # forgeable title, and a benign title over a denied tool auto-fires.
+        # Kept OUT of ``deny_targets`` above on purpose: the shipped regex rules
+        # are authored against shell text, and running them over a synthesized
+        # reference is the accidental widening the note above forbids. Not
+        # gated on provenance: a deny can only ever deny.
+        if mcp_server_name and self._config.auto_deny_tools:
+            _tool_ref = mcp_identity_ref(mcp_server_name, mcp_tool_name)
+            for _ref in (_tool_ref, f"Running: {_tool_ref}", mcp_identity_ref(mcp_server_name, "")):
+                if _ref and any(
+                    _tool_matches(pattern, _ref) for pattern in self._config.auto_deny_tools
+                ):
+                    return ToolHookResult.deny(f"Blocked by security policy: {_ref}")
 
         # A file-search builtin's scope lives only in its arguments -- it carries no
         # ``command``, and its title need not name the root it walks -- so this target is
@@ -1093,19 +1125,59 @@ class HookManager:
             # server alone. Fall through to interactive approval (fail-closed),
             # never silent execute.
             if canonical_mcp_name:
-                return ToolHookResult.auto_approve()
+                return ToolHookResult.auto_approve(identity_grant=mcp_identity_trusted)
 
         # Auto-approve — match against both the original title (preserves
         # "Running: "/"Reading " prefixes) and the normalized name (stripped)
         # so that "Running: *" and bare tool-name patterns both work.
         #
-        # This loop matches only the TITLE, which the agent authors — safe here
+        # This loop matches the TITLE, which the agent authors — safe here
         # ONLY because a shell call whose command could not be recovered was
         # already hard-denied above, so no unverified command can reach it. Do not
         # weaken that refusal without also gating this loop.
+        #
+        # For an MCP-served call whose canonical identity is VERIFIED — both
+        # ``_meta.kiro`` fields present AND the caller's ``mcp_identity_trusted``
+        # provenance flag set (the event's own flag, earned only when the
+        # identity came from the client's tool_call cache; non-emptiness alone
+        # is not provenance, see ``AcpEvent.mcp_identity_trusted``) — the
+        # pattern is matched against THAT identity, in place of the title. A
+        # grant keyed on the title would let a model-authored ``description``
+        # that reads like an allowed tool approve a different one; keyed on the
+        # identity, the pattern approves exactly the tool that executes. Two
+        # spellings of the same identity: kiro-cli's own title form
+        # ``Running: @server/tool`` and the governance reference
+        # ``@server/tool`` (``mcp_identity_ref``). The wire form
+        # ``mcp__server__tool`` is deliberately NOT a grant target: a server
+        # or tool name may itself contain ``__``, so two different verified
+        # identities can share one wire spelling, and a grant written against
+        # it would approve the other tool. The deny list may accept that form
+        # (over-denying is safe); a grant may not. An identity that is present
+        # but unproven falls back to the title branch, exactly as before.
+        _identity_ref = (
+            mcp_identity_ref(mcp_server_name, mcp_tool_name)
+            if mcp_server_name and mcp_tool_name and mcp_identity_trusted
+            else ""
+        )
+        grant_targets: tuple[str, ...]
+        if _identity_ref:
+            grant_targets = (f"Running: {_identity_ref}", _identity_ref)
+            identity_grant = True
+        else:
+            grant_targets = (tool_name, normalized)
+            identity_grant = False
         for pattern in self._config.auto_approve_tools:
-            if _tool_matches(pattern, tool_name) or _tool_matches(pattern, normalized):
-                return ToolHookResult.auto_approve()
+            if any(_tool_matches(pattern, target) for target in grant_targets):
+                return ToolHookResult.auto_approve(identity_grant=identity_grant)
+        if _identity_ref:
+            # Runtime breadcrumb for the deliberate title-match exclusion: a
+            # pattern that matches the agent-authored title does not grant an
+            # identity-verified MCP call. On an unattended surface the only
+            # other symptom is a card nobody answers, so say once per
+            # (pattern, identity) which rewrite restores the grant.
+            for pattern in self._config.auto_approve_tools:
+                if _tool_matches(pattern, tool_name) or _tool_matches(pattern, normalized):
+                    _note_title_only_grant_pattern(pattern, _identity_ref)
 
         # KiroCrew-side read-only auto-approve — the LAST branch before allow(),
         # AFTER every early-return deny (deny-by-default shell, sensitive-path,
@@ -1960,6 +2032,61 @@ def _search_deny_target(raw_params: dict | None) -> str:
             fields.append(f"{canonical}={_encode_search_field(text)}")
             break
     return " ".join(fields)
+
+
+#: (pattern, identity) pairs already reported by ``_note_title_only_grant_pattern``,
+#: bounded so a misconfigured pattern over a long session cannot grow it without limit.
+_TITLE_ONLY_GRANT_NOTED: set[tuple[str, str]] = set()
+_TITLE_ONLY_GRANT_NOTED_CAP = 512
+
+
+def _note_title_only_grant_pattern(pattern: str, identity_ref: str) -> None:
+    """Log once that an ``auto_approve_tools`` pattern matches only the title.
+
+    For an MCP call with a verified identity the grant is keyed on
+    ``@server/tool``, so a pattern written against the agent-authored title
+    (a ``description``, or a title that does not spell the identity) stops
+    granting. The visible symptom is an approval card, which on an unattended
+    surface nobody answers; this line is the breadcrumb that connects the card
+    to the pattern and names the rewrite.
+    """
+    key = (pattern, identity_ref)
+    if key in _TITLE_ONLY_GRANT_NOTED:
+        return
+    if len(_TITLE_ONLY_GRANT_NOTED) >= _TITLE_ONLY_GRANT_NOTED_CAP:
+        _TITLE_ONLY_GRANT_NOTED.clear()
+    _TITLE_ONLY_GRANT_NOTED.add(key)
+    logger.warning(
+        "auto_approve_tools pattern %r matches this call's title but not its verified MCP "
+        "identity %s; for an MCP call the grant is keyed on the identity, so the call falls "
+        "to interactive approval. Rewrite the pattern as %r (or 'Running: %s').",
+        pattern,
+        identity_ref,
+        identity_ref,
+        identity_ref,
+    )
+
+
+def identity_grant_covers_child(result: ToolHookResult, event: object) -> bool:
+    """True when a hook auto-approve may stand for a LOW-FIDELITY child request.
+
+    A backend-subagent permission event whose arguments are unverified is
+    normally downgraded past every hook auto-approve, because those grants read
+    the agent-authored title. The one exception is a grant the hook decided by
+    the call's VERIFIED MCP identity (``ToolHookResult.identity_grant``) for an
+    event whose own identity verified (``AcpEvent.child_mcp_identity_trusted``):
+    both sides of that match are the same ``_meta.kiro`` server/tool pair the
+    client cached from the tool_call frame, so nothing the agent authors
+    reaches the decision. It is also the user's NARROW grant — they allowed
+    this tool — where session trust-all or YOLO would allow every tool the
+    child calls. The dashboard runner and the subagent manager both consult
+    this so the two consumers cannot drift on the rule.
+    """
+    return bool(
+        result.action == TOOL_AUTO_APPROVE
+        and result.identity_grant
+        and getattr(event, "child_mcp_identity_trusted", False)
+    )
 
 
 def _normalize_tool_name(tool_name: str) -> str:
