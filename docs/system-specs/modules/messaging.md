@@ -62,7 +62,7 @@ Slack's transport path is gated behind the `messaging.use_transport` config flag
 | `messaging/privacy_mode.py` | The `!temporary` / `!incognito` session privacy modes, keyed by **session key** — two bounded LRUs, the durable `SessionMap` flag, one `is_restricted` predicate, the token strippers, and the SEL audit with the channel as a parameter. See [Session privacy modes](#session-privacy-modes-privacy_modepy) |
 | `messaging/auto_title.py` | Conversation auto-titling — the claim-early LRU, the tool-free bounded background turn, the prompt, and the title-cleaning rules. Renaming the platform conversation is a caller-supplied callback. See [Auto-titling](#auto-titling-auto_titlepy) |
 | `messaging/upload_gate.py` | `session_is_restricted(dashboard_state, session_key, persisted_probe=, unknown_denies=True)` — the shared incognito/temporary decision, `session_blocks_reads(...)` — its READ counterpart (only `temporary` blocks reads; `incognito` still reads), plus `uploads_restricted(...)` which adds the per-channel upload audit, plus `live_dashboard_slot`. Three-state ladder (non-`dashboard:` key answers off `privacy_mode`, a LIVE slot answers off `is_restricted`/`blocks_reads`, otherwise the PERSISTED transcript mode answers). `unknown_denies` decides an unreadable mode: uploads DENY it outright (bytes cannot be recalled), while the durable-history gate denies only when a transcript EXISTS but its mode cannot be resolved (an ambiguous stem, a header no normal session wrote) — that is where an incognito session can hide. A legacy header with no `memory_mode` reads `persistent` rather than unknown, so the only unknown history allows is a truly ABSENT record, where nothing on disk claims the session is restricted. Discord and Telegram both route uploads here; both resumed-turn paths also use it to gate live projection and durable history, and Telegram uses it for `/title` |
-| `messaging/session_trust.py` | The per-session tool-Trust grant store: `is_session_trusted`, `add_trusted_session(key, sessions=)`, `clear_trusted_sessions`. In memory only, so an ad-hoc auto-approve grant dies with the process. The grant has TWO halves and both are load-bearing: the in-memory mapping the driver reads, and the session's approval policy set to `auto`, because a spawned subagent reads its parent's policy and never this mapping. So it is a `key -> SessionManager` MAPPING rather than a set, which is what lets `clear_trusted_sessions` undo the policy half too (back to `""`, the same value the dashboard's untrust toggle writes) without its caller having to hand a manager back. **Every mutation goes through the API**: reaching the container directly is how a revoke came to drop one half and leave subagents trusted, and a mapping has no `.add`, so a half-grant is not expressible either. Named `session_trust`, not `trust`, so it cannot be confused with a connection-admission roster: this grant is about what ONE session's tools may skip, not about which principals may attach. Consumed only through `TurnDriver`'s `auto_approve_session` predicate, which runs BEHIND the keystone, governance and deny-list gates, so a hard DENY still refuses |
+| `messaging/session_trust.py` | The per-session tool-Trust grant store: `is_session_trusted`, `add_trusted_session(key, sessions=, strict=)`, `clear_trusted_sessions`. In memory only, so an ad-hoc auto-approve grant dies with the process. The grant has TWO halves and both are load-bearing: the in-memory mapping the driver reads, and the session's approval policy set to `auto`, because a spawned subagent reads its parent's policy and never this mapping. So it is a `key -> SessionManager` MAPPING rather than a set, which is what lets `clear_trusted_sessions` undo the policy half too (back to `""`, the same value the dashboard's untrust toggle writes) without its caller having to hand a manager back. **Every mutation goes through the API**: reaching the container directly is how a revoke came to drop one half and leave subagents trusted, and a mapping has no `.add`, so a half-grant is not expressible either. `strict=True` is for a caller that reports the grant back to the person who clicked (the Slack linked-approval Trust button): a failing policy write undoes the in-memory half and raises, so a PARTIAL grant is never labelled "Trusted"; the default stays best-effort for callers with nobody to tell. Named `session_trust`, not `trust`, so it cannot be confused with a connection-admission roster: this grant is about what ONE session's tools may skip, not about which principals may attach. Consumed only through `TurnDriver`'s `auto_approve_session` predicate, which runs BEHIND the keystone, governance and deny-list gates, so a hard DENY still refuses |
 | `messaging/link.py` | **Layer 3** — session-key namespacing (`session_key`/`canonical_key`/`legacy_key`/`is_legacy_slack_key`) + `ChannelLink` + DM-scope key derivation / `should_rotate_generation`, plus the in-channel `/link` ⇄ `/unlink` pair (`rebind_conversation_location` / `release_conversation_location`) |
 | `messaging/conversation.py` | `ConversationState` — per-conversation rotating *generation* bookkeeping (advanced by `/new` and idle/daily reset), seeded from the persisted session map |
 | `messaging/inbound_spool.py` | The durable spool for an inbound message the SHUTDOWN GATE refused, and its boot-time replay. See [Durable inbound spool](#durable-inbound-spool-inbound_spoolpy) |
@@ -888,6 +888,44 @@ Four properties are load-bearing:
   `test_channel_transport_outbound_authz.py` requires every shipped transport to
   override the method rather than inherit the permissive ABC default, so a new
   channel cannot skip the question.
+
+### In-place edits (`update_message`)
+
+`update_message(channel, ts, text?, blocks?)` rewrites a message the bot itself
+posted — the rolling status message, the checklist that ticks, the estimate a
+result supersedes — instead of posting a follow-up that buries the original. It
+is **Slack-only** (`chat.update` via `slack/client.py::update_message`, which
+injects the workspace `team_id` for multi-workspace installs) and it takes the
+`ts` a `send_message` response reports. Either `text` or `blocks` is required and
+what the call carries REPLACES the message, so an edit sending only `blocks`
+drops the old text.
+
+It is gated as an EGRESS, with `send_message`'s ladder rather than
+`delete_message`'s bare shape checks. Deleting retracts content the audience
+already has; an edit PUBLISHES new agent-authored text to that same audience, so
+`mcp_tools/messaging.py::update_message` requires strict identity
+(`require_strict_session_key`), refuses channel agents
+(`_deny_channel_agent_messaging`), and vets both `capabilities.messaging` and the
+per-transport `channels` scope for `"slack"` — the transport the edit actually
+leaves over. Without that pair, a session whose messaging capability is off could
+still push arbitrary text into Slack by editing a message it posted while the
+capability was on. Every return path lands on the SEL trail.
+
+The route is `POST /api/update-message`
+(`dashboard/handlers/messaging.py::api_update_message`, registered in
+`dashboard/server.py::_register_mcp_routes` and listed in
+`_STRICT_INTERNAL_API_PATHS` — loopback plus `X-Internal-Secret`, no cookie
+fall-through, exactly like `/api/send-message` and `/api/delete-message`). It
+applies `api_send_message`'s outbound floor —
+`redact_for_display` over the text, `_sanitize_blocks` over the blocks — because
+the replacement content reaches Slack as-is. It applies the tracked-channel
+allowlist to ROOM targets only: a `D` channel is never a tracked channel, so a DM
+edit passes on the prefix, while a public or private channel must still be in
+`slack.tracking_channels` (403 `channel_not_tracked`). That allowlist is the
+operator's revocation lever, not only a first-contact check — without this rung a
+message the bot authored while the channel was tracked would remain a writable
+slot in it after the operator revoked egress. Same shape as the `file_send` Slack
+leg (`dashboard/upload_destination.py::resolve_slack`).
 
 ## Telegram dashboard-session resume
 

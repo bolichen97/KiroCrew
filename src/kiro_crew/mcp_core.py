@@ -1068,7 +1068,9 @@ def _vet_browse_governance(caller_session: str) -> str | None:
         return None
 
 
-def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
+def _vet_channel_governance(
+    caller_session: str, transport: str, tool_name: str = "send_message"
+) -> str | None:
     """Return a denial reason if governance forbids messaging *via transport*.
 
     The ``channels`` scope (a ScopedMap) is the per-transport allowlist: which
@@ -1078,8 +1080,14 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
     generally but restrict it to specific transports (e.g. Slack only).  We
     query the ScopedMap ``members`` allowlist for *transport*.  ``posture`` (the
     per-transport identity ceiling, policy-only) is enforced at the transport's
-    own admission path, not here.  Same stdio-silent, fail-closed-CPP discipline
-    as :func:`_vet_messaging_governance`.
+    own admission path, not here.
+
+    ``tool_name`` attributes the SEL audit records (denial / degraded) to the
+    actual calling tool — the gate is shared by ``send_message`` and
+    ``update_message``, and the persisted audit trail must name the real caller.
+
+    Same stdio-silent, fail-closed-CPP discipline as
+    :func:`_vet_messaging_governance`.
     """
     from kiro_crew.platform.context import PlatformCompositionError
 
@@ -1095,9 +1103,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             log_warning=False,
         )
         if not getattr(decision, "permitted", True):
-            _audit_governance_deny(
-                caller_session, f"send_message:{transport}", "channels", decision
-            )
+            _audit_governance_deny(caller_session, f"{tool_name}:{transport}", "channels", decision)
             return f"messaging via transport {transport!r} blocked by governance policy"
         return None
     except PlatformCompositionError:
@@ -1108,7 +1114,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             from kiro_crew.platform.governance_profiles import audit_governance_degraded
 
             audit_governance_degraded(
-                f"send_message:{transport}",
+                f"{tool_name}:{transport}",
                 session_key=caller_session,
                 scope="channels",
                 app=_governance_app(),

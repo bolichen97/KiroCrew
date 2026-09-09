@@ -294,6 +294,44 @@ exfiltration redactors run.
 
 The saved project dir enables running `kirocrew` from any directory.
 
+### Slack credentials are checked before they are stored
+
+`kirocrew setup --slack` asks Slack about each value as it is pasted, so a typo,
+a revoked token, or a channel ID pasted where the member ID belongs is reported
+at the prompt instead of surfacing later as a "Slack disabled" line in the
+gateway log. The app-level token is checked with `apps.connections.open` (the
+call the gateway itself makes at startup) and the bot token with `auth.test`,
+which also names the workspace — the same two calls, and the same rules, as the
+dashboard's Slack credential save. The member ID is format-checked against
+`validation.USER_ID_RE` first (so `C…`/`B…` is refused with no network, and
+Enterprise Grid's `W…` is admitted) and then confirmed with `users.info`; only
+`user_not_found` / `users_not_found` (`cli_setup._SLACK_OWNER_REJECTIONS`) indict
+the ID, because any other Slack error (a missing `users:read` scope, a rate
+limit) indicts the check.
+
+Three verdicts, and only one of them refuses a value:
+
+- **Accepted** — saved, with the workspace or member name printed.
+- **Rejected by Slack** — reported with Slack's own error code and re-asked, up
+  to three times; if all three are refused the step writes **nothing**, so a
+  working credential already in `.env` is never replaced by a broken one.
+- **Unverifiable** (Slack unreachable, transport error) — a warning, and the
+  value is saved as typed. Being offline never costs the operator the
+  credentials they just typed.
+
+The check runs only when stdin and stdout are both a terminal. Off one, nobody
+can see a verdict and re-asking would consume the next line of a piped answer
+file and misassign every remaining answer, so an automated run (`kirocrew
+update` re-runs setup with its output captured and stdin on `/dev/null`) behaves
+exactly as it did before the check existed. After a successful write the step
+PRINTS `Restart the gateway to pick them up: kirocrew restart`, since Slack
+credentials are read once at startup and tokens written here stay inert until a
+running gateway restarts. It deliberately does not offer to perform the restart:
+doing so would drop every in-flight session, and probing whether a gateway is up
+in order to decide costs a service-manager query and a port probe that can each
+fail in ways the wizard then has to degrade around — all to save one command the
+line already names.
+
 ### First-run Kiro CLI prerequisite onboarding
 
 KiroCrew exposes the same two-step readiness contract on every supported

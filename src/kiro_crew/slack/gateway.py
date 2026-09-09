@@ -307,6 +307,7 @@ from kiro_crew.slack.handler import (
     build_timing_footer,
     is_thread_incognito,
     is_thread_temporary,
+    is_tracked_channel,
 )
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.retry import open_dm_with_retry
@@ -332,6 +333,7 @@ from kiro_crew.subagent_completion_meta import (
 )
 from kiro_crew.taskrunner import TaskRunner
 from kiro_crew.tunnel import set_publish_disabled
+from kiro_crew.validation import CHANNEL_ID_RE
 from kiro_crew.wecom.gateway import warn_if_channel_uncredentialed
 
 if TYPE_CHECKING:
@@ -7082,6 +7084,8 @@ class GatewayOrchestrator:
         - ``dashboard:<slot>`` → inject into existing dashboard chat slot
         - ``dashboard``        → create new dashboard chat slot
         - ``slack:<chan>:<ts>`` → reply to Slack thread
+        - ``slack:<chan>``     → new message in that Slack channel (later parts of a
+          split report thread under the first one)
         - ``slack``            → new Slack DM only (no dashboard notification)
         - ``silent``           → log only
         - ``""`` (empty)       → routed per ``heartbeat.default_deliver`` config:
@@ -7240,19 +7244,71 @@ class GatewayOrchestrator:
                     logger.exception("Heartbeat Slack delivery failed")
             return
 
-        # ── slack:<channel>:<thread_ts> → reply to thread ──
+        # ── slack:<channel>[:<thread_ts>] → thread reply, else a new channel post ──
         if deliver.startswith("slack:"):
             parts = deliver.split(":", 2)
             try:
-                if self.slack and len(parts) == 3:
-                    chan, ts = parts[1], parts[2]
+                # A channel id with no thread ts is a valid target: post there as a
+                # new message. ``parts[1]`` must be non-empty though -- a truncated
+                # tag ("slack:") would otherwise post to channel "", and the
+                # resulting SlackApiError is swallowed by the except below, so the
+                # report would go nowhere. That case keeps the owner-DM leg.
+                # The ``slack:`` prefix guarantees a colon, so ``parts[1]`` exists.
+                chan = parts[1]
+                ts: str | None = parts[2] if len(parts) == 3 else None
+                # The deliver tag is agent-writable: HEARTBEAT.md is not fenced by
+                # ``security.paths._CREW_SECRET_LEAVES`` and prompt.md tells the
+                # agent to append entries, so ``chan`` is untrusted input. An
+                # unattended post reaches a NEW audience, which is what
+                # ``api_send_message``'s tracked-channel allowlist governs.
+                allowed = bool(chan and CHANNEL_ID_RE.match(chan) and is_tracked_channel(chan))
+                owner_dm: str | None = None
+                if self.slack and not allowed and self._owner_id:
+                    # Resolved only off the allowed path, where it serves twice: as
+                    # the fallback target, and to admit a ``slack:D...:<ts>``
+                    # origin-thread reply -- the owner's own DM channel is never a
+                    # tracked channel, so it cannot clear the check above.
+                    owner_dm = await self.slack.open_dm(self._owner_id)
+                    if chan and owner_dm and chan == owner_dm:
+                        allowed = True
+                # EVERY denied routing decision is audited, including the one with
+                # an EMPTY channel (`deliver="slack:"`, which the agent can write).
+                # Gating the log on `chan` meant that exact input produced a denial
+                # with no SEL record at all -- the one shape that leaves no trace is
+                # the one an agent can author, so it is the last that should be
+                # exempt. `channel=` reads as "none supplied" in the record.
+                if self.slack and not allowed:
+                    sel().log_api_access(
+                        caller="heartbeat",
+                        operation="heartbeat_channel_deliver",
+                        outcome="denied",
+                        source="gateway",
+                        resources=f"channel={chan},thread_ts={ts or ''}",
+                    )
+                    logger.warning(
+                        "Heartbeat deliver target %r is not a tracked channel — "
+                        "falling back to the owner DM",
+                        chan,
+                    )
+                if self.slack and allowed:
+                    # An unattended post to an operator-named channel is egress to
+                    # a non-owner audience, so it lands on the audit trail like the
+                    # sibling dashboard-deliver branches.
+                    sel().log_api_access(
+                        caller="heartbeat",
+                        operation="heartbeat_channel_deliver",
+                        outcome="approved",
+                        source="gateway",
+                        resources=f"channel={chan},thread_ts={ts or ''}",
+                    )
                     for post in _heartbeat_slack_parts(title, result_text):
-                        await self.slack.post_message(chan, post, ts)
-                elif self.slack and self._owner_id:
-                    chan = await self.slack.open_dm(self._owner_id)
-                    if chan:
-                        for post in _heartbeat_slack_parts(title, result_text):
-                            await self.slack.post_message(chan, post)
+                        # A split report threads under its own first part rather
+                        # than posting N top-level messages into the channel.
+                        posted_ts = await self.slack.post_message(chan, post, ts)
+                        ts = ts or posted_ts
+                elif self.slack and owner_dm:
+                    for post in _heartbeat_slack_parts(title, result_text):
+                        await self.slack.post_message(owner_dm, post)
             except Exception:
                 logger.exception("Heartbeat Slack delivery failed")
             if self.dashboard_state:

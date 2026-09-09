@@ -730,9 +730,13 @@ class TestDeliverResult:
         assert any(a[0] == "post" for a in mock_slack.actions)
 
     @pytest.mark.asyncio
-    async def test_slack_thread_delivery(self):
+    async def test_slack_thread_delivery(self, monkeypatch):
         from conftest import MockSlackClient
 
+        # The deliver tag is agent-writable, so the named channel must be tracked
+        # (or be the owner's own DM channel) before an unattended report is posted
+        # into it — see test_slack_heartbeat_channel_deliver.py for the refusals.
+        monkeypatch.setattr("kiro_crew.slack.gateway.is_tracked_channel", lambda c: c == "C123")
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         mock_slack = MockSlackClient()
         orch.slack = mock_slack

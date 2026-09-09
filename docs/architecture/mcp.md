@@ -675,9 +675,14 @@ answers `tools/list` from):
 - **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`,
   `spawn_release`, `spawn_sub_agents`, `wait`
 - **Messaging and notification:** `send_message`, `send_notification`,
-  `delete_message`, `file_send`, `read_slack_profile`. `send_message` is the
-  agent's only proactive egress, and it names its destination rather than
-  inferring one: `session="slack"` / `channel` / `user` / `thread_ts` are the
+  `delete_message`, `update_message`, `file_send`, `read_slack_profile`.
+  `send_message` is the agent's only proactive egress to a NEW destination —
+  `update_message` rewrites a Slack message the bot itself already posted, on the
+  same gate ladder (strict identity, channel-agent containment,
+  `capabilities.messaging` and the `channels` scope for `"slack"`), because an
+  edit publishes new text to an audience rather than retracting what it has.
+  `send_message` names its destination rather than inferring one:
+  `session="slack"` / `channel` / `user` / `thread_ts` are the
   Slack fields, and `channel_type` is the non-Slack one — the transport of the
   conversation the calling session already belongs to. Exactly one of the two
   families may appear per call. The routing ladder and the fail-closed contract
