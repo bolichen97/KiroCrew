@@ -153,6 +153,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
 )
+from kiro_crew.credential_errors import is_credential_propagation_delay
 from kiro_crew.env import (
     augmented_path,
     describe_search_path,
@@ -1832,7 +1833,16 @@ _RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b",
 # "The model backend hit a transient error (HTTP 5xx)" and burn the retry ladder.
 # The wrapper is a transport envelope, not a signal about the failure inside it;
 # classification reads the inner detail (see _provider_detail).
-_RE_5XX_HINT = re.compile(r"(please try again)", re.IGNORECASE)
+#
+# The hint wordings are PROVIDER-scoped, so onboarding a backend means auditing
+# this alternation. "please try again" is Kiro/Bedrock. "try your request again"
+# is the claude-agent-acp seam's generic upstream 500 ("Internal error: API
+# Error: The system encountered an unexpected error during processing. Try your
+# request again." with data {'errorKind': 'unknown'}): that frame carries no
+# named exception and no HTTP status token, so its retry hint is the ONLY
+# transient signal in it, and without this token the momentary blip reached the
+# user as a terminal error card and the backoff ladder never engaged.
+_RE_5XX_HINT = re.compile(r"(please try again|try your request again)", re.IGNORECASE)
 # Session expiry, by HTTP status. An expired session is rejected with 401/403,
 # and nothing else in this module recognised those codes: the error fell through
 # to the 5xx family (a co-occurring DispatchFailure/ConnectionReset from the
@@ -1903,7 +1913,16 @@ def is_auth_failure_output(haystack: str) -> bool:
     Keeping one detector rather than widening the banner regex is the same
     anti-drift argument the module makes for its other shared patterns: a second
     vocabulary is what created the gap.
+
+    :func:`kiro_crew.credential_errors.is_credential_propagation_delay` is the
+    single carve-out: an auth-shaped rejection a retry DOES fix, so latching it
+    would raise the explicitly non-retryable ``AcpAuthRequired`` and skip the
+    ladder — and a cold-start burst is exactly when kiro-cli prints it on stderr.
+    It lives in ``credential_errors.py``, not here, so consumers outside the ACP
+    layer share the verdict without a fresh agent-SDK boundary import edge.
     """
+    if is_credential_propagation_delay(haystack):
+        return False
     return bool(_RE_AUTH.search(haystack)) or _is_session_expired(haystack)
 
 
@@ -2024,10 +2043,19 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
     Classifies from the RAW ``{code, message, data}`` — never the formatted
     user-facing string — so the retry decision is independent of message
     wording. :class:`AcpError` carries this verdict (``.transient``) to the
-    retry layer (``llm_helpers``, ``chat_runner``). Precedence mirrors
-    :func:`_format_acp_error`: unentitled-model(terminal) →
-    usage-limit(terminal) → model-unavailable → throttle → auth(terminal) →
-    generic 5xx / pre-stream generation failure → unknown(terminal).
+    retry layer (``llm_helpers``, ``chat_runner``). Precedence:
+    unentitled-model(terminal) → usage-limit(terminal) →
+    malformed-request(terminal) → model-unavailable → throttle →
+    credential-propagation(transient) → auth(terminal) →
+    session-expiry(terminal) → generic 5xx / pre-stream generation failure →
+    unknown(terminal). Every step mirrors :func:`_format_acp_error`'s if/elif
+    order EXCEPT malformed-request, which that formatter checks LAST: this
+    classifier deliberately hoists it above the 5xx family so a co-occurring
+    connector token or retry hint cannot rescue a payload the backend rejected
+    for its shape (see
+    ``test_terminal_branches_outrank_a_co_occurring_dispatch_failure``). A frame
+    carrying both wordings therefore reads as 5xx prose with a terminal verdict;
+    only the verdict drives retries.
 
     *available_models* is this account's advertised set when the caller knows
     it. It only ever makes the verdict MORE conservative: a model the account
@@ -2067,6 +2095,11 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         # the bounded retry budget caps the cost if one ever slips through.
         return True
     if _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
+        return True
+    if is_credential_propagation_delay(haystack):
+        # Transient: the credential is valid, IAM has just not propagated it yet.
+        # Checked BEFORE both auth branches below, which match this very frame
+        # (UnrecognizedClientException, HTTP 403) and would return terminal.
         return True
     if _RE_AUTH.search(haystack):
         # Auth is terminal — a retry can't fix an expired/denied credential.
@@ -2441,6 +2474,21 @@ def _format_acp_error(
             formatted = (
                 "Bedrock is throttling requests. Try: (1) wait a few seconds and "
                 "retry, or (2) switch to a different model in the picker (e.g. sonnet)."
+                f"{req_id_suffix}"
+            )
+        elif is_credential_propagation_delay(haystack):
+            # Not-yet-propagated credential (see is_credential_propagation_delay).
+            # Ahead of the Bedrock-auth and session-expiry branches, which match
+            # the same frame and would tell the operator to re-authenticate a
+            # credential that is already valid. Names "credential-propagation
+            # delay" because llm_helpers._TRANSIENT_MARKERS keys on that phrase,
+            # so the string-fallback classifier recognises this wording too.
+            formatted = (
+                "The AWS credential was rejected as invalid — usually a transient IAM "
+                "credential-propagation delay right after a credential is minted, in "
+                "which case the same credential works within a few seconds. Retry in a "
+                "moment; if it keeps failing the access key itself is invalid (deleted, "
+                "rotated, or mistyped) — refresh your AWS credentials."
                 f"{req_id_suffix}"
             )
         elif _RE_AUTH.search(haystack):

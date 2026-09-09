@@ -645,7 +645,7 @@ def _opt_out_key(key: str) -> str:
 
 # Background session recycle thresholds (more aggressive than chat compaction)
 _BG_RECYCLE_PCT = 70.0  # recycle at 70% — well before overflow
-_BG_BLIND_RECYCLE_PROMPTS = 40  # recycle after 40 prompts if no metadata
+_BG_BLIND_RECYCLE_PROMPTS = 40  # unconditional backstop: recycle after 40 prompts
 
 # TTL (seconds) for the per-agent model resolution cache. Bounds how long a
 # stale resolution — especially the "auto" miss for an agent whose JSON is
@@ -1864,8 +1864,9 @@ class SessionManager:
           session's subagents (alive for the parent's whole lifetime).
         - ``self._bg_runtime`` — the background runtime backing ``get_bg_session``
           (kirocrew-lite title-gen / memory consolidation), plus any
-          ``_draining_bg_runtimes`` displaced by a backend switch while their
-          handles finish — killing one mid-drain is exactly what parking avoids.
+          ``_draining_bg_runtimes`` displaced by a backend switch or by
+          staleness while their handles finish — killing one mid-drain is
+          exactly what parking avoids.
 
         All are shielded from the sweep by unioning their live PIDs into the
         active set here (mirrors ``_pool_pids``/``_in_flight_pids``). Only alive

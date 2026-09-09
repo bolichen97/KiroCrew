@@ -4524,8 +4524,8 @@ class TestCleanupLoopResilience:
 
 
 class TestGetBgSessionRecycle:
-    """get_bg_session() recycles a healthy-but-stale _bg runtime only when it
-    has zero active sessions."""
+    """get_bg_session() displaces a healthy-but-stale _bg runtime, killing it
+    when idle and parking it to drain when its handles are still live."""
 
     @pytest.mark.asyncio
     async def test_recycles_stale_idle_runtime(self, cfg):
@@ -4533,7 +4533,7 @@ class TestGetBgSessionRecycle:
 
         stale = AsyncMock()
         stale.is_alive = lambda: True
-        stale.has_active_sessions = lambda: False
+        stale.has_active_or_initializing_sessions = lambda: False
         stale._is_stale = AsyncMock(return_value="age")
         stale.kill = AsyncMock()
         stale.pid = 111
@@ -4555,33 +4555,43 @@ class TestGetBgSessionRecycle:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_does_not_recycle_stale_runtime_with_active_sessions(self, cfg):
+    async def test_parks_a_stale_runtime_that_still_has_active_sessions(self, cfg):
+        """A runtime that never goes idle must still be bounded.
+
+        The old policy only recycled during a zero-session window and merely
+        logged otherwise, so under sustained background load the age/RSS caps
+        were never enforced. Now the retiree is detached from the slot — its
+        in-flight work finishes untouched — and new callers get a fresh process.
+        Staleness is probed with ``_is_stale()`` (age OR RSS), not the age-only
+        ``_stale_by_age()``, because RSS is the growth mode that was observed.
+        """
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
 
         stale = AsyncMock()
         stale.is_alive = lambda: True
-        stale.has_active_sessions = lambda: True
-        stale._stale_by_age = lambda: True  # drives the deferral log
-        stale._is_stale = AsyncMock(return_value="age")  # must NOT be consulted
+        stale.has_active_or_initializing_sessions = lambda: True
+        # Inside the age cap; stale by RSS.
+        stale._is_stale = AsyncMock(return_value="rss")
         stale.kill = AsyncMock()
         stale.pid = 222
-        stale._session_queues = {"s": object()}
-        sentinel = object()
-        stale.create_session = AsyncMock(return_value=sentinel)
+        stale.create_session = AsyncMock(return_value=object())
         mgr._bg_runtime = stale
 
-        # A live+reused runtime must not trigger a respawn.
-        with patch(
-            "kiro_crew.acp.runtime.AcpRuntime",
-            side_effect=AssertionError("should not respawn a live runtime"),
-        ):
+        rt2 = AsyncMock()
+        rt2.spawn = AsyncMock()
+        rt2.is_alive = lambda: True
+        sentinel = object()
+        rt2.create_session = AsyncMock(return_value=sentinel)
+
+        with patch("kiro_crew.acp.runtime.AcpRuntime", side_effect=[rt2]):
             result = await mgr.get_bg_session()
 
-        stale.kill.assert_not_awaited()  # active sessions → recycle deferred
-        # The active-session path uses the cheap _stale_by_age(), NOT the
-        # offloaded _is_stale() probe.
-        stale._is_stale.assert_not_awaited()
+        stale._is_stale.assert_awaited_once()
+        stale.kill.assert_not_awaited()  # live handles → parked, not killed
+        stale.create_session.assert_not_awaited()  # and never serves again
+        assert stale in mgr._draining_bg_runtimes
         assert result is sentinel
+        mgr._draining_bg_runtimes = []
         await mgr.close_all()
 
 

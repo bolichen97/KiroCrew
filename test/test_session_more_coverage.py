@@ -646,7 +646,7 @@ class TestGetBgSessionRespawn:
         mgr._bg_runtime = SimpleNamespace(
             is_alive=lambda: True,
             has_active_sessions=lambda: True,
-            _stale_by_age=lambda: False,
+            _is_stale=AsyncMock(return_value=None),  # healthy, so never displaced
             pid=11,
             create_session=create,
             kill=AsyncMock(),
@@ -672,7 +672,7 @@ class TestGetBgSessionRespawn:
         doomed = SimpleNamespace(
             is_alive=lambda: alive[0],
             has_active_sessions=lambda: True,
-            _stale_by_age=lambda: False,
+            _is_stale=AsyncMock(return_value=None),  # healthy, so never displaced
             pid=11,
             create_session=create_session,
             kill=AsyncMock(side_effect=RuntimeError("kill failed")),

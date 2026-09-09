@@ -71,10 +71,12 @@ _ADD_EXACT_CAP_IDS = [f[0] for f in _ADD_EXACT_CAP_FIELDS]
 # _update_job_locked validates every table field present in kwargs but only
 # ASSIGNS the documented updatable ones. Exact-cap acceptance on update is
 # therefore only meaningful for fields update actually persists; the rest
-# (created_by, thread_ts, session_key, command, script) are validated-then-
-# ignored, which the reject tests already pin via their job-unchanged asserts.
+# (created_by, session_key, command, script) are validated-then-ignored, which
+# the reject tests already pin via their job-unchanged asserts.
 _UPDATE_ASSIGNED_FIELDS = [
-    f for f in _NEWLY_VALIDATED_FIELDS if f[0] in ("agent_id", "channel", "folder_id", "model")
+    f
+    for f in _NEWLY_VALIDATED_FIELDS
+    if f[0] in ("agent_id", "channel", "folder_id", "model", "thread_ts")
 ]
 _UPDATE_ASSIGNED_IDS = [f[0] for f in _UPDATE_ASSIGNED_FIELDS]
 

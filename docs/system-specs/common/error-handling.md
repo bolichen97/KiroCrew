@@ -71,6 +71,41 @@ never drift. Notable terminal (non-retryable) classes:
 - **Usage limit** and **model not entitled**: allowance spent, or the plan lacks
   the model; also terminal, with guidance to switch model or tier.
 
+The auth family has exactly ONE transient member, **credential propagation**.
+Bedrock refuses a freshly minted credential with "The security token included in
+the request is invalid" — usually wrapped in `UnrecognizedClientException` and
+carrying a 403 — until IAM has propagated it, and the identical credential is
+accepted seconds later, so the existing backoff ladder absorbs it.
+`is_credential_propagation_delay` is the single predicate, read ahead of
+`_RE_AUTH` and the session-expiry branch in BOTH the classifier and the
+formatter, ahead of `llm_helpers._is_transient_acp_error`'s
+`accessdenied`/`unrecognizedclient` exclusion short-circuit (a
+`_TRANSIENT_MARKERS` entry alone is unreachable, because the exclusion sits
+above the markers), and inside `is_auth_failure_output` so `acp/runtime.py`'s
+stderr latch does not convert it to the explicitly non-retryable
+`AcpAuthRequired` and skip the ladder entirely. It is scoped to the "is invalid"
+WORDING, never to the status: a bare 401/403, an `... is expired` token, a
+combined "invalid or expired", and an invalid *bearer* token all stay terminal.
+The predicate lives in `credential_errors.py`, not `acp/client.py`, so consumers
+on the application side of the agent-SDK boundary share one verdict without a
+fresh ACP-layer import edge.
+
+That wording is shared with a permanently invalid access key
+(`UnrecognizedClientException` or `InvalidClientTokenId` for a key that was
+deleted, rotated, or mistyped), so a never-valid credential is also classified
+transient. The retry budget bounds that misclassification — three retries, ~15 s
+— and the formatted message closes with the terminal "refresh your AWS
+credentials" guidance rather than asserting the propagation diagnosis as fact.
+
+Retry hints are the other wording-only signal, and they are **provider-scoped**:
+`_RE_5XX_HINT` carries one alternative per backend spelling ("please try again"
+for Kiro/Bedrock, "try your request again" for the claude-agent-acp seam's
+generic upstream 500, whose frame has no named exception and no HTTP status, so
+the hint is its only transient marker). Onboarding a backend means auditing that
+alternation. The kiro-cli mid-stream envelope ("Encountered an error in the
+response stream: …") is deliberately NOT a hint — matching it would make the
+branch a catch-all that discards the real cause.
+
 ## Model-Side Refusals
 
 A refusal is a turn the model DECLINED, not a turn that failed: the request
