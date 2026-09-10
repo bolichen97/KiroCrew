@@ -354,6 +354,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
     {
         "/api/send-message",
         "/api/delete-message",
+        "/api/update-message",
         "/api/browser-event",
         "/api/browser/frame",
         "/api/browser/pump-audit",
@@ -1503,6 +1504,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/taskrunner/cancel", handlers.api_taskrunner_cancel)
     app.router.add_post("/api/send-message", handlers.api_send_message)
     app.router.add_post("/api/delete-message", handlers.api_delete_message)
+    app.router.add_post("/api/update-message", handlers.api_update_message)
     # send_notification MCP tool (RFC notification bus Phase 5) — registered
     # here (not the dashboard-only block) so headless --slack-only mode
     # serves it too; it is on _STRICT_INTERNAL_API_PATHS like send-message.

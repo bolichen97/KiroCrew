@@ -1585,7 +1585,10 @@
       "watches_load_failed": "Couldn't load this session's watches.",
       "clear_stopped_goal": "Clear stopped goal",
       "loop_stopped": "Stopped",
-      "stopped_help": "Start loop resumes this goal. Clear stopped goal removes it for good."
+      "stopped_help": "Start loop resumes this goal. Clear stopped goal removes it for good.",
+      "clear_goal_for_good": "Clear goal for good",
+      "cancel": "Cancel",
+      "clear_goal_question": "Remove this goal for good?"
     },
     "bottomTerminalPanel": {
       "close_failed": "Couldn't stop this terminal's shell on the server. It will be cleaned up automatically.",
@@ -2610,9 +2613,11 @@
       "suggestion_summarize_chat": "Summarize this week's chat activity",
       "suggestion_triage_tickets": "Triage my on-call tickets",
       "suggestion_write_design_doc": "Help me write a design doc",
-      "switch_back_to_default_mode": "Switch back to default mode",
-      "switch_to_ephemeral_mode": "Switch to ephemeral mode",
+      "choose_memory_mode": "Choose memory mode",
+      "incognito_active_switch_to_persistent": "Incognito — switch to persistent mode",
+      "switch_to_persistent_mode": "Switch to persistent mode",
       "temporary": "Temporary",
+      "temporary_active_switch_to_persistent": "Temporary — switch to persistent mode",
       "temporary_desc": "Blank slate — no memory reads or writes",
       "what_can_i_do_for_you": "What can I do for you?"
     },
@@ -2954,8 +2959,9 @@
       "wake_instructions_too_long": "Enter no more than {{max}} characters.",
       "wakes": "Wakes: {{count}}",
       "clear_monitor": "Clear stopped monitor",
-      "confirm_clear": "Yes, clear it",
-      "terminal_exits": "Restart watches the same pull request again. Clear stopped monitor removes this monitor for good and lets this session watch something else."
+      "confirm_clear": "Clear monitor for good",
+      "terminal_exits": "Restart watches the same pull request again. Clear stopped monitor removes this monitor for good and lets this session watch something else.",
+      "clear_monitor_question": "Remove this monitor for good?"
     }
   },
   "hooks": {
@@ -3049,6 +3055,7 @@
       "transcription_request_failed": "Transcription request failed."
     },
     "useWebSocket": {
+      "response_ready": "Response ready",
       "a_task_needs_your_decision": "A task needs your decision",
       "approval_required": "Approval Required",
       "tool_approval": "Tool approval: {{name}}",
@@ -5279,6 +5286,9 @@
         "recordMetricsStatusUnavailable": "Could not load the metric-recording setting. The switch is locked until it loads."
       },
       "notificationsPanel": {
+        "desktop_alerts": "Desktop alerts",
+        "notify_when_a_background_chat_finishes": "Notify when a background chat finishes",
+        "notify_when_a_background_chat_finishes_description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
         "always_interrupts_cannot_be_muted_or_lowered": "Always interrupts — cannot be muted or lowered",
         "channel_not_active_app_disabled_setting_retained": "Channel not active (app disabled) — setting retained",
         "default_priority": "Default priority: {{priority}}",
@@ -5929,6 +5939,11 @@
   },
   "settings": {
     "chat": {
+      "defaultMemoryMode": {
+        "description": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
+        "label": "Default Memory Mode",
+        "persistent": "Persistent"
+      },
       "plainDiff": {
         "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
         "label": "Plain diffs"
@@ -5945,6 +5960,35 @@
     "groups": {
       "preferences": "Preferences",
       "system": "System"
+    },
+    "secrets": {
+      "managed_title": "Used automatically by {{productName}}",
+      "managed_description": "Credentials {{productName}} recognizes and uses automatically. Add or rotate their values here.",
+      "jira_api_token_label": "Jira API token",
+      "jira_api_token_description": "Authenticates Jira issue lookups for the configured instance.",
+      "jira_global_unused_multi_host": "Not used by Jira while multiple hosts are configured. Set each host’s credential above, or delete this entry.",
+      "jira_global_unused_host_token": "Not used because the host-specific Jira credential takes precedence. Delete this entry if you no longer need the fallback.",
+      "jira_host_token_label": "Jira host API token",
+      "jira_host_token_description": "Authenticates Jira issue lookups for one configured host.",
+      "wakatime_api_key_label": "WakaTime API key",
+      "wakatime_api_key_description": "Authenticates coding-activity sync when WakaTime is enabled.",
+      "other_stored_title": "Other stored secrets",
+      "other_stored_description": "Reference stored secrets by exact name as secret://NAME from an MCP server configuration or .env credential setting.",
+      "managed_config_error": "Some automatic credentials are hidden because $KIROCREW_HOME/config.json (default ~/.kiro/crew/config.json) could not be read.",
+      "wakatime_unused_hint": "Not used while WakaTime is disabled. Enable WakaTime or delete this entry.",
+      "managed_name_hint": "Saving here updates {{name}} under Used automatically by {{productName}}.",
+      "stored_title": "Stored secrets",
+      "managed_unconfigured_hint": "To use WakaTime or Jira automatically, enable WakaTime or add a Jira host in $KIROCREW_HOME/config.json (default ~/.kiro/crew/config.json).",
+      "managed_setup_guide": "Open the secrets setup guide",
+      "delete_managed_confirm": "Permanently delete “{{name}}”? The current value cannot be recovered.",
+      "delete_managed_name": "Delete {{name}}",
+      "save_managed_name": "Save {{name}}",
+      "managed_value_placeholder": "Paste secret value",
+      "wakatime_setup_link": "Open WakaTime API key settings",
+      "saved": "Saved",
+      "name_placeholder": "MY_API_KEY",
+      "value_placeholder": "sk-...",
+      "load_error": "Could not load secrets: {{error}}"
     },
     "tabs": {
       "about": {
@@ -6011,9 +6055,6 @@
         "description": "Text-to-speech and speech-to-text (dictation) settings",
         "label": "Voice"
       }
-    },
-    "secrets": {
-      "load_error": "Could not load secrets: {{error}}"
     }
   },
   "utils": {

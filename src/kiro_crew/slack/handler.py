@@ -58,6 +58,7 @@ from kiro_crew.context import (
 )
 from kiro_crew.cron import CronService
 from kiro_crew.dashboard.chat_utils import (
+    effective_session_key,
     expire_slack_options,
     mint_options_token,
     options_control_is_stale,
@@ -1150,13 +1151,25 @@ class _LinkedApproval:
     ``state.resolve_approval``); the dashboard loop then answers the backend
     exactly once. Calling ``approve_tool`` from here too would answer the
     JSON-RPC request twice.
+
+    ``trust_grantable`` carries the server-side durable-grant proof that was true
+    of the dashboard card when the prompt was mirrored (see
+    :func:`_linked_trust_grantable`). It defaults to False so an entry built
+    without it -- and therefore every path that never established the proof --
+    cannot grant Trust.
     """
 
-    __slots__ = ("request_id", "session_key")
+    __slots__ = ("request_id", "session_key", "trust_grantable")
 
-    def __init__(self, request_id: str | int, session_key: str) -> None:
+    def __init__(
+        self,
+        request_id: str | int,
+        session_key: str,
+        trust_grantable: bool = False,
+    ) -> None:
         self.request_id = request_id
         self.session_key = session_key
+        self.trust_grantable = trust_grantable
 
 
 # Linked-slot approvals: keyed by f"{channel}:{approval_msg_ts}", parallel to
@@ -1362,14 +1375,20 @@ def is_slack_session_trusted(session_key: str) -> bool:
     return is_session_trusted(session_key)
 
 
-def add_trusted_session(session_key: str, sessions: "SessionManager | None" = None) -> None:
+def add_trusted_session(
+    session_key: str, sessions: "SessionManager | None" = None, strict: bool = False
+) -> None:
     """Grant per-session Trust for *session_key* (mirrors native trust_tool).
 
     Adds the session to the in-memory trust set and, when a SessionManager is
     supplied, sets its approval policy to ``auto`` so spawned subagents inherit
     the trust (they read the parent's approval policy, not the in-memory set).
+
+    ``strict=True`` propagates a failing policy write (after undoing the in-memory
+    half) rather than logging it, for a caller that has to report the grant back to
+    the clicker and must not call a partial grant a grant.
     """
-    _add_trusted_session(session_key, sessions)
+    _add_trusted_session(session_key, sessions, strict=strict)
 
 
 def is_allowed_user(user_id: str) -> bool:
@@ -4481,6 +4500,114 @@ class _LinkedApprovalEvent:
         self.tool_purpose = ""
 
 
+def _linked_slots_for(session_key: str) -> list[Any]:
+    """Every live dashboard slot whose turns run on *session_key*.
+
+    Keyed by the slot's EFFECTIVE session key, the one derivation the dashboard's
+    own trust resolver uses: a linked cron/workflow or channel-surfaced slot runs
+    under its ``linked_session_key``, not under ``dashboard:{key}``, so matching on
+    the raw slot key would miss exactly the slots this Slack mirror serves.
+
+    Empty when there is no dashboard state, no slots, or no match — every caller
+    treats that as "cannot act on this session".
+    """
+    slots = getattr(_dashboard_state, "_slots", None) if _dashboard_state is not None else None
+    if not slots:
+        return []
+    return [slot for slot in list(slots.values()) if effective_session_key(slot) == session_key]
+
+
+def _linked_trust_grantable(session_key: str, request_id: str | int) -> bool:
+    """Whether the dashboard card behind a linked approval may grant durable Trust.
+
+    ``chat_runner`` stamps ``trust_grantable`` onto a pending permission card only
+    when the call is unredacted and its grant scope is fully derivable, precisely so
+    an alternate approval surface cannot offer a durable grant merely because it
+    received a pending card; the dashboard resolver refuses a grant whose card lacks
+    the bit (``pattern_underivable``). This Slack mirror IS such a surface, so it
+    re-derives the same server-side proof from the owning slot's card rather than
+    treating the click as authority.
+
+    Fail-closed: no dashboard state, no owning slot, no card, or any raise -> no
+    Trust, leaving the prompt allow-once/reject exactly as before.
+    """
+    try:
+        # Reuse the dashboard resolver's own card reader, so the two surfaces cannot
+        # disagree about what a card says. Imported at call time: chat_handlers ->
+        # chat_runner -> this module, so a module-level import would close a cycle
+        # (same reason as ``_run_chat`` below).
+        from kiro_crew.dashboard.chat_handlers import _get_pattern_from_pending
+
+        for slot in _linked_slots_for(session_key):
+            if _get_pattern_from_pending(slot, str(request_id), "trust_grantable") == "1":
+                return True
+    except Exception:
+        logger.warning(
+            "Could not derive linked trust proof (session=%s req=%s); withholding Trust",
+            session_key,
+            request_id,
+            exc_info=True,
+        )
+    return False
+
+
+def _grant_linked_trust(linked_entry: _LinkedApproval, sessions: SessionManager | None) -> bool:
+    """Grant durable session Trust for a linked slot. True only on a REAL grant.
+
+    All three halves, or none. A linked slot's own tool approvals are re-decided per
+    event by ``chat_runner._slot_is_trusted``, which reads ``slot._trust``; the
+    session ``approval_policy`` is the half a spawned subagent inherits, and
+    ``chat_runner`` rewrites it from ``_persistable_session_policy(slot, ...)`` on
+    every session create/resume — so a policy-only write would be erased at the next
+    turn and a ``_trust``-only write would never reach subagents. The third is the
+    shared ``messaging.session_trust`` mapping, which the channel ``TurnDriver``
+    reads: a channel-born slot's own Slack thread is driven by
+    ``slack/transport_dispatch``, not by the dashboard chat runner, so without it a
+    Slack-typed follow-up re-prompts for every tool. Written under the slot's
+    EFFECTIVE session key, the same key the dashboard resolver grants under.
+
+    Fail-closed, and deliberately in the opposite order to the dashboard resolver
+    (which writes ``_trust`` first and lets a raise become a 500): the fallible
+    policy write goes FIRST — via the shared grant's ``strict`` mode, which undoes
+    its own in-memory half and re-raises — so a failure leaves no slot silently
+    trusted while the caller reports the click as denied. Returns False — no grant
+    at all — when the card carries no durable-grant proof, when there is no session
+    manager to hold the subagent half, when no live slot owns the session, or on any
+    raise.
+    """
+    if not linked_entry.trust_grantable or sessions is None:
+        return False
+    try:
+        slots = _linked_slots_for(linked_entry.session_key)
+        if not slots:
+            return False
+        # Through the shared channel-neutral grant, which owns BOTH the mapping the
+        # channel driver reads and the parent approval_policy a subagent reads --
+        # the same seam every other trust path in this module goes through, rather
+        # than poking `set_approval_policy` here. The mapping half is not optional:
+        # a CHANNEL-BORN slot's turns run on the channel's own session key, and its
+        # thread is deliberately absent from ``_slack_to_slot`` (see
+        # ``state.get_or_create_slot``), so a Slack-typed follow-up is driven by
+        # ``slack/transport_dispatch`` -- whose TurnDriver gates auto-approval on
+        # ``is_session_trusted``, never on the session policy. Without it the user
+        # is re-prompted for every tool on the very thread they granted Trust from.
+        #
+        # ``strict`` is what keeps this fail-closed: the policy write is the
+        # fallible half, and the default grant swallows its failure, which would
+        # report a partial grant to the clicker as "Trusted".
+        add_trusted_session(linked_entry.session_key, sessions, strict=True)
+        for slot in slots:
+            slot._trust = True
+    except Exception:
+        logger.warning(
+            "Failed to grant linked session trust (session=%s)",
+            linked_entry.session_key,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 async def post_linked_approval(
     slack: SlackClientOps,
     channel: str,
@@ -4500,9 +4627,20 @@ async def post_linked_approval(
     The caller (dashboard ``_run_chat``) treats ``None`` as "delivery failed"
     and surfaces it rather than silently parking on an unanswerable prompt.
 
-    Trust is intentionally omitted (``is_dm=False``): trust for a linked slot is
-    a dashboard-side mode, not wired through this path. Approve / Reject are
-    sufficient to guarantee the prompt is answerable from Slack.
+    Trust ("Trust session") is offered only when BOTH hold:
+
+    * the mirror target is a DM (``channel`` starts with ``D``) — the native path's
+      blast-radius rule, since trust escalates the whole session; and
+    * the dashboard card carries the server's durable-grant proof
+      (:func:`_linked_trust_grantable`).
+
+    Without both, the prompt stays Approve / Reject, which is still enough to
+    guarantee it is answerable from Slack.
+
+    The verdict is recorded on the registry entry and re-consulted at click time
+    (:func:`_grant_linked_trust`), so the grant rests on what this process derived
+    when it rendered the prompt — never on the ``action_id`` the Slack payload
+    carries, which a rendered button does not make authoritative.
     """
     # title / tool_input are LLM-generated (the tool-use request). Slack is an
     # external surface, so scrub them the same way every other outbound LLM
@@ -4513,9 +4651,10 @@ async def post_linked_approval(
     tool_input, _ = redact_exfiltration_urls(tool_input)
     tool_input, _ = redact_credentials(tool_input)
     event = _LinkedApprovalEvent(request_id, title, tool_input)
+    trust_grantable = channel.startswith("D") and _linked_trust_grantable(session_key, request_id)
     # _build_approval_blocks is typed for AcpEvent but only reads the four
     # attributes the shim provides (request_id/title/tool_input/tool_purpose).
-    blocks = _build_approval_blocks(event, is_dm=False)  # type: ignore[arg-type]
+    blocks = _build_approval_blocks(event, is_dm=trust_grantable)  # type: ignore[arg-type]
     try:
         approval_ts = await slack.post_blocks(
             channel, blocks, "Manual approval required", thread_ts
@@ -4528,7 +4667,9 @@ async def post_linked_approval(
             exc_info=True,
         )
         return None
-    _linked_approvals[f"{channel}:{approval_ts}"] = _LinkedApproval(request_id, session_key)
+    _linked_approvals[f"{channel}:{approval_ts}"] = _LinkedApproval(
+        request_id, session_key, trust_grantable
+    )
     return approval_ts
 
 
@@ -4624,11 +4765,34 @@ async def handle_interaction(
     # Linked-dashboard-slot approval: the dashboard's _run_chat owns the ACP
     # answer (it is parked on the slot's approval future). Resolve ONLY that
     # future here via state.resolve_approval — do NOT call approve_tool/reject
-    # (that would answer the JSON-RPC request twice). Trust is not offered on
-    # this path, so treat anything that isn't an explicit reject as approve.
+    # (that would answer the JSON-RPC request twice). Anything that isn't an
+    # explicit reject approves THIS call; a Trust click additionally widens the
+    # session, and only a widening that actually took counts as an approval.
     linked_entry = _linked_approvals.get(key)
     if linked_entry is not None:
         approved = action_id != _ACTION_REJECT
+        trusted = False
+        if action_id == _ACTION_TRUST:
+            trusted = _grant_linked_trust(linked_entry, sessions)
+            # A Trust click that could not grant must NOT be quietly downgraded to
+            # a one-shot approve and labelled "Trusted": that reports a security
+            # state the session does not have. Deny instead, so the user sees the
+            # escalation fail and retries.
+            approved = trusted
+            if trusted:
+                logger.info("Trust mode ON (linked) for session %s", linked_entry.session_key)
+            else:
+                logger.warning(
+                    "Refusing linked trust click for session %s", linked_entry.session_key
+                )
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.interactive.trust_linked",
+                outcome="allowed" if trusted else "denied",
+                source="slack",
+                resources=linked_entry.session_key,
+                error="" if trusted else "trust_grant_unavailable",
+            )
         resolved = False
         if _dashboard_state is not None and hasattr(_dashboard_state, "resolve_approval"):
             try:
@@ -4654,6 +4818,8 @@ async def handle_interaction(
             Stats().inc_tool_approval()
         else:
             Stats().inc_tool_denial()
+        if trusted:
+            return _ACTION_TRUST
         return _ACTION_APPROVE if approved else _ACTION_REJECT
 
     pending = _pending_approvals.get(key)

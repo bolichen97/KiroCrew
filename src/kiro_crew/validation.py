@@ -1320,6 +1320,21 @@ DELETE_MESSAGE_SCHEMA = ToolSchema(
     ],
 )
 
+# update_message addresses a message the same way delete_message does, so it is
+# schema-gated for the same reason (a missing key must be a clean ValidationError,
+# not a crash out of the stdio loop). ``text``/``blocks`` are optional HERE and
+# bounded like SEND_MESSAGE's: the "one of the two is required" rule is the
+# handler's, because a schema cannot express the either/or.
+UPDATE_MESSAGE_SCHEMA = ToolSchema(
+    tool_name="update_message",
+    fields=[
+        FieldSpec("channel", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("ts", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("text", str, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("blocks", list, item_type=dict, max_items=50),
+    ],
+)
+
 SKILL_SEARCH_SCHEMA = ToolSchema(
     tool_name="skill_search",
     fields=[
@@ -2387,6 +2402,10 @@ CRON_LIST_SCHEMA = ToolSchema(
     tool_name="cron_list",
     fields=[
         FieldSpec("verbose", bool),
+        # Registered here as well as in the tool's own inputSchema: _validate_args
+        # drops any field this list does not name, so a schema-only addition would
+        # silently never reach the handler.
+        FieldSpec("json", bool),
         FieldSpec(
             "ids",
             list,
@@ -2896,6 +2915,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "monitor_update": MONITOR_UPDATE_SCHEMA,
     "ask_question": ASK_QUESTION_SCHEMA,
     "delete_message": DELETE_MESSAGE_SCHEMA,
+    "update_message": UPDATE_MESSAGE_SCHEMA,
     "local_knowledge_search": LOCAL_KNOWLEDGE_SEARCH_SCHEMA,
     "knowledge_dedup": KNOWLEDGE_DEDUP_SCHEMA,
     "knowledge_add_document": KNOWLEDGE_ADD_DOCUMENT_SCHEMA,

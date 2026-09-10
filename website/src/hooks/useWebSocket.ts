@@ -7,6 +7,7 @@ import { store } from '../store'
 import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
 import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
+import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
 import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
@@ -1966,8 +1967,9 @@ export function useWebSocket() {
               if (last) flushVoiceTail(data.slot, last)
             }
             dispatch(sseChatMessage({ ...data, role: '_done' }))
-            // Turn-complete chime: sound-only (no feed entry, no toast).
-            // Plays on every real turn completion — active or background
+            // Turn-complete chime: sound-only (no feed entry, and no toast of
+            // its own — the opt-in one below is a separate branch on its own
+            // gate). Plays on every real turn completion — active or background
             // chat — and never during reconnect catch-up replay.
             // Preset/volume/mute resolve in useNotificationSound via the
             // 'turn' category.
@@ -1976,6 +1978,28 @@ export function useWebSocket() {
               reconnecting: reconnectingRef.current,
             })) {
               dispatchMcNotification(TURN_DONE_KIND)
+            }
+            // Opt-in native toast, default OFF, and gated on the user being
+            // AWAY — deliberately not the chime's gate, which ignores focus so
+            // every turn is audible. Titled with the finishing session so a
+            // user tracking several background threads learns which one is
+            // done; `tag` is per-slot so concurrent completions coalesce per
+            // session instead of overwriting one another.
+            if (shouldNotifyOnChatComplete({
+              slot: data.slot,
+              reconnecting: reconnectingRef.current,
+            })) {
+              const doneSlot = data.slot as string
+              const doneTitle = store.getState().dashboard.slots
+                .find(s => s.key === doneSlot)?.title || doneSlot
+              // Android Chrome throws "Illegal constructor" for page-context
+              // Notification; an uncaught throw here kills the whole message
+              // handler, so the native toast is best-effort (same as approval).
+              try {
+                new Notification(doneTitle, { body: i18nT('hooks.useWebSocket.response_ready'), tag: `kirocrew-chat-done:${doneSlot}` })
+              } catch {
+                /* unsupported platform */
+              }
             }
             if (data.slot && data.slot !== store.getState().chat.activeSlot && !reconnectingRef.current) {
               dispatch(markSlotUnread(data.slot))

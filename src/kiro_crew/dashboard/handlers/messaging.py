@@ -1268,15 +1268,27 @@ def _redact_all(value: str) -> str:
 def _sanitize_blocks(
     blocks: list[dict],
     *redactors: Any,
+    display_form: bool = False,
 ) -> list[dict]:
     """Walk Block Kit blocks and sanitize all strings (both keys and values).
 
     Block Kit structural keys (type, text, mrkdwn, etc.) pass through
     sanitizers unchanged since they don't match hostile patterns.
+
+    With ``display_form=True`` each string is scanned through
+    :func:`redact_for_display` (composing the redactors via ``_redact_all``)
+    rather than by the literal redactors alone. That is the SAME floor the text
+    path uses, and it is what catches a credential split across Block Kit markup
+    — ``AKIA`` in one run and the rest bolded in the next — which the literal
+    scan sees only as fragments. Block text a caller controls is LLM-authored,
+    so it is exactly where such a split arrives.
     """
     from copy import deepcopy  # noqa: F811
 
     def _redact_str(s: str) -> str:
+        if display_form:
+            s, _ = redact_for_display(s, _redact_all)
+            return s
         for fn in redactors:
             s, _ = fn(s)
         return s
@@ -2102,7 +2114,9 @@ async def api_send_message(request: web.Request) -> web.Response:
     text, _ = redact_for_display(text, _redact_all)
     title, _ = redact_for_display(title, _redact_all)
     if blocks:
-        blocks = _sanitize_blocks(blocks, redact_exfiltration_urls, redact_credentials)
+        blocks = _sanitize_blocks(
+            blocks, redact_exfiltration_urls, redact_credentials, display_form=True
+        )
 
     # render [OPTIONS: ...] tags as interactive buttons on the
     # plain-text path (when the caller did not supply explicit blocks — those
@@ -2770,6 +2784,141 @@ async def api_delete_message(request: web.Request) -> web.Response:
         safe_error, _ = redact_credentials(safe_error)
         safe_error, _ = redact_exfiltration_urls(safe_error)
         return web.json_response({"error": f"Delete failed: {safe_error}"}, status=502)
+    return web.json_response({"ok": True})
+
+
+async def api_update_message(request: web.Request) -> web.Response:
+    """POST /api/update-message — edit a bot-authored Slack message in place.
+
+    The egress twin of ``api_delete_message``: same "the bot's own message"
+    addressing, but it PUBLISHES replacement content, so the outbound floor is
+    ``api_send_message``'s — ``redact_for_display`` over the text and
+    ``_sanitize_blocks`` over the blocks, before either reaches Slack.
+
+    Authorization is per target kind. A ROOM must be in the tracked-channel
+    allowlist, which is the operator's revocation lever rather than only a
+    first-contact check — without it a message the bot authored while the channel
+    was tracked would stay a writable slot in it after the operator revoked egress.
+    A DM must be the CURRENT owner's, resolved through the same
+    ``open_dm(owner_id)`` the send path uses, and fails closed when no owner is
+    configured or the lookup raises. Admitting every ``D`` channel on its prefix
+    would leave a FORMER owner's DM permanently writable, since ``owner_id``
+    changes and the DM channel id does not.
+
+    That is one notch stricter than the ``file_send`` Slack leg
+    (``dashboard/upload_destination.py::resolve_slack``), which still passes DMs on
+    the prefix. Deliberate: this endpoint publishes replacement content into a
+    message that is already there, so a wrong audience is not merely a new message
+    they can ignore.
+    """
+    # circular import: slack.handler imports from dashboard.* at module load
+    from kiro_crew.slack.handler import is_tracked_channel  # noqa: F811
+
+    state: DashboardState = request.app["state"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    channel = body.get("channel", "")
+    if not isinstance(channel, str):
+        return web.json_response(
+            {"error": "invalid channel ID format", "code": "invalid_channel"}, status=400
+        )
+    channel = channel.strip()
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
+        return web.json_response(
+            {"error": "invalid channel ID format", "code": "invalid_channel"}, status=400
+        )
+    ts = body.get("ts", "")
+    if not _is_slack_ts(ts):
+        return web.json_response(
+            {
+                "error": "ts must be a Slack timestamp string like '1712793600.123456'",
+                "code": "invalid_ts",
+            },
+            status=400,
+        )
+    text = body.get("text", "")
+    if not isinstance(text, str):
+        return web.json_response(
+            {"error": "text must be a string", "code": "invalid_text"}, status=400
+        )
+    blocks = body.get("blocks")
+    if blocks is not None and not isinstance(blocks, list):
+        return web.json_response(
+            {"error": "blocks must be a list", "code": "invalid_blocks"}, status=400
+        )
+    if not text and not blocks:
+        return web.json_response(
+            {"error": "text or blocks required", "code": "content_required"}, status=400
+        )
+    # A DM is authorized by IDENTITY, a room by the tracked-channel allowlist --
+    # and a DM must be the CURRENT owner's, not merely D-prefixed. Passing every
+    # `D...` on the prefix alone would leave any DM this bot ever posted in a
+    # writable slot forever, including a FORMER owner's: `owner_id` changes, the
+    # old DM channel id does not, and an edit publishes new agent-authored text
+    # into it. So the prefix is a routing fact, never an authorization one.
+    #
+    # For rooms, tracking is the operator's revocation lever (see
+    # api_send_message's 403: "Add it to config.json ... restart the gateway"), not
+    # just a first-contact check -- a message this bot authored while the channel
+    # was tracked must not remain writable after the operator revoked egress.
+    #
+    # Both refused before any content processing, matching api_send_message's
+    # "Authorization gates (before any side effects)" ordering.
+    if channel.startswith("D"):
+        # Resolved through the same `open_dm(state.owner_id)` the send path uses
+        # (see the send_message Slack leg), so the two agree on who the owner is.
+        # Fail CLOSED when there is no owner configured or the lookup raises: an
+        # unresolvable owner means we cannot prove this DM is theirs.
+        owner_dm = ""
+        if state.owner_id and state.slack_client:
+            try:
+                owner_dm = await state.slack_client.open_dm(state.owner_id)
+            except Exception:
+                logger.warning("update_message: could not resolve the owner DM", exc_info=True)
+        denied = not owner_dm or channel != owner_dm
+        # Deliberately does NOT echo the resolved owner DM id: the refusal is
+        # returned to the caller that just failed authorization.
+        deny_reason = f"channel {channel} is not the owner's DM"
+        deny_code = "not_owner_dm"
+    else:
+        denied = not is_tracked_channel(channel)
+        deny_reason = f"channel {channel} not in tracked channels"
+        deny_code = "channel_not_tracked"
+    if denied:
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="update_message",
+            tool_kind="slack",
+            outcome="denied",
+            downstream_service="slack",
+            resources=f"channel={channel}",
+        )
+        return web.json_response({"error": deny_reason, "code": deny_code}, status=403)
+    # Sanitize LLM-generated content before it reaches Slack, on the same
+    # DISPLAY-form floor api_send_message uses: the literal-form scan alone lets a
+    # markdown-collapse credential through, and an edit is posted as-is.
+    text, _ = redact_for_display(text, _redact_all)
+    if blocks:
+        blocks = _sanitize_blocks(
+            blocks, redact_exfiltration_urls, redact_credentials, display_form=True
+        )
+    slack = state.slack_client
+    if not slack:
+        return web.json_response(
+            {"error": "Slack not connected", "code": "slack_not_connected"}, status=503
+        )
+    try:
+        await slack.update_message(channel, ts, text, blocks)
+    except Exception as e:
+        safe_error = str(e).split("\n")[0][:200]
+        safe_error, _ = redact_credentials(safe_error)
+        safe_error, _ = redact_exfiltration_urls(safe_error)
+        return web.json_response(
+            {"error": f"Update failed: {safe_error}", "code": "update_failed"}, status=502
+        )
     return web.json_response({"ok": True})
 
 
