@@ -107,6 +107,12 @@ async def test_private_task_failure_lesson_never_uses_global_provider_or_store(m
         consolidator=SimpleNamespace(_vector_store=global_vectors),
     )
     run = Project(spec_path="spec.md", spec_content="private task", task_id="failed-private")
+    run.agent = "member-alice"
+    # The runner-wide field a concurrent run overwrites. Set to something ELSE so
+    # the assertion below distinguishes the run's own agent from the shared one:
+    # the lesson session is run-scoped, so reading the shared field here would run
+    # extraction under a sibling run's agent and tool permissions.
+    runner._agent = "some-other-run"
     history_key = await runner._bound_history_key(run, "taskrunner:run:spec")
     assert history_key == "taskrunner:run:failed-private"
     assert store_of_session(ConversationLog(), history_key) == writer
@@ -118,7 +124,7 @@ async def test_private_task_failure_lesson_never_uses_global_provider_or_store(m
         patch.object(runner, "_notify", AsyncMock()),
     ):
         await runner._extract_lesson(task, run)
-    assert llm.await_args.kwargs == {"runtime_key": runtime}
+    assert llm.await_args.kwargs == {"runtime_key": runtime, "agent": "member-alice"}
     private_vectors.write_lesson.assert_called_once_with(
         "check inputs", "tool", None, "task_runner"
     )

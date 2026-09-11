@@ -179,6 +179,216 @@ class TestDecomposeYamlWithAudit:
         assert kwargs["outcome"] == "error"
         assert kwargs["metadata"]["task_id"] == "plan_2"
 
+    def test_provenance_is_recorded_when_supplied(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sourced denial is attributed to its origin, not to the dashboard."""
+        audit = MagicMock()
+        monkeypatch.setattr(tr, "sel", lambda: audit)
+        with pytest.raises(ValueError):
+            tr._decompose_yaml_with_audit(
+                "not: a workflow\n", "plan_3", source="cron", spec_name="wf.yaml"
+            )
+        kwargs = audit.log_tool_invocation.call_args.kwargs
+        assert kwargs["session_key"] == "cron"
+        assert kwargs["metadata"]["source"] == "cron"
+        assert kwargs["metadata"]["spec_name"] == "wf.yaml"
+
+
+# ── YAML spec routing in run() ──
+
+
+class TestYamlSpecDecomposeRouting:
+    """A ``.yaml``/``.yml`` spec decomposes deterministically for every source."""
+
+    @staticmethod
+    def _write(tmp_path: Path, body: str, name: str = "wf.yaml") -> Path:
+        spec = tmp_path / name
+        spec.write_text(body, encoding="utf-8", newline="\n")
+        return spec
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["cron", "mcp"])
+    async def test_sourced_workflow_spec_bypasses_llm(self, tmp_path: Path, source: str) -> None:
+        spec = self._write(tmp_path, _YAML_SPEC)
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_1", source=source)
+        dec.assert_not_awaited()
+        assert [t.index for t in run.tasks] == [1, 2]
+        assert run.tasks[1].depends_on == [1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["cron", "mcp"])
+    async def test_sourced_invalid_spec_denies_llm_fallback(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_2", source=source)
+        dec.assert_not_awaited()
+        assert run.status == "failed"
+        assert run.tasks == []
+
+    @pytest.mark.asyncio
+    async def test_sourced_denial_audit_carries_provenance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        audit = MagicMock()
+        monkeypatch.setattr(tr, "sel", lambda: audit)
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()),
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_3", source="cron")
+        assert run.status == "failed"
+        denials = [
+            call.kwargs
+            for call in audit.log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_name") == "decompose_yaml"
+            and call.kwargs.get("outcome") == "error"
+        ]
+        assert len(denials) == 1
+        assert denials[0]["session_key"] == "cron"
+        assert denials[0]["metadata"]["source"] == "cron"
+        assert denials[0]["metadata"]["spec_name"] == "wf.yaml"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["chat", "dashboard"])
+    async def test_attended_invalid_spec_still_falls_back_to_llm(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """Attended surfaces keep the LLM fallback for a non-workflow ``.yaml``.
+
+        ``/task run <file>.yaml`` (``source="chat"``) and the dashboard both always
+        supply a source, so a truthiness gate would have killed a path that worked
+        before the deny-by-default rule — with an operator right there to read the
+        plan the LLM produces.
+        """
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id=f"yaml_att_{source}", source=source)
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
+    #: A spec that YAML itself cannot parse — an unterminated flow sequence, so
+    #: ``safe_load`` raises out of the scanner rather than returning a mapping
+    #: the shape checks then reject. This is the ORDINARY way a hand-written
+    #: spec is wrong, and it takes a different code path from a parseable
+    #: non-workflow document: the shape checks raise ``ValueError``, the parser
+    #: raises ``yaml.YAMLError``, and only one of those two classes is what the
+    #: routing gate below decides on.
+    _UNPARSEABLE = "agents:\n  first: [unterminated\n"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["chat", "dashboard"])
+    async def test_attended_unparseable_spec_still_falls_back_to_llm(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """A syntax error is a rejected spec, not a broken runtime.
+
+        The attended fallback is selected on the exception class, so a spec that
+        fails in the scanner has to arrive as the same class as one that fails a
+        shape check. Otherwise the most common authoring mistake is the one case
+        the fallback does not cover, and an operator watching a plan get built
+        instead sees the run fail.
+        """
+        spec = self._write(tmp_path, self._UNPARSEABLE)
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id=f"yaml_unp_{source}", source=source)
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["cron", "mcp"])
+    async def test_sourced_unparseable_spec_is_still_denied(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """Normalizing the parser error must not open the unattended path."""
+        spec = self._write(tmp_path, self._UNPARSEABLE)
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id=f"yaml_unp_deny_{source}", source=source)
+        dec.assert_not_awaited()
+        assert run.status == "failed"
+        assert run.tasks == []
+
+    @pytest.mark.asyncio
+    async def test_local_invalid_spec_still_falls_back_to_llm(self, tmp_path: Path) -> None:
+        """Unsourced (local) runs keep the pre-existing LLM fallback."""
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_4")
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
+    @pytest.mark.asyncio
+    async def test_sourced_markdown_spec_still_uses_llm(self, tmp_path: Path) -> None:
+        """Widening the suffix gate must not divert non-YAML specs."""
+        spec = self._write(tmp_path, _YAML_SPEC, name="TASK.md")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_5", source="cron")
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
 
 # ── current_run ──
 
@@ -504,6 +714,175 @@ class TestExecutePlan:
         assert run.tasks[1].attempts == 0
         assert run.tasks[1].error == ""
         assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_execute_plan_stamps_an_explicit_agent_on_the_run(self, tmp_path: Path) -> None:
+        """A plan created under agent A but EXECUTED with agent B must run as B.
+
+        The executor reads ``run.agent`` (not ``self._agent``), so a re-execute
+        that picks a different agent has to update the run's own agent — the
+        finding was that ``execute_plan`` set only the shared field and left the
+        run stamped with its plan-time agent A (and A's tool scope).
+        """
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="planned")
+        run.agent = "agent-a"
+        with (
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            task_id = await runner.execute_plan("plan_1", agent="agent-b")
+            await runner._tasks[task_id]
+        assert run.agent == "agent-b"
+
+    @pytest.mark.asyncio
+    async def test_the_stamp_lands_before_execute_plan_yields(self, tmp_path: Path) -> None:
+        """The startable-status check and the stamp must be ONE atomic claim.
+
+        Two concurrent executes of the same run both pass the status check. If the
+        stamp sat after an await they would interleave, and the loser's worker
+        would run under the winner's agent and tool profile — the cross-scope
+        bleed `run.agent` exists to close, re-introduced between two executes of
+        one run instead of two runs. So the stamp has to land in the same
+        await-free window as the check, which is what this pins: the agent is
+        already stamped by the time the FIRST await inside `execute_plan` runs.
+        """
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="planned")
+        run.agent = "agent-a"
+        seen: list[str] = []
+
+        async def _record_first_await(*_a, **_kw) -> None:
+            seen.append(run.agent)
+
+        with (
+            patch.object(TaskRunner, "_apersist_runs", AsyncMock(side_effect=_record_first_await)),
+            patch.object(
+                TaskRunner, "_grant_run_trust", AsyncMock(side_effect=_record_first_await)
+            ),
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            task_id = await runner.execute_plan("plan_1", agent="agent-b")
+            await runner._tasks[task_id]
+        assert seen, "execute_plan awaited nothing — the ordering claim is untestable"
+        assert seen[0] == "agent-b", "the stamp landed after execute_plan's first await"
+
+    @pytest.mark.asyncio
+    async def test_a_restored_named_run_refuses_to_resume_without_an_agent(
+        self, tmp_path: Path
+    ) -> None:
+        """The shape a restart leaves: `agent_named` set, `agent` empty.
+
+        The run's scope is known to be narrower than the default, and which agent
+        set it is unknown, so resuming on the default could execute the remaining
+        tasks under a broader profile than the one chosen. Refuse instead.
+        """
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="paused")
+        run.agent = ""
+        run.agent_named = True
+        with pytest.raises(ValueError, match="cannot identify"):
+            await runner.execute_plan("plan_1")
+
+    @pytest.mark.asyncio
+    async def test_a_restored_named_run_resumes_when_an_agent_is_named_again(
+        self, tmp_path: Path
+    ) -> None:
+        """The refusal is a request for input, not a dead end."""
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="paused")
+        run.agent = ""
+        run.agent_named = True
+        with (
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            task_id = await runner.execute_plan("plan_1", agent="agent-again")
+            await runner._tasks[task_id]
+        assert run.agent == "agent-again"
+
+    @pytest.mark.asyncio
+    async def test_an_unnamed_run_still_resumes_under_the_default(self, tmp_path: Path) -> None:
+        """The refusal must not catch a run that never named an agent.
+
+        Those are the overwhelming majority, and they have always resumed under the
+        configured default — refusing them would break ordinary resume.
+        """
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="paused")
+        run.agent = ""
+        run.agent_named = False
+        with (
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            task_id = await runner.execute_plan("plan_1")
+            await runner._tasks[task_id]
+        assert run.agent == ""
+
+    @pytest.mark.asyncio
+    async def test_an_overlapping_execute_is_refused_instead_of_restamping(
+        self, tmp_path: Path
+    ) -> None:
+        """A second execute of a live start must be REFUSED, not merged into it.
+
+        `run.status` only becomes "running" inside the execution task, several
+        awaits after the startable-status check, so the check alone lets an
+        overlapping request through — and that request re-stamps `run.agent`,
+        leaving the first worker executing under the second's agent and tool
+        profile. Making the stamp atomic is not sufficient; the run has to be
+        claimed so the second caller is turned away.
+        """
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="planned")
+        run.agent = "agent-a"
+        gate = asyncio.Event()
+        second: list[str] = []
+
+        async def _hold(*_a, **_kw) -> None:
+            # Suspend the first start INSIDE the window the claim protects, then
+            # let a second execute run to completion against the same run.
+            if not gate.is_set():
+                gate.set()
+                with pytest.raises(ValueError, match="already being started"):
+                    await runner.execute_plan("plan_1", agent="agent-b")
+                second.append(run.agent)
+
+        with (
+            patch.object(TaskRunner, "_grant_run_trust", AsyncMock(side_effect=_hold)),
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            task_id = await runner.execute_plan("plan_1", agent="agent-first")
+            await runner._tasks[task_id]
+        assert gate.is_set(), "the overlapping execute never ran — nothing was tested"
+        assert second == ["agent-first"], "the refused execute still restamped run.agent"
+        assert run.agent == "agent-first"
+        assert runner._starting == set(), "the claim outlived the start"
+
+    @pytest.mark.asyncio
+    async def test_execute_plan_keeps_the_plan_time_agent_when_none_given(
+        self, tmp_path: Path
+    ) -> None:
+        """An empty ``agent`` means 'no new selection' — keep the plan-time one,
+        never blank it (which would drop it to the instance default)."""
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="planned")
+        run.agent = "agent-a"
+        with (
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            task_id = await runner.execute_plan("plan_1")
+            await runner._tasks[task_id]
+        assert run.agent == "agent-a"
 
     @pytest.mark.asyncio
     async def test_fresh_resets_passed_tasks_too(self, tmp_path: Path) -> None:
@@ -1315,6 +1694,38 @@ class TestPersistence:
         assert runner._persist_written == 0
         assert not (tmp_path / "runs.json").exists()
 
+    def test_the_named_agent_FACT_is_persisted_even_though_the_name_is_not(
+        self, tmp_path: Path
+    ) -> None:
+        """Only the NAME confers scope, so only the name has to be protected.
+
+        The bare fact that a run was started under a named agent is safe to keep in
+        this agent-writable file because both of its values fail closed, and it is
+        what stops a restart from silently substituting a broader default profile
+        for a narrower chosen one.
+        """
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, task_id="keep", name="keep", status="completed")
+        run.agent = "privileged-agent"
+        run.agent_named = True
+        runner._persist_runs()
+        data = json.loads((tmp_path / "runs.json").read_text(encoding="utf-8"))
+        assert data[0]["agent_named"] is True
+        assert "privileged-agent" not in (tmp_path / "runs.json").read_text(encoding="utf-8")
+
+    def test_the_agent_selection_is_never_written_to_the_registry(self, tmp_path: Path) -> None:
+        """``runs.json`` lives in the task runner's own work dir, which is the
+        agent's operating directory and therefore agent-writable. Writing the
+        agent there makes a tool-scope decision recoverable from a file a
+        sandboxed agent can edit, so the selection stays in memory."""
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, task_id="keep", name="keep", status="completed")
+        run.agent = "privileged-agent"
+        runner._persist_runs()
+        data = json.loads((tmp_path / "runs.json").read_text(encoding="utf-8"))
+        assert "agent" not in data[0]
+        assert "privileged-agent" not in (tmp_path / "runs.json").read_text(encoding="utf-8")
+
     def test_stale_snapshot_never_clobbers_a_newer_one(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
         runner._commit_snapshot(5, '["new"]')
@@ -1364,6 +1775,19 @@ class TestLoadRuns:
         runner = _runner(tmp_path)
         assert runner._runs == {}
         assert (tmp_path / "runs.json").exists()
+
+    def test_an_injected_agent_in_the_registry_is_ignored(self, tmp_path: Path) -> None:
+        """The read side of the same boundary.
+
+        A file a sandboxed agent can write must not choose the profile a resumed
+        run executes under, so an ``agent`` key present in an entry — however it
+        got there — is not honoured. The run resumes under the configured default,
+        which is the baseline profile and the safe direction to fail.
+        """
+        item = _registry_item(agent="privileged-agent")
+        (tmp_path / "runs.json").write_text(json.dumps([item]), encoding="utf-8")
+        runner = _runner(tmp_path)
+        assert runner._runs["r1"].agent == ""
 
     def test_running_run_recovers_as_resumable_without_trust(self, tmp_path: Path) -> None:
         (tmp_path / "runs.json").write_text(json.dumps([_registry_item()]), encoding="utf-8")
@@ -1418,3 +1842,113 @@ class TestLoadRuns:
         (tmp_path / "runs.json").write_text(json.dumps([good, bad]), encoding="utf-8")
         runner = _runner(tmp_path)
         assert list(runner._runs) == ["good"]
+
+
+class TestRetryPreservesTheRunsOwnAgent:
+    """A retry must keep the run's OWN agent, never the runner's shared one.
+
+    ``TaskRunner._agent`` is overwritten by whichever run started most recently, so
+    a handler that reads it and passes it to ``retry_from_task`` restamps the
+    retried run with a SIBLING's agent -- and that agent's tool permissions. The
+    runner treats an empty agent as "no new selection", so the handler passes none.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_retry_does_not_inherit_a_live_runs_agent(self, tmp_path: Path) -> None:
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="failed")
+        run.agent = "run-a-agent"
+        # A concurrent run B left its agent on the shared instance field.
+        runner._agent = "run-b-privileged"
+
+        with (
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "workspace_is_valid", AsyncMock(return_value=True)),
+        ):
+            task_id = await runner.retry_from_task("plan_1", 1)
+            await runner._tasks[task_id]
+
+        assert run.agent == "run-a-agent", (
+            f"the retry restamped the run with {run.agent!r}; a sibling's agent "
+            "(and its tool scope) leaked in through the shared _agent field"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_agent_still_restamps_the_run(self, tmp_path: Path) -> None:
+        """Guard the guard: preservation must not make re-selection impossible."""
+        runner = _runner(tmp_path)
+        run = _seed_run(runner, tmp_path, status="failed")
+        run.agent = "run-a-agent"
+
+        with (
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "workspace_is_valid", AsyncMock(return_value=True)),
+        ):
+            task_id = await runner.retry_from_task("plan_1", 1, agent="chosen")
+            await runner._tasks[task_id]
+
+        assert run.agent == "chosen"
+
+
+class TestRunScopedAgentIsolation:
+    """A DEFAULT run (`run.agent == ""`) must decompose and extract lessons under
+    its OWN agent — empty, which resolves to the kirocrew default — never the
+    shared ``self._agent`` a concurrent NAMED run leaves on the instance.
+
+    ``self._agent`` is the exact field overlapping runs race on (a concurrent
+    ``execute_plan``/``start_background``/``retry`` overwrites it), so a fallback
+    to it here would let a default run's decomposition or lesson session run under
+    a sibling's agent AND its tool permissions — a cross-run privilege bleed.
+    Both tests fail on the pre-fix ``agent or self._agent`` / ``(agent or
+    self._agent) or None`` code.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_run_decompose_ignores_a_siblings_shared_agent(
+        self, tmp_path: Path
+    ) -> None:
+        runner = _runner(tmp_path)
+        # A concurrent NAMED run has stamped the shared instance field.
+        runner._agent = "sibling-privileged"
+        seen: dict[str, object] = {}
+
+        async def _capture(*_args: object, **kwargs: object) -> list:
+            seen.update(kwargs)
+            return []
+
+        with patch.object(tr, "decompose", side_effect=_capture):
+            # The default run passes its own empty run.agent.
+            await runner._decompose("spec", task_id="t", agent="")
+
+        assert seen.get("agent") == "", (
+            "default run decomposed under the shared self._agent "
+            f"({seen.get('agent')!r}); a concurrent named run's agent leaked in"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lesson_extraction_names_no_agent_on_the_shared_session(
+        self, tmp_path: Path
+    ) -> None:
+        """Lesson extraction must pass NO agent, not merely the run's own.
+
+        ``BACKGROUND_KEY`` is a gateway-wide shared session and ``get_or_create``
+        honours ``agent`` only on a cold start, returning a live session untouched.
+        An agent argument here therefore does not scope the turn to this run — it
+        scopes every run's lesson extraction to whichever run cold-started ``_bg``
+        first, handing the rest that agent's tool permissions. Passing none keeps
+        the turn on the background lane deterministically.
+        """
+        sessions = _sessions()
+        runner = _runner(tmp_path, sessions=sessions)
+        runner._agent = "sibling-privileged"
+
+        with patch("kiro_crew.taskrunner.stream_and_collect_json", AsyncMock(return_value={})):
+            await runner._call_llm_for_lesson("prompt")
+
+        args, kwargs = sessions.get_or_create.await_args
+        assert "agent" not in kwargs and len(args) == 1, (
+            f"lesson call named an agent (args={args!r}, kwargs={kwargs!r}); on a "
+            "SHARED session key that binds every later run to it"
+        )

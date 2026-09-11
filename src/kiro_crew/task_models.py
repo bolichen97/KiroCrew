@@ -115,6 +115,26 @@ class Project:
     commit_hashes: list[str] = field(default_factory=list)
     worktree_path: str = ""
     repo_root: str = ""  # original repo root (for worktree cleanup)
+    #: The agent this run executes under. Per-run rather than a single field on
+    #: TaskRunner: `_MAX_CONCURRENT_TASKS` allows overlapping runs, and a shared
+    #: field is overwritten by every start, so a concurrent run would read a
+    #: sibling's agent -- and with it that agent's tool permissions. Naming an
+    #: agent per run is the intended use of `task_run`'s `agent` parameter, so the
+    #: crossing is ordinary operation rather than an edge case.
+    #:
+    #: NOT persisted: the run registry lives in the agent's own operating directory,
+    #: so a value read back from it would let a sandboxed agent pick the profile a
+    #: resumed run executes under. See `agent_named` for what a restart does keep.
+    agent: str = ""
+    #: Whether this run was started under an EXPLICITLY NAMED agent. Persisted,
+    #: unlike `agent` itself, because it is safe in agent-writable state: both of
+    #: its values fail closed. Set, it makes a resume refuse until an agent is
+    #: named again -- an agent that forges it can only block its own run. Cleared,
+    #: the run resumes under the configured default, which is what an unnamed run
+    #: does anyway. Only the NAME confers scope, so only the name has to be
+    #: protected; the bare fact that one existed is enough to stop a restart from
+    #: silently substituting a broader profile for a restricted one.
+    agent_named: bool = False
     git_enabled: bool = (
         True  # False when the workspace is not a git repo (run in place, no git ops)
     )

@@ -1543,7 +1543,7 @@ class TestScenarioReplanNewStepsFailThenSecondReplan:
 
         decompose_count = 0
 
-        async def _mock_decompose(spec, wd="", tid=""):
+        async def _mock_decompose(spec, wd="", tid="", agent=""):
             nonlocal decompose_count
             decompose_count += 1
             if decompose_count == 1:
@@ -1597,7 +1597,7 @@ class TestScenarioTokenBudgetDuringReplan:
         )
         run.tasks = [step1, failed]
 
-        async def _mock_decompose(spec, wd="", tid=""):
+        async def _mock_decompose(spec, wd="", tid="", agent=""):
             return [
                 Step(index=1, title="R1", description="d"),
                 Step(index=1, title="R2", description="d"),
@@ -2013,7 +2013,7 @@ class TestScenarioReplanSuccessCompletesTask:
 
         exec_count = 0
 
-        async def _decompose(spec_text, work_dir="", task_id=""):
+        async def _decompose(spec_text, work_dir="", task_id="", agent=""):
             return [Step(index=1, title="Task ", description="d")]
 
         runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
@@ -2474,7 +2474,7 @@ class TestScenarioReplanStepSessionReset:
         ]
 
         # Mock _decompose to return 1 new step
-        async def _mock_decompose(spec, work_dir="", task_id=""):
+        async def _mock_decompose(spec, work_dir="", task_id="", agent=""):
             return [Step(index=1, title="Fix", description="fix it")]
 
         with (
@@ -2602,7 +2602,7 @@ class TestScenarioReplanSessionNotLeaked:
             Step(index=2, title="Fail", description="d", status=StepStatus.FAILED, error="err"),
         ]
 
-        async def _mock_decompose(spec, work_dir="", task_id=""):
+        async def _mock_decompose(spec, work_dir="", task_id="", agent=""):
             return [Step(index=1, title="Fix", description="fix")]
 
         with (
@@ -2830,7 +2830,7 @@ class TestScenarioReplanDependsOnReindexing:
             Step(index=2, title="Fail", description="d", status=StepStatus.FAILED, error="err"),
         ]
 
-        async def _mock_decompose(spec, work_dir="", task_id=""):
+        async def _mock_decompose(spec, work_dir="", task_id="", agent=""):
             return [
                 Step(index=1, title="Fix A", description="d"),
                 Step(index=2, title="Fix B", description="d", depends_on=[1]),

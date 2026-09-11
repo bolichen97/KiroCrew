@@ -100,6 +100,30 @@ def _state(runner: MagicMock | None) -> SimpleNamespace:
     return SimpleNamespace(task_runner=runner)
 
 
+def _agent_resolution(resolved: bool):
+    """Patch the resolver the launch endpoints consult for a named agent.
+
+    Named against the real host otherwise: these tests invent agent names, and
+    the endpoints refuse a name resolution does not confirm, so without this the
+    invented name is a 404 and a test about spec forwarding fails for an
+    unrelated reason. ``requested_resolved`` is the only field the guard reads.
+
+    Patched on the HANDLER module, not on ``config.loader``: the handler imports
+    both names at module scope, so it holds its own binding and a patch applied to
+    the loader would not be seen here.
+    """
+    import kiro_crew.dashboard.handlers.taskrunner as _h
+
+    return (
+        patch.object(_h, "KiroCrewConfig", MagicMock()),
+        patch.object(
+            _h,
+            "resolve_agent_bindings",
+            MagicMock(return_value=SimpleNamespace(requested_resolved=resolved)),
+        ),
+    )
+
+
 def _request(
     state: Any,
     method: str = "POST",
@@ -271,18 +295,144 @@ class TestStart:
         spec = tmp_path / "TASK.md"
         spec.write_text("# t", encoding="utf-8")
         runner = _runner(tmp_path)
-        resp = await api_taskrunner_start(
-            _request(
-                _state(runner),
-                json_body={"spec": str(spec), "agent": "a1", "name": "n1", "source": "file"},
+        cfg_patch, resolve_patch = _agent_resolution(True)
+        with cfg_patch, resolve_patch:
+            resp = await api_taskrunner_start(
+                _request(
+                    _state(runner),
+                    json_body={"spec": str(spec), "agent": "a1", "name": "n1", "source": "file"},
+                )
             )
-        )
         assert resp.status == 200
         assert _body(resp) == {"ok": True, "spec": str(spec.resolve()), "task_id": "tid-1"}
         kwargs = runner.start_background.call_args.kwargs
         assert kwargs["agent"] == "a1"
         assert kwargs["name"] == "n1"
         assert kwargs["source"] == "file"
+
+    @pytest.mark.asyncio
+    async def test_an_unresolved_agent_is_refused_before_the_run_starts(
+        self, tmp_path: Path
+    ) -> None:
+        """A grammar-valid name that resolves to nothing must not start a run.
+
+        The resolver falls back to the configured default for an unknown name, so
+        without this the task runs under a DIFFERENT agent — and a different tool
+        profile — than the caller named, and the 200 response says nothing about
+        the substitution. The refusal has to land before `start_background`, since
+        that is what puts the name on a `--agent` argv.
+        """
+        spec = tmp_path / "TASK.md"
+        spec.write_text("# t", encoding="utf-8")
+        runner = _runner(tmp_path)
+        cfg_patch, resolve_patch = _agent_resolution(False)
+        with cfg_patch, resolve_patch:
+            resp = await api_taskrunner_start(
+                _request(
+                    _state(runner),
+                    json_body={"spec": str(spec), "agent": "ghost-agent", "source": "file"},
+                )
+            )
+        assert resp.status == 404
+        assert _body(resp)["code"] == "agent_not_found"
+        runner.start_background.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["agent", "workspace_dir"])
+    @pytest.mark.parametrize("bad", [{}, [], 7, True])
+    async def test_a_non_string_selection_field_is_400_not_500(
+        self, tmp_path: Path, field: str, bad: object
+    ) -> None:
+        """A JSON body is caller-controlled, so neither field is known to be text.
+
+        An unhashable value reaches the resolver's ``agent_name in config.agents``
+        and raises ``TypeError`` — a 500 on a malformed request. The type is
+        checked before resolution so a bad request is answered as one, and so the
+        resolver is never handed something it cannot compare.
+        """
+        spec = tmp_path / "TASK.md"
+        spec.write_text("# t", encoding="utf-8")
+        runner = _runner(tmp_path)
+        resp = await api_taskrunner_start(
+            _request(
+                _state(runner),
+                json_body={"spec": str(spec), "source": "file", field: bad},
+            )
+        )
+        assert resp.status == 400
+        assert _body(resp)["error"] == f"{field} must be a string"
+        runner.start_background.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_inline_start_writes_no_spec_file(self, tmp_path: Path) -> None:
+        """A refusal must not leave a `TASK_*.md` behind.
+
+        The inline branch writes the spec into the work dir, and the only cleanup
+        for it is the handler's `except Exception` — which a `return` does not
+        reach. Since the refusal fires on the repeatable case (an agent name an
+        LLM invented), refusing after the write would strand one file per call.
+        The selection does not depend on the spec, so it is checked first.
+        """
+        runner = _runner(tmp_path)
+        work_dir = Path(runner._work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        cfg_patch, resolve_patch = _agent_resolution(False)
+        with cfg_patch, resolve_patch:
+            resp = await api_taskrunner_start(
+                _request(
+                    _state(runner),
+                    json_body={"spec": "__inline__:# hello", "agent": "ghost-agent"},
+                )
+            )
+        assert resp.status == 404
+        assert list(work_dir.glob("TASK_*.md")) == []
+        runner.start_background.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_override_resolves_against_the_runners_own_workspace(
+        self, tmp_path: Path
+    ) -> None:
+        """A request that names no folder still runs somewhere.
+
+        Resolving against nothing would 404 a project-scope agent that exists in
+        exactly the runner's configured workspace — the project the run is about
+        to use. The fallback is the same rule the status payload publishes as
+        `default_workspace_dir`, so the two cannot disagree.
+        """
+        spec = tmp_path / "TASK.md"
+        spec.write_text("# t", encoding="utf-8")
+        runner = _runner(tmp_path)
+        runner._workspace_dir = "/configured-ws"
+        cfg_patch, resolve_patch = _agent_resolution(True)
+        with cfg_patch, resolve_patch as resolve:
+            await api_taskrunner_start(
+                _request(
+                    _state(runner),
+                    json_body={"spec": str(spec), "source": "file", "agent": "a"},
+                )
+            )
+        assert resolve.call_args.args[2] == "/configured-ws"
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_agent_needs_no_resolution(self, tmp_path: Path) -> None:
+        """Empty means "the configured default", which is a decision, not a typo.
+
+        Resolution is not even consulted — an empty name has nothing to confirm,
+        and requiring a lookup would make every default-agent run pay for one.
+        """
+        spec = tmp_path / "TASK.md"
+        spec.write_text("# t", encoding="utf-8")
+        runner = _runner(tmp_path)
+        import kiro_crew.dashboard.handlers.taskrunner as _h
+
+        with patch.object(
+            _h, "resolve_agent_bindings", MagicMock(side_effect=AssertionError("no lookup"))
+        ):
+            resp = await api_taskrunner_start(
+                _request(_state(runner), json_body={"spec": str(spec), "source": "file"})
+            )
+        assert resp.status == 200
+        assert runner.start_background.call_args.kwargs["agent"] == ""
 
     @pytest.mark.asyncio
     async def test_empty_inline_spec_is_400(self, tmp_path: Path) -> None:
@@ -556,6 +706,24 @@ class TestRetry:
         resp = await api_taskrunner_retry(_request(_state(runner), match_info={"task_id": "t1"}))
         assert _body(resp) == {"ok": True, "task_id": "t1"}
         assert runner.retry_from_task.await_args.args == ("t1", 1)
+
+    @pytest.mark.asyncio
+    async def test_retry_does_not_pass_the_runners_shared_agent(self, tmp_path: Path) -> None:
+        """The handler must name NO agent, so the run keeps its own.
+
+        ``TaskRunner._agent`` holds whichever run started most recently, so passing
+        it here restamped the retried run with a SIBLING's agent and tool scope.
+        ``retry_from_task`` reads an empty agent as "no new selection".
+        """
+        runner = _runner(tmp_path)
+        runner._agent = "sibling-privileged"
+        resp = await api_taskrunner_retry(_request(_state(runner), match_info={"task_id": "t1"}))
+        assert _body(resp) == {"ok": True, "task_id": "t1"}
+        kwargs = runner.retry_from_task.await_args.kwargs
+        assert "agent" not in kwargs or not kwargs["agent"], (
+            f"the retry handler forwarded agent={kwargs.get('agent')!r} from the "
+            "shared _agent field, restamping the run with a sibling's agent"
+        )
 
     @pytest.mark.asyncio
     async def test_value_error_is_400(self, tmp_path: Path) -> None:
@@ -967,15 +1135,61 @@ class TestExecutePlan:
         assert _body(resp)["error"] == "nothing to execute"
 
     @pytest.mark.asyncio
+    async def test_a_resume_resolves_the_agent_against_the_retained_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """`execute_plan` keeps a resumed run's own `work_dir` and discards the
+        body's `workspace_dir` override, so the agent has to be resolved against
+        the retained one. Resolving against the override would accept a
+        project-scope agent that does not exist where the run actually executes
+        (and reject the one that does) — a project agent lives only in its own
+        checkout."""
+        runner = _runner(tmp_path)
+        run = _planned_run()
+        run.status = "paused"  # a resume, not a planned start
+        run.work_dir = "/retained"
+        runner._runs = {"p1": run}
+        cfg_patch, resolve_patch = _agent_resolution(True)
+        with cfg_patch, resolve_patch as resolve:
+            await api_taskrunner_execute_plan(
+                _request(
+                    _state(runner),
+                    match_info={"task_id": "p1"},
+                    json_body={"agent": "a", "workspace_dir": "/discarded"},
+                )
+            )
+        assert resolve.call_args.args[2] == "/retained"
+
+    @pytest.mark.asyncio
+    async def test_a_planned_start_resolves_against_the_body_override(self, tmp_path: Path) -> None:
+        """The other half of the rule: a still-planned run ADOPTS the override, so
+        that is the directory its agent must exist in."""
+        runner = _runner(tmp_path)
+        run = _planned_run()
+        runner._runs = {"p1": run}
+        cfg_patch, resolve_patch = _agent_resolution(True)
+        with cfg_patch, resolve_patch as resolve:
+            await api_taskrunner_execute_plan(
+                _request(
+                    _state(runner),
+                    match_info={"task_id": "p1"},
+                    json_body={"agent": "a", "workspace_dir": "/adopted"},
+                )
+            )
+        assert resolve.call_args.args[2] == "/adopted"
+
+    @pytest.mark.asyncio
     async def test_success_forwards_options(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
-        resp = await api_taskrunner_execute_plan(
-            _request(
-                _state(runner),
-                match_info={"task_id": "p1"},
-                json_body={"agent": "a", "fresh": True, "workspace_dir": "/ws"},
+        cfg_patch, resolve_patch = _agent_resolution(True)
+        with cfg_patch, resolve_patch:
+            resp = await api_taskrunner_execute_plan(
+                _request(
+                    _state(runner),
+                    match_info={"task_id": "p1"},
+                    json_body={"agent": "a", "fresh": True, "workspace_dir": "/ws"},
+                )
             )
-        )
         assert _body(resp) == {"ok": True, "task_id": "p1"}
         kwargs = runner.execute_plan.await_args.kwargs
         assert kwargs["agent"] == "a"

@@ -225,6 +225,102 @@ dashboard_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
 | `plan()` API | `"text"`, `"spec"`, `"file"` | ✅ |
 | Cron job | must pass `source="cron"` | ❌ (filtered out) |
 
+### Agent Selection
+
+Every launch endpoint (`/api/taskrunner` start, `/plan`, `/execute`) accepts an `agent`
+name, and `task_run` exposes it on the MCP surface. Three checks apply, and they answer
+different questions. All three endpoints share one `_agent_selection(body)`, which reads
+and vets the `agent`/`workspace_dir` pair — they all put the agent on a `--agent` argv,
+so a check living at one of them leaves the other two open.
+
+- **Grammar** (`_AGENT_NAME_RE`, at the tool boundary) — is the string safe to place in
+  a `--agent` argv. Every agent-valued tool field is pattern-bound for this reason.
+- **Type** (at the endpoint) — a JSON body is caller-controlled, so neither field is
+  known to be text. A non-string value is `400 must be a string`; without the check an
+  unhashable one reaches the resolver's `agent_name in config.agents` and raises
+  `TypeError`, answering a malformed request with a `500`.
+- **Resolution** (at the endpoint) — does the name refer to an agent that exists. A
+  NONEMPTY name that resolution does not positively confirm is refused
+  `404 agent_not_found` before the run starts, because `_resolve_agent_selection` falls
+  back to `default_agent` for an unknown name: without the check, a typo or a name an
+  LLM invented runs the task under a different agent — and a different tool profile —
+  than the caller asked for, and the `200` response says nothing about the substitution.
+  The check reads the resolver's own `requested_resolved` flag rather than re-deriving a
+  membership test, and resolves against the project the run will ACTUALLY execute in,
+  since a project-scope agent shadows a user-level one and exists only in that checkout.
+  For `/start` and `/plan` that is the request's `workspace_dir`, which a new run adopts.
+  When a request names no folder at all, the runner's own effective workspace is used
+  (`workspace_dir` if configured, else the per-run base) — the same value the status
+  payload publishes as `default_workspace_dir`, so a project agent living in the default
+  project is not refused for want of an explicit override.
+  For `/execute` it is the run's RETAINED `work_dir` whenever the run is past `planned`,
+  because `execute_plan` applies a `workspace_dir` override only while the run is still
+  `planned`: resolving a resume against the override would vet the agent against a folder
+  the run then discards, accepting a project agent that does not exist where it runs and
+  rejecting the one that does.
+
+An EMPTY `agent` is not a name and is not resolved: it means "the configured default",
+which is a caller's decision rather than a possible mistake.
+
+Once admitted, the agent is a per-run field on `Project`, never a field on the runner —
+overlapping runs share one `TaskRunner` instance, so a shared field would let one run
+execute under a sibling's agent and tool scope. An execute- or retry-time selection
+restamps the run; an empty selection preserves the plan-time agent. That stamp lands in
+the SAME await-free window as `execute_plan`'s startable-status check and its
+`workspace_dir` override: two concurrent executes of one run both pass that check, so a
+stamp after the first `await` would interleave and leave the loser's worker running under
+the winner's agent and tool profile — the cross-scope bleed this field exists to close,
+re-introduced between two executes of a single run.
+
+**The selection is in-memory only and is NOT persisted.** `runs.json` lives in the task
+runner's own work dir, which is the agent's operating directory and therefore
+agent-writable, so a value restored from it would let a sandboxed agent choose the
+profile a resumed run executes under by editing its own state file. `_persist_runs` does
+not write the field and `_load_runs` does not read it back even when an entry carries
+one.
+
+What a restart DOES keep is `agent_named`, a boolean saying the run was started under an
+explicitly named agent. That is safe in the same agent-writable file because both of its
+values fail closed: set, it makes the resume refuse until an agent is named again, so an
+agent that forges it can only block its own run; cleared, the run resumes under the
+configured default, which is what an unnamed run does anyway. Only the NAME confers scope,
+so only the name needs protecting — but the bare fact that one existed is enough to stop a
+restart from silently substituting a broader default profile for a narrower chosen one.
+
+So a resumed run with `agent_named` set and no `agent` is **refused** ("started under a
+named agent this gateway cannot identify"); naming an agent again resumes it. A run
+that never named one keeps resuming under the configured default, which is the
+pre-existing behaviour and the overwhelming majority. Carrying the NAME across a restart
+requires gateway-protected state that agents cannot reach.
+
+### Decomposer Selection
+
+`run()` picks the decomposer from the spec's suffix, not from the caller. A spec whose
+path ends in `.yaml`/`.yml` is decomposed deterministically by `decompose_yaml` for
+every `source`, so a cron- or MCP-started workflow spec produces the same task DAG as
+the same file started from the dashboard. Inline YAML submitted with `source="yaml"` is
+likewise decomposed deterministically. Any other spec is decomposed by the LLM.
+
+Deny-by-default governs the invalid case, and it is keyed on whether anyone is
+watching. When an **unattended** run's `.yaml`/`.yml` spec is not workflow-shaped —
+`source` in `_UNATTENDED_SOURCES` = `{"cron", "mcp"}` — the run fails and is never
+retried through the LLM decomposer. **Attended** sources (`chat`, `dashboard`, and
+unsourced CLI runs) fall back to the LLM decomposer, because an operator is present to
+read the plan and both of those surfaces always supply a source, so a truthiness gate
+would have removed a path that worked before the rule. The SEL `decompose_yaml` `error`
+event is recorded either way.
+
+"Not workflow-shaped" includes a document YAML cannot parse at all. `decompose_yaml`
+raises `ValueError` for every rejected spec, its own shape checks and a `yaml.YAMLError`
+out of `safe_load` alike, and this gate selects on that one class — so a syntax error,
+the most ordinary way a hand-written spec is wrong, takes the same branch as a semantic
+one instead of failing an attended run that would otherwise have been given the LLM
+fallback.
+
+Every `decompose_yaml` audit event carries the run's provenance — `source` and
+`spec_name` in its metadata, and the source as its caller identity (`dashboard` for
+unsourced runs), so a denial is attributed to the surface that started the run.
+
 ### Data Types
 
 Named `TaskStatus`/`Task`/`Project` in `task_models.py`; `StepStatus`/`Step`/`TaskRun`

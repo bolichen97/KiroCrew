@@ -1186,6 +1186,11 @@ TASK_RUN_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("spec", str, required=True, max_len=MAX_LONG_STRING),
         FieldSpec("name", str, max_len=200),
+        # Agent the run executes under. Pattern-bound like every other
+        # agent-valued tool field: the value reaches a ``--agent`` argument on
+        # the agent subprocess, so its grammar is checked here rather than
+        # passed through.
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
     ],
 )
 

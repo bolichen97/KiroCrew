@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -87,6 +87,11 @@ def _make_state_with_two_slots():
     state = MagicMock()
     state._slots = {"chat-1": slot_1, "chat-2": slot_2}
     state.get_slot = MagicMock(side_effect=lambda slot_name: state._slots.get(slot_name))
+    # ``_resolve_session_target`` iterates ``state.crons.list_jobs(...)``; a bare
+    # MagicMock is not iterable, so cron-key tests need a real list here. Tests
+    # that want an origin override it with their own job.
+    state.crons = MagicMock()
+    state.crons.list_jobs = MagicMock(return_value=[])
     return state, slot_1, slot_2
 
 
@@ -131,6 +136,10 @@ def _make_state_with_cron_and_chat_slots():
     state = MagicMock()
     state._slots = {"cron-daily-digest": cron_slot, "chat-2": chat_slot}
     state.get_slot = MagicMock(side_effect=lambda slot_name: state._slots.get(slot_name))
+    # See _make_state_with_two_slots: keep ``list_jobs`` iterable so a cron key
+    # that misses its live slot reaches origin resolution instead of a TypeError.
+    state.crons = MagicMock()
+    state.crons.list_jobs = MagicMock(return_value=[])
     return state, cron_slot, chat_slot
 
 
@@ -329,8 +338,12 @@ class TestOutboxNotifySlotTargeting:
             assert broadcast_payload["slot"] == "chat-2"
 
     @pytest.mark.asyncio
-    async def test_notify_falls_back_when_session_key_slot_not_found(self, outbox, mock_sel):
-        """B3: Header present but slot doesn't exist → graceful fallback to max heuristic."""
+    async def test_notify_suppresses_card_when_session_key_slot_not_found(self, outbox, mock_sel):
+        """B3: Header present but slot doesn't exist → card is SUPPRESSED, not
+        leaked to an unrelated slot. A present-but-unresolved X-Session-Key
+        denotes a session with no live slot; falling back to the
+        most-recently-active slot would surface the card in whatever session the
+        user happens to have focused (the file_send card-leak bug)."""
         wav = outbox / "stale.wav"
         wav.write_bytes(b"\x00" * 100)
         state, slot_1, slot_2 = _make_state_with_two_slots()
@@ -341,9 +354,69 @@ class TestOutboxNotifySlotTargeting:
                 headers={"X-Session-Key": "dashboard:nonexistent-slot"},
             )
             assert resp.status == 200
-            # Slot not found → fallback picks slot_2 (newer ts)
-            slot_2.append.assert_called_once()
+            # Present-but-unresolved key → no slot receives the card
             slot_1.append.assert_not_called()
+            slot_2.append.assert_not_called()
+            state.broadcast_ws.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_card_is_distinguishable_in_the_audit(self, outbox, mock_sel):
+        """Suppression is right, but it must not read as delivery.
+
+        The endpoint answers 200 either way and records one ``completed`` event
+        either way, so without a marker the vanished card and the delivered one
+        are the same event and there is nothing to diagnose from.
+        """
+        wav = outbox / "vanished.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(wav),
+                    "filename": "vanished.wav",
+                    "description": "test",
+                    "size": 100,
+                },
+                headers={"X-Session-Key": "dashboard:nonexistent-slot"},
+            )
+            assert resp.status == 200
+        notified = [
+            call.kwargs
+            for call in mock_sel.log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_kind") == "notify"
+        ]
+        assert len(notified) == 1
+        assert notified[0]["outcome"] == "completed"
+        assert "delivered=0" in notified[0]["resources"]
+
+    @pytest.mark.asyncio
+    async def test_a_delivered_card_says_so_in_the_same_field(self, outbox, mock_sel):
+        """The marker's other value, so the pair is what distinguishes them."""
+        wav = outbox / "landed.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(wav),
+                    "filename": "landed.wav",
+                    "description": "test",
+                    "size": 100,
+                },
+                headers={"X-Session-Key": "dashboard:chat-1"},
+            )
+            assert resp.status == 200
+        slot_1.append.assert_called_once()
+        notified = [
+            call.kwargs
+            for call in mock_sel.log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_kind") == "notify"
+        ]
+        assert len(notified) == 1
+        assert "delivered=1" in notified[0]["resources"]
 
     @pytest.mark.asyncio
     async def test_notify_targets_cron_slot_from_cron_session_key(self, outbox, mock_sel):
@@ -363,12 +436,20 @@ class TestOutboxNotifySlotTargeting:
             chat_slot.append.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_notify_falls_back_when_cron_slot_not_found(self, outbox, mock_sel):
-        """B5: cron:{id} key with NO matching cron-{id} slot → graceful fallback
-        to the max-heuristic (this state has no cron-daily-digest slot)."""
+    async def test_notify_routes_to_cron_origin_when_no_live_slot(self, outbox, mock_sel):
+        """B5: cron:{id} key with NO matching cron-{id} slot (a headless script
+        cron with no live dashboard slot) routes the card to the cron's ORIGIN
+        dashboard session — the chat that created the cron — mirroring
+        send_message(session="origin"). It must NOT leak into the
+        most-recently-active dashboard slot."""
         wav = outbox / "cron.wav"
         wav.write_bytes(b"\x00" * 100)
         state, slot_1, slot_2 = _make_state_with_two_slots()
+        # The "daily-digest" cron was created from dashboard chat-1 (the older
+        # slot). slot_2 is newer, so the old max-heuristic would have leaked the
+        # card there — origin resolution must override that.
+        job = MagicMock(id="daily-digest", session_key="dashboard:chat-1")
+        state.crons.list_jobs = MagicMock(return_value=[job])
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post(
                 "/api/outbox/notify",
@@ -376,9 +457,222 @@ class TestOutboxNotifySlotTargeting:
                 headers={"X-Session-Key": "cron:daily-digest"},
             )
             assert resp.status == 200
-            # No cron-daily-digest slot → fallback picks slot_2 (newer ts)
+            # Origin is chat-1 → slot_1 receives the card, not the newer slot_2
+            slot_1.append.assert_called_once()
+            slot_2.append.assert_not_called()
+            broadcast_payload = state.broadcast_ws.call_args[0][1]
+            assert broadcast_payload["slot"] == "chat-1"
+
+    @pytest.mark.asyncio
+    async def test_notify_suppresses_card_when_cron_origin_unresolvable(self, outbox, mock_sel):
+        """B5b: cron:{id} key with NO live cron-{id} slot AND no resolvable origin
+        (a cron created from the dashboard UI with no originating chat, or an
+        unknown job) → card SUPPRESSED, not leaked into the most-recently-active
+        dashboard slot."""
+        wav = outbox / "orphan_cron.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        # No job matches the cron id → origin unresolvable
+        state.crons.list_jobs = MagicMock(return_value=[])
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(wav),
+                    "filename": "orphan_cron.wav",
+                    "description": "test",
+                    "size": 100,
+                },
+                headers={"X-Session-Key": "cron:unknown-job"},
+            )
+            assert resp.status == 200
+            slot_1.append.assert_not_called()
+            slot_2.append.assert_not_called()
+            state.broadcast_ws.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_rehydrates_cron_origin_slot_on_get_slot_miss(self, outbox, mock_sel):
+        """B5c: the COMMON headless case — a script cron running with NO dashboard
+        tab open, so state._slots is EMPTY. The origin slot is not loaded, so on
+        the get_slot miss the handler rehydrates it from history (off the loop,
+        mirroring send_message(session="origin")) and delivers the card there. A
+        cold-rehydrated slot has no live reader, so delivery goes through append's
+        own _on_message callback, not an explicit broadcast."""
+        wav = outbox / "cold.wav"
+        wav.write_bytes(b"\x00" * 100)
+        # No dashboard tabs open at all → state._slots is empty
+        state = MagicMock()
+        state._slots = {}
+        state.get_slot = MagicMock(return_value=None)
+        job = MagicMock(id="daily-digest", session_key="dashboard:chat-cold")
+        state.crons = MagicMock()
+        state.crons.list_jobs = MagicMock(return_value=[job])
+        # The origin session exists on disk; rehydration returns a COLD slot
+        # (no live reader — faithful to a session with no open tab).
+        cold = MagicMock()
+        cold.key = "chat-cold"
+        cold._has_reader = False
+        cold.messages = [
+            {"role": "assistant", "content": "prev", "ts": "2026-05-27T19:00:00+00:00"}
+        ]
+
+        def fake_append_cold(role, content, cls="", **kwargs):
+            msg = {
+                "role": role,
+                "content": content,
+                "ts": "2026-05-27T22:00:00+00:00",
+                "meta": {**(kwargs.get("meta") or {}), "mid": f"m-cold-{len(cold.messages)}"},
+            }
+            cold.messages.append(msg)
+            return msg
+
+        cold.append = MagicMock(side_effect=fake_append_cold)
+        with patch(
+            "kiro_crew.dashboard.handlers.files.rehydrate_slot_from_history_async",
+            new_callable=AsyncMock,
+            return_value=cold,
+        ) as mock_rehydrate:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/outbox/notify",
+                    json={
+                        "path": str(wav),
+                        "filename": "cold.wav",
+                        "description": "test",
+                        "size": 100,
+                    },
+                    headers={"X-Session-Key": "cron:daily-digest"},
+                )
+                assert resp.status == 200
+                # get_slot("chat-cold") missed → rehydrated from history
+                mock_rehydrate.assert_awaited_once_with(state, "chat-cold")
+                cold.append.assert_called_once()
+                content = json.loads(cold.append.call_args[0][1])
+                assert content["filename"] == "cold.wav"
+                state.broadcast_ws.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_suppresses_when_cron_origin_slot_gone(self, outbox, mock_sel):
+        """B5d: origin resolves to a slot key, but the session is truly gone
+        (never persisted, deleted, or closed) so rehydration also returns None →
+        card SUPPRESSED. Two live slots are seeded to prove the card is not leaked
+        into a focused slot either."""
+        wav = outbox / "gone_cron.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        job = MagicMock(id="daily-digest", session_key="dashboard:chat-gone")
+        state.crons.list_jobs = MagicMock(return_value=[job])
+        with patch(
+            "kiro_crew.dashboard.handlers.files.rehydrate_slot_from_history_async",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_rehydrate:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/outbox/notify",
+                    json={
+                        "path": str(wav),
+                        "filename": "gone_cron.wav",
+                        "description": "test",
+                        "size": 100,
+                    },
+                    headers={"X-Session-Key": "cron:daily-digest"},
+                )
+                assert resp.status == 200
+                mock_rehydrate.assert_awaited_once_with(state, "chat-gone")
+                slot_1.append.assert_not_called()
+                slot_2.append.assert_not_called()
+                state.broadcast_ws.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_routes_a_subagent_card_to_its_parent_slot(self, outbox, mock_sel):
+        """B7: a dedicated-process sub-agent has no tab of its own, so its card
+        belongs to the PARENT's tab — the surface its completion injection and its
+        ``subagent_*`` WS frames already route to. Suppressing it instead would let
+        ``file_send`` answer "File sent" with nothing on screen anywhere."""
+        wav = outbox / "sub.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        # A PLAIN LIST, because the real ``all_agents`` is a @property. Doubling it
+        # as a callable is what let the production `manager.all_agents()` bug pass:
+        # the double accepted the call, the real object raised TypeError, and the
+        # card was suppressed for every sub-agent.
+        state.subagents.all_agents = [
+            MagicMock(id="a1", conversation_key="", parent_session_key="dashboard:chat-1")
+        ]
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={"path": str(wav), "filename": "sub.wav", "description": "t", "size": 100},
+                headers={"X-Session-Key": "subagent:a1"},
+            )
+            assert resp.status == 200
+            slot_1.append.assert_called_once()
+            slot_2.append.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_routes_a_continuation_to_its_own_parent(self, outbox, mock_sel):
+        """Two records can carry ONE key, and the card belongs to the LIVE one.
+
+        A continuation is minted as a new run whose ``conversation_key`` is the
+        original's ``subagent:<id>``, and the original resolves to that same string.
+        When a DIFFERENT session continued the conversation the two parents differ,
+        so taking the first match routes the card to the PREVIOUS owner's chat --
+        another user's tab. The newest active run is the right answer.
+        """
+        wav = outbox / "cont.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        # Roster order puts the ORIGINAL first, so a first-match scan picks it.
+        state.subagents.all_agents = [
+            MagicMock(
+                id="orig",
+                conversation_key="",
+                parent_session_key="dashboard:chat-1",
+                done=True,
+                started=100.0,
+            ),
+            MagicMock(
+                id="cont",
+                conversation_key="subagent:orig",
+                parent_session_key="dashboard:chat-2",
+                done=False,
+                started=200.0,
+            ),
+        ]
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={"path": str(wav), "filename": "cont.wav", "description": "t", "size": 100},
+                headers={"X-Session-Key": "subagent:orig"},
+            )
+            assert resp.status == 200
             slot_2.append.assert_called_once()
             slot_1.append.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_suppresses_an_unknown_subagents_card(self, outbox, mock_sel):
+        """B7b: an unknown run (reaped, or a manager that cannot answer) yields no
+        parent, so the card is suppressed rather than guessed into a focused tab."""
+        wav = outbox / "sub_unknown.wav"
+        wav.write_bytes(b"\x00" * 100)
+        state, slot_1, slot_2 = _make_state_with_two_slots()
+        state.subagents.all_agents = []
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/outbox/notify",
+                json={
+                    "path": str(wav),
+                    "filename": "sub_unknown.wav",
+                    "description": "t",
+                    "size": 100,
+                },
+                headers={"X-Session-Key": "subagent:gone"},
+            )
+            assert resp.status == 200
+            slot_1.append.assert_not_called()
+            slot_2.append.assert_not_called()
+            state.broadcast_ws.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_notify_appends_to_empty_header_targeted_slot(self, outbox, mock_sel):

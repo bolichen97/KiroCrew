@@ -98,6 +98,10 @@ _HEARTBEAT_INTERVAL = 30  # watchdog checks process liveness every 30s
 _DEAD_THRESHOLD = 2  # consecutive dead checks before fail-fast reset
 _RESULT_MEM_CAP = 4000  # truncate task.result in memory after step completes
 _WORKFLOW_RESULT_SUMMARY_CAP = 120
+# Sources with no operator watching the run: an invalid workflow spec must fail
+# with the SEL denial rather than degrade to the LLM decomposer. Attended sources
+# (chat, dashboard, CLI/unsourced) keep the fallback.
+_UNATTENDED_SOURCES = frozenset({"cron", "mcp"})
 
 
 class WorkflowRunPublisher(Protocol):
@@ -220,25 +224,42 @@ def _read_spec_prefix(path: str, max_chars: int) -> str:
         return spec_file.read(max_chars).strip()
 
 
-def _decompose_yaml_with_audit(yaml_content: str, task_id: str) -> list[Task]:
-    """Decompose YAML with SEL audit logging."""
+def _decompose_yaml_with_audit(
+    yaml_content: str,
+    task_id: str,
+    source: str = "",
+    spec_name: str = "",
+) -> list[Task]:
+    """Decompose YAML with SEL audit logging.
+
+    ``source``/``spec_name`` carry the run's provenance. Without them a
+    cron/MCP-sourced denial is recorded against ``dashboard`` — the one surface
+    that did not start the run — which makes the audit trail unusable for
+    exactly the unattended callers it exists to record.
+    """
+    metadata: dict[str, Any] = {"task_id": task_id}
+    if source:
+        metadata["source"] = source
+    if spec_name:
+        metadata["spec_name"] = spec_name
+    caller = source or "dashboard"
     try:
         tasks = decompose_yaml(yaml_content)
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="ok",
-            metadata={"task_id": task_id, "task_count": len(tasks)},
+            metadata={**metadata, "task_count": len(tasks)},
         )
         return tasks
     except Exception as exc:
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="error",
-            metadata={"task_id": task_id, "error": str(exc)},
+            metadata={**metadata, "error": str(exc)},
         )
         raise
 
@@ -319,6 +340,16 @@ class TaskRunner:
         )
         self._ctor_max_parallel_steps = max_parallel_steps
         self._runs: dict[str, Project] = {}
+        #: Runs whose start is in flight — claimed by `execute_plan` between its
+        #: startable-status check and the moment the execution task exists. The
+        #: status check alone cannot exclude a second concurrent execute: `run
+        #: .status` only becomes "running" inside the execution task, which is
+        #: several awaits later, so until then every overlapping request passes the
+        #: check, re-stamps `run.agent`, and leaves the earlier worker running under
+        #: the later request's agent and tool profile. Claim entries are added and
+        #: removed with no await in between the check and the add, so the pair is
+        #: atomic on the single-threaded loop.
+        self._starting: set[str] = set()
         # Serialize registry writes and enforce monotonic ordering. Snapshots
         # are always built on the event-loop thread (see _serialize_runs), so
         # an older snapshot whose offloaded write lands late must not clobber a
@@ -344,6 +375,13 @@ class TaskRunner:
         # remains the owner of planning/execution semantics; this port only
         # mirrors lifecycle and progress for one unified management surface.
         self._workflow_service = workflow_service
+        # The MOST RECENTLY REQUESTED agent, for the `status()` header only, and
+        # the one field on this instance that a concurrent start overwrites while
+        # another run is mid-flight. So it is not a default for anything: every
+        # per-run decision reads `Project.agent`, which is stamped once per run
+        # and never re-read from here. An `agent or self._agent` tail anywhere in
+        # this class is a cross-run scope bleed — the empty argument it exists to
+        # cover is exactly the case where a sibling's value is what it returns.
         self._agent: str = ""
         self._load_runs()
 
@@ -658,6 +696,8 @@ class TaskRunner:
             original_input=original_input,
             source=source,
             status="planned",
+            agent=agent,
+            agent_named=bool(agent),
             task_id=task_id,
             work_dir=str(task_dir),
             name=workflow_name or auto_name(spec_content or original_input, spec_path),
@@ -672,11 +712,16 @@ class TaskRunner:
                 self._ctx, session_key, f"{_SESSION_PREFIX}:{task_id}:runtime"
             )
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(decompose_input, task_id)
+                run.tasks = _decompose_yaml_with_audit(
+                    decompose_input,
+                    task_id,
+                    source=source,
+                    spec_name=Path(spec_path).name if spec_path else "",
+                )
             else:
                 try:
                     run.tasks = await asyncio.wait_for(
-                        self._decompose(decompose_input, run.work_dir, task_id),
+                        self._decompose(decompose_input, run.work_dir, task_id, run.agent),
                         timeout=180,
                     )
                 except asyncio.TimeoutError:
@@ -870,6 +915,25 @@ class TaskRunner:
         restartable = {"planned", "paused", "cancelled", "failed"}
         if run.status not in restartable:
             raise ValueError(f"Run {task_id} is not in a startable state (status={run.status})")
+        # A run started under an explicitly NAMED agent cannot resume on a guess.
+        # The name is not persisted (it would be agent-writable), so after a gateway
+        # restart `agent_named` is set while `agent` is empty: the run's scope is
+        # known to be narrower than the default, and which agent set it is unknown.
+        # Falling back to
+        # the configured default there would silently execute the remaining tasks
+        # under a possibly BROADER profile than the one chosen, so the resume is
+        # refused until a caller names an agent again.
+        if run.agent_named and not run.agent and not agent:
+            raise ValueError(
+                f"Run {task_id} was started under a named agent this gateway cannot "
+                "identify (the selection does not survive a restart). "
+                "Re-run it with an explicit agent."
+            )
+        # `run.status` is not enough on its own: it only becomes "running" inside
+        # the execution task, several awaits from here, so two overlapping requests
+        # both pass the check above. `_starting` closes that window.
+        if task_id in self._starting:
+            raise ValueError(f"Run {task_id} is already being started")
 
         # Optional per-run workspace override: only applied to a run that has NOT
         # begun yet (status "planned"). A resumed run (paused/cancelled/failed) keeps
@@ -880,6 +944,27 @@ class TaskRunner:
         _override = _resolve_workspace_dir(workspace_dir)
         if _override and run.status == "planned":
             run.work_dir = _override
+        # Stamp the run's own agent from an EXPLICIT execute-time selection, the
+        # way retry_from_task does — the executor reads `run.agent`, not
+        # `self._agent`, so without this a plan created under agent A but executed
+        # with agent B would silently run B's tasks as A (and A's tool scope).
+        # An empty `agent` means "no new selection": keep the plan-time agent.
+        #
+        # Here, in the SAME await-free window as the `work_dir` override above and
+        # the startable-status check before it, not after the first await. Two
+        # concurrent executes of one run both pass that check; if the stamp sat
+        # after an await they would interleave and the loser's worker would run
+        # under the winner's agent and tool profile — the very cross-scope bleed
+        # this field exists to close. Nothing between the check and this line
+        # yields, so the check and the stamp are one atomic claim.
+        #
+        # In-memory only, for the life of this gateway: the selection is not
+        # persisted (see `_persist_runs`), so a run that outlives a restart
+        # resumes under the configured default rather than a value read back from
+        # an agent-writable file.
+        if agent:
+            run.agent = agent
+            run.agent_named = True
 
         # Guard: limit concurrent running tasks — check BEFORE mutating state
         active = sum(1 for t in self._tasks.values() if not t.done())
@@ -888,85 +973,93 @@ class TaskRunner:
                 f"Too many concurrent tasks ({active}/{_MAX_CONCURRENT_TASKS}). "
                 "Cancel or wait for a running task to finish."
             )
+        # CLAIMED here: after every check that can refuse this request, so a refused
+        # one leaves nothing claimed, and before the first await below, so no
+        # overlapping request can slip between the check and the claim. Released in
+        # the `finally` once the execution task exists — from then on `run.status`
+        # is what refuses a second execute.
+        self._starting.add(task_id)
+        try:
 
-        if run.status in ("paused", "cancelled", "failed"):
-            for t in run.tasks:
-                if fresh or t.status not in (TaskStatus.PASSED, TaskStatus.SKIPPED):
-                    t.status = TaskStatus.PENDING
-                    t.error = ""
-                    t.result = ""
-                    t.attempts = 0
-            run.error = ""
-            run.replan_count = 0
-            run.status = "planned"
-            await self._apersist_runs()
+            if run.status in ("paused", "cancelled", "failed"):
+                for t in run.tasks:
+                    if fresh or t.status not in (TaskStatus.PASSED, TaskStatus.SKIPPED):
+                        t.status = TaskStatus.PENDING
+                        t.error = ""
+                        t.result = ""
+                        t.attempts = 0
+                run.error = ""
+                run.replan_count = 0
+                run.status = "planned"
+                await self._apersist_runs()
 
-        await self._grant_run_trust(run, bool(auto_approve))
-        await self._apersist_runs()
+            await self._grant_run_trust(run, bool(auto_approve))
 
-        self._agent = agent
-        history_key = await self._bound_history_key(run, f"taskrunner:run:{task_id}")
+            self._agent = agent
+            history_key = await self._bound_history_key(run, f"taskrunner:run:{task_id}")
 
-        async def _execute() -> None:
-            watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
-            try:
-                run.status = "running"
-                run.started_at = run.last_task_time = time.time()
-                await self._workflow_rebind(run)
-                await self._apersist_runs()  # persist immediately so crash recovery works
+            async def _execute() -> None:
+                watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
                 try:
-                    await git_coord.init_workspace(run)
-                except Exception:
-                    logger.debug("Git init failed for plan execution", exc_info=True)
-                save_progress(run)
-                task_list = "\n".join(f"  {t.index}. {t.title}" for t in run.tasks)
-                await self._notify(
-                    "\U0001f680 Executing plan",
-                    f"{len(run.tasks)} task(s):\n{task_list}",
-                    run=run,
-                )
-                watchdog_task = asyncio.create_task(self._watchdog_loop(run))
-                await self._execute_tasks(run, history_key)
-                if run.status == "running":
-                    run.status = "completed"
+                    run.status = "running"
+                    run.started_at = run.last_task_time = time.time()
+                    await self._workflow_rebind(run)
+                    await self._apersist_runs()  # persist immediately so crash recovery works
+                    try:
+                        await git_coord.init_workspace(run)
+                    except Exception:
+                        logger.debug("Git init failed for plan execution", exc_info=True)
+                    save_progress(run)
+                    task_list = "\n".join(f"  {t.index}. {t.title}" for t in run.tasks)
                     await self._notify(
-                        "\u2705 Task completed",
-                        format_completion_summary(run),
+                        "\U0001f680 Executing plan",
+                        f"{len(run.tasks)} task(s):\n{task_list}",
                         run=run,
                     )
-            except asyncio.CancelledError:
-                if run.status != "pausing":
-                    run.status = "cancelling"
-                self._reset_incomplete_tasks(run)
-            except Exception as exc:
-                logger.exception("Plan execution error")
-                run.status = "failed"
-                run.error = str(exc)
-                await self._notify("\u274c Task error", str(exc), run=run)
-            finally:
-                try:
-                    await asyncio.shield(self._cleanup_run_sessions(run))
+                    watchdog_task = asyncio.create_task(self._watchdog_loop(run))
+                    await self._execute_tasks(run, history_key)
+                    if run.status == "running":
+                        run.status = "completed"
+                        await self._notify(
+                            "\u2705 Task completed",
+                            format_completion_summary(run),
+                            run=run,
+                        )
                 except asyncio.CancelledError:
-                    pass  # shield was cancelled but cleanup completed
-                # Finalize cancel status after cleanup
-                if run.status in ("cancelling", "pausing"):
-                    run.status = "paused" if run.status == "pausing" else "cancelled"
-                run.finished_at = time.time()
-                save_progress(run)
-                await self._apersist_runs()
-                if run.branch_name:
+                    if run.status != "pausing":
+                        run.status = "cancelling"
+                    self._reset_incomplete_tasks(run)
+                except Exception as exc:
+                    logger.exception("Plan execution error")
+                    run.status = "failed"
+                    run.error = str(exc)
+                    await self._notify("\u274c Task error", str(exc), run=run)
+                finally:
                     try:
-                        await git_coord.finalize(run)
-                    except Exception:
-                        logger.debug("Git finalize failed", exc_info=True)
-                await self._workflow_finalize(run)
-                if watchdog_task and not watchdog_task.done():
-                    watchdog_task.cancel()
-                if self._consolidator:
-                    self._consolidator.maybe_consolidate(history_key)
-                self._tasks.pop(task_id, None)
+                        await asyncio.shield(self._cleanup_run_sessions(run))
+                    except asyncio.CancelledError:
+                        pass  # shield was cancelled but cleanup completed
+                    # Finalize cancel status after cleanup
+                    if run.status in ("cancelling", "pausing"):
+                        run.status = "paused" if run.status == "pausing" else "cancelled"
+                    run.finished_at = time.time()
+                    save_progress(run)
+                    await self._apersist_runs()
+                    if run.branch_name:
+                        try:
+                            await git_coord.finalize(run)
+                        except Exception:
+                            logger.debug("Git finalize failed", exc_info=True)
+                    await self._workflow_finalize(run)
+                    if watchdog_task and not watchdog_task.done():
+                        watchdog_task.cancel()
+                    if self._consolidator:
+                        self._consolidator.maybe_consolidate(history_key)
+                    self._tasks.pop(task_id, None)
 
-        self._tasks[task_id] = asyncio.create_task(_execute())
+            self._tasks[task_id] = asyncio.create_task(_execute())
+        finally:
+            self._starting.discard(task_id)
         return task_id
 
     def plan_to_chat_context(self, task_id: str) -> str:
@@ -985,6 +1078,7 @@ class TaskRunner:
         source: str = "",
         workspace_dir: str = "",
         auto_approve: bool = False,
+        agent: str = "",
     ) -> Project:
         spec_path = Path(spec_path)
         if not spec_path.exists():
@@ -1007,6 +1101,12 @@ class TaskRunner:
             last_task_time=time.time(),
             status="running",
             source=source,
+            # Stamped from the explicit parameter, never from the shared
+            # `self._agent`: a concurrent `start_background` mutates that field,
+            # so reading it here would let an overlapping run hand this one a
+            # sibling's agent and tool scope. Empty is the standalone default.
+            agent=agent,
+            agent_named=bool(agent),
             workflow_run_id=existing.workflow_run_id if existing else "",
             workflow_id=existing.workflow_id if existing else "",
             workflow_slug=existing.workflow_slug if existing else "",
@@ -1027,18 +1127,34 @@ class TaskRunner:
             await self._apersist_runs()  # persist immediately so crash recovery works
             await self._notify("\U0001f680 Task started", f"Spec: `{spec_path.name}`", run=run)
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
-            elif not source and spec_path.suffix in (".yaml", ".yml"):
+                run.tasks = _decompose_yaml_with_audit(
+                    spec_content, task_id, source=source, spec_name=spec_path.name
+                )
+            elif spec_path.suffix in (".yaml", ".yml"):
+                # The suffix decides the decomposer, not the caller: a cron- or
+                # MCP-sourced workflow spec must decompose deterministically too.
                 try:
-                    run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
+                    run.tasks = _decompose_yaml_with_audit(
+                        spec_content, task_id, source=source, spec_name=spec_path.name
+                    )
                 except (ValueError, KeyError):
+                    # Deny by default for UNATTENDED callers (cron/MCP): nobody is
+                    # watching, so an invalid spec fails with the audit trail above
+                    # rather than degrading to the unaudited LLM decomposer.
+                    # Attended callers (chat, dashboard, CLI) keep the fallback —
+                    # an operator is present to see the plan, and `/task run
+                    # <file>.yaml` on a non-workflow YAML worked before the gate.
+                    if source in _UNATTENDED_SOURCES:
+                        raise
                     logger.warning(
                         "YAML spec %s is not in workflow format; falling back to LLM decomposition",
                         spec_path.name,
                     )
-                    run.tasks = await self._decompose(spec_content, run.work_dir, task_id)
+                    run.tasks = await self._decompose(
+                        spec_content, run.work_dir, task_id, run.agent
+                    )
             else:
-                run.tasks = await self._decompose(spec_content, run.work_dir, task_id)
+                run.tasks = await self._decompose(spec_content, run.work_dir, task_id, run.agent)
             if not run.tasks:
                 run.status = "failed"
                 run.error = "Failed to decompose spec into tasks"
@@ -1227,8 +1343,11 @@ class TaskRunner:
 
     async def self_review(self, run: Project, task: Task, session_key: str = "") -> bool:
         """Delegate to standalone self_review for backward compat."""
+        # Run-scoped agent, not self._agent: overlapping runs share the instance,
+        # so the shared field would hand this run a sibling run's agent (and its
+        # tool permissions). run.agent is stamped at construction.
         return await self_review_fn(
-            run, task, self._sessions, self._agent, session_key=session_key, ctx=self._ctx
+            run, task, self._sessions, run.agent, session_key=session_key, ctx=self._ctx
         )
 
     async def _execute_single_task(
@@ -1250,7 +1369,7 @@ class TaskRunner:
             history_key=history_key,
             sessions=self._sessions,
             ctx=self._ctx,
-            agent=self._agent,
+            agent=run.agent,  # run-scoped; see self_review
             on_notify=self._notify,
             on_approval=self._on_approval,
             on_tool_approval=self._on_tool_approval,
@@ -1318,7 +1437,7 @@ class TaskRunner:
             f"## Failed Task\n- \u274c {failed_task.title}: {err_detail}\n\n"
             f"{memory_ctx}\n\nRe-plan the REMAINING work."
         )
-        new_tasks = await self._decompose(replan_spec, run.work_dir, run.task_id)
+        new_tasks = await self._decompose(replan_spec, run.work_dir, run.task_id, run.agent)
         if not new_tasks:
             run.status = "failed"
             run.error = f"Re-plan failed after task {failed_task.index}"
@@ -1450,6 +1569,9 @@ class TaskRunner:
                 status="planning",
                 started_at=time.time(),
                 source=source,
+                # Per-run, so overlapping background runs never read each other's
+                # agent (and its tool permissions) off the shared instance field.
+                agent=agent,
                 auto_approve=bool(auto_approve),
             )
             if session_key:
@@ -1474,6 +1596,7 @@ class TaskRunner:
                         source=source,
                         workspace_dir=workspace_dir,
                         auto_approve=auto_approve,
+                        agent=agent,
                     )
                 except Exception as exc:
                     logger.exception("start_background task %s failed", task_id)
@@ -1679,6 +1802,11 @@ class TaskRunner:
         run.error = ""
         run.finished_at = 0.0
         run.started_at = run.last_task_time = time.time()
+        # Explicit re-selection only; an empty `agent` keeps the run's existing
+        # one rather than blanking it (same rule as execute_plan).
+        if agent:
+            run.agent = agent
+            run.agent_named = True
         await self._apersist_runs()  # persist immediately so crash recovery works
         self._agent = agent
         history_key = await self._bound_history_key(
@@ -1754,14 +1882,20 @@ class TaskRunner:
         spec: str,
         work_dir: str = "",
         task_id: str = "",
+        agent: str = "",
     ) -> list[Task]:
+        # Run-scoped `agent` ONLY -- every caller passes it from its own run, and
+        # an empty value means "the default agent" (decompose resolves "" to the
+        # kirocrew default itself). It must NOT fall back to `self._agent`: that
+        # field is shared and a concurrent named run overwrites it, so a default
+        # run would decompose under a sibling's agent and its tool permissions.
         return await decompose(
             spec,
             self._sessions,
             self._ctx,
             work_dir=work_dir or str(self._work_dir),
             task_id=task_id,
-            agent=self._agent,
+            agent=agent,
         )
 
     # ── Notifications ──
@@ -1863,7 +1997,9 @@ class TaskRunner:
                 "Respond with ONLY valid JSON."
             )
             result = (
-                await self._call_llm_for_lesson(prompt, runtime_key=runtime_key)
+                await self._call_llm_for_lesson(
+                    prompt, runtime_key=runtime_key, agent=run.agent if run else ""
+                )
                 if private_store
                 else await self._call_llm_for_lesson(prompt)
             )
@@ -1914,7 +2050,9 @@ class TaskRunner:
         except Exception:
             logger.debug("Lesson extraction failed", exc_info=True)
 
-    async def _call_llm_for_lesson(self, prompt: str, *, runtime_key: str = "") -> dict | None:
+    async def _call_llm_for_lesson(
+        self, prompt: str, *, runtime_key: str = "", agent: str = ""
+    ) -> dict | None:
         session_key = f"{runtime_key}:lesson" if runtime_key else BACKGROUND_KEY
         if runtime_key:
             from kiro_crew.context import inherit_session_memory
@@ -1922,14 +2060,28 @@ class TaskRunner:
             await inherit_session_memory(self._ctx, runtime_key, session_key)
         try:
             if runtime_key:
+                # `{runtime_key}:lesson` is a RUN-scoped key, so an agent here IS a
+                # scope -- and it has to be the run's own, passed in, never
+                # `self._agent`: overlapping runs share this instance, so the shared
+                # field can hand this run a sibling's agent and its tool scope.
                 client, _is_new, _resumed = await self._sessions.open_task_session(
-                    runtime_key, session_key, agent=self._agent or None
+                    runtime_key, session_key, agent=agent or None
                 )
             else:
-                client, _is_new, _resumed = await self._sessions.get_or_create(
-                    session_key,
-                    agent=self._agent or None,
-                )
+                # NO agent on this branch, deliberately. `BACKGROUND_KEY` is a
+                # gateway-wide SHARED session, and `get_or_create` honours `agent`
+                # only on a cold start -- a live session is returned as-is. So an
+                # agent here would not scope the turn to this run: it would scope it
+                # to whichever run happened to cold-start `_bg` first, and every
+                # later run's lesson extraction would inherit that agent AND its
+                # tool permissions. Lesson extraction is ancillary summarization, so
+                # it runs on the shared background lane under the background agent,
+                # which is both deterministic and the least privilege of the options.
+                #
+                # This is the same rule `llm_helpers.background_turn` states: the KEY
+                # decides which session is returned, the AGENT only decides what it
+                # is created as, so an agent argument on a shared key is not a scope.
+                client, _is_new, _resumed = await self._sessions.get_or_create(session_key)
             return await stream_and_collect_json(client, prompt)
         except Exception:
             logger.debug("LLM lesson extraction call failed", exc_info=True)
@@ -2067,6 +2219,24 @@ class TaskRunner:
                         "error": run.error,
                         "tokens_used": run.tokens_used,
                         "replan_count": run.replan_count,
+                        # The FACT of a named agent, not the name. Safe in this
+                        # agent-writable file because both values fail closed: set,
+                        # a resume refuses until an agent is named again (forging it
+                        # only blocks the forger's own run); cleared, the run
+                        # resumes under the default, which is what an unnamed run
+                        # does anyway.
+                        "agent_named": run.agent_named,
+                        # `Project.agent` is deliberately NOT written here. This
+                        # file lives in the task runner's own work dir, which is
+                        # the agent's operating directory and therefore
+                        # agent-writable: a value restored from it would let a
+                        # sandboxed agent choose the profile a resumed run
+                        # executes under by editing its own state file. A tool
+                        # scope has to come from something the agent cannot
+                        # reach, so the selection stays in memory and a resumed
+                        # run falls back to the configured default — the baseline
+                        # profile — until it can be recorded in gateway-protected
+                        # state. See `_load_runs` for the matching read.
                         "work_dir": run.work_dir,
                         # Git-workspace identity. `work_dir` alone is NOT enough:
                         # init_workspace() OVERWRITES it with the worktree path,
@@ -2230,6 +2400,17 @@ class TaskRunner:
                     error=item.get("error", ""),
                     tokens_used=item.get("tokens_used", 0),
                     replan_count=item.get("replan_count", 0),
+                    # Restored, unlike the name: it decides whether this run may
+                    # resume without an explicit selection, and both of its values
+                    # are safe to take from an untrusted file (see `_persist_runs`).
+                    agent_named=bool(item.get("agent_named", False)),
+                    # `agent` is NOT read back, even from an entry that carries
+                    # one: this file is agent-writable (see `_persist_runs`), so
+                    # honouring it would take a tool-scope decision from a
+                    # sandboxed agent's own state file. A resumed run therefore
+                    # executes under the configured default — the baseline
+                    # profile — which is the pre-existing behaviour and the safe
+                    # direction to fail.
                     work_dir=item.get("work_dir", ""),
                     branch_name=item.get("branch_name", ""),
                     base_branch=item.get("base_branch", ""),

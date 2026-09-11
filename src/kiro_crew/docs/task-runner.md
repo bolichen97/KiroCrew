@@ -39,10 +39,11 @@ The `task_run` MCP tool accepts a spec file path or inline content:
 
 ```
 task_run(spec="path/to/spec.md")
+task_run(spec="path/to/spec.md", agent="<agent-name>")
 task_run(spec="__inline__: Step 1: do X\nStep 2: do Y")
 ```
 
-`spec` is required; `name` is optional and is otherwise derived from the spec.
+`spec` is required. `name` and `agent` are optional — `name` is otherwise derived from the spec, and an omitted `agent` runs the task under the configured default.
 
 ## Spec File Format
 
@@ -113,7 +114,7 @@ After a task completes, you can refine the results interactively:
 
 ## Per-Agent Tasks
 
-Tasks can specify which agent to use, allowing specialized agents for different types of work.
+Tasks can specify which agent to use, allowing specialized agents for different types of work. Pick the agent on the dashboard Tasks page, or pass `agent` to the `task_run` MCP tool; omit it to use the configured default.
 
 ## Cancellation
 

@@ -98,6 +98,14 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "Human-readable task name (auto-derived from spec if omitted)",
                     },
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "Agent the run executes under, so it gets that agent's "
+                            "skills, knowledge and tool permissions. Omit to use the "
+                            "configured default."
+                        ),
+                    },
                 },
                 "required": ["spec"],
             },
@@ -743,7 +751,18 @@ def task_run(name: str, args: dict[str, Any]) -> str:
     spec = args["spec"]
     task_name = args.get("name", "")
     _src = "cron" if mcp_core._resolve_session_key().startswith("cron:") else "mcp"
-    d = mcp_core._post("/api/taskrunner", {"spec": spec, "name": task_name, "source": _src})
+    # "" (not omitted) is what makes the endpoint fall through to the configured
+    # default agent -- it reads ``body.get("agent", "")`` and passes it straight
+    # to ``TaskRunner.start_background``.
+    d = mcp_core._post(
+        "/api/taskrunner",
+        {
+            "spec": spec,
+            "name": task_name,
+            "agent": args.get("agent", ""),
+            "source": _src,
+        },
+    )
     if d.get("error"):
         return f"Error: {d['error']}"
 

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
@@ -20,6 +21,89 @@ if TYPE_CHECKING:
     from kiro_crew.taskrunner import TaskRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _effective_workspace(runner: object) -> str:
+    """The workspace a run gets when the request names none.
+
+    Same rule the status payload publishes as ``default_workspace_dir``: the
+    configured ``workspace_dir`` if set, else the per-run base directory. Kept in
+    one function so agent resolution and that pre-fill cannot disagree about which
+    project an unqualified run belongs to.
+    """
+    ws = getattr(runner, "_workspace_dir", None)
+    return str(ws) if ws else str(getattr(runner, "_work_dir", "") or "")
+
+
+async def _agent_selection(
+    body: dict, runner: object, *, project_dir: str | None = None
+) -> tuple[str, str, web.Response | None]:
+    """Read and vet the launch endpoints' ``agent``/``workspace_dir`` pair.
+
+    Returns ``(agent, workspace_dir, refusal)``; a non-None refusal is the
+    response to return. Shared by ``/start``, ``/plan`` and ``/execute`` because
+    all three read the same two fields and all three put the agent on a
+    ``--agent`` argv, so a check that lives at one of them leaves two open.
+
+    Two things are wrong with a raw ``body.get("agent", "")``:
+
+    * **Type.** A JSON body is caller-controlled, so the value can be any JSON
+      type. A dict reaches the resolver's ``agent_name in config.agents`` and
+      raises ``TypeError: unhashable type`` — a 500 on a malformed request that
+      should be a 400.
+    * **Existence.** An unknown-but-well-formed name falls through to
+      ``default_agent`` silently (``_resolve_agent_selection``), so a typo — or a
+      name an LLM invented — runs the task under a different agent, and therefore
+      a different tool profile, than the one it named, with nothing in the 200
+      response saying so. The grammar check at the tool boundary proves only that
+      the string is safe in an argv, not that it names anything.
+
+    ``requested_resolved`` is the resolver's own positive-confirmation flag
+    (``alias_hit or bool(passthrough)``), so this asks the authority rather than
+    re-deriving a membership test that could disagree with it. Resolution is
+    against the project the run will ACTUALLY use, because a project-scope agent
+    shadows a user-level one and exists only in that checkout: resolving against
+    the wrong one both rejects legitimate project agents and accepts names that do
+    not exist where the run executes. In precedence: *project_dir* when a caller
+    knows better, else the body's ``workspace_dir`` (which a NEW run adopts), else
+    the runner's own effective workspace — a request that names no folder still
+    runs somewhere, and resolving against nothing would 404 a project agent living
+    in exactly that default project. ``/execute`` does: ``execute_plan`` applies the override only
+    while ``run.status == "planned"`` and a resumed run keeps its own
+    ``work_dir``, so validating a resume against the body's override would vet the
+    agent against a directory the run then discards. Memory-file validation is
+    off — the question is whether the name resolves, not whether its store is
+    usable.
+
+    An EMPTY agent is not resolved at all: it means "the configured default",
+    which is a decision the caller made rather than a name that could be wrong.
+    """
+    agent = body.get("agent", "")
+    workspace_dir = body.get("workspace_dir", "")
+    for field, value in (("agent", agent), ("workspace_dir", workspace_dir)):
+        if not isinstance(value, str):
+            return "", "", web.json_response({"error": f"{field} must be a string"}, status=400)
+    if not agent:
+        return agent, workspace_dir, None
+    # Last fallback: the runner's own configured workspace. A request that names
+    # no folder still runs SOMEWHERE, and resolving against nothing would 404 a
+    # project-scope agent that exists in exactly that default project.
+    resolve_against = (workspace_dir if project_dir is None else project_dir) or (
+        _effective_workspace(runner)
+    )
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    bindings = await asyncio.to_thread(
+        resolve_agent_bindings, cfg, agent, resolve_against or None, validate_memory_files=False
+    )
+    if bindings.requested_resolved:
+        return agent, workspace_dir, None
+    return (
+        "",
+        "",
+        web.json_response(
+            {"error": f"Agent '{agent}' not found", "code": "agent_not_found"}, status=404
+        ),
+    )
 
 
 async def _taskrunner_request_origin(request: web.Request) -> tuple[str, web.Response | None]:
@@ -291,6 +375,16 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
             )
         spec_path = str(resolved)
 
+    # Vetted BEFORE the inline spec below is written. The selection does not
+    # depend on the spec at all, and the inline branch creates a `TASK_*.md` whose
+    # only cleanup is the `except Exception` further down — which a `return` does
+    # not reach. Refusing after the write would therefore strand one file per
+    # refused call, and the refusal fires on exactly the repeatable case
+    # (an agent name an LLM invented, or a non-string field).
+    agent, workspace_dir, refusal = await _agent_selection(body, state.task_runner)
+    if refusal is not None:
+        return refusal
+
     # Handle inline spec content
     created_spec: Path | None = None
     if spec_path.startswith("__inline__:"):
@@ -306,9 +400,7 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         spec_path = str(fpath)
 
     try:
-        agent = body.get("agent", "")
         task_name = body.get("name", "")
-        workspace_dir = body.get("workspace_dir", "")
         allowed_sources = {"dashboard", "text", "spec", "file", "chat", "mcp", "cron", "yaml"}
         claimed_source = body.get("source")
         source = claimed_source if claimed_source in allowed_sources else "dashboard"
@@ -533,9 +625,15 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
     assert body is not None  # read_bounded_json returns (dict, None) on success
     from_step = body.get("from_step", 1)
     try:
-        await state.task_runner.retry_from_task(
-            task_id, from_step, agent=state.task_runner._agent or ""
-        )
+        # NO agent argument: a retry PRESERVES the run's own agent. Reading the
+        # runner's shared `_agent` here is a cross-run bleed -- that field is
+        # overwritten by whichever run started most recently, so retrying run A
+        # while run B is live restamped A with B's agent and its tool permissions.
+        # `retry_from_task` treats an empty agent as "no new selection" and keeps
+        # `run.agent`. A deliberate retry-under-a-different-agent would need a
+        # validated request field (the value reaches a `--agent` argv), which no
+        # caller asks for today.
+        await state.task_runner.retry_from_task(task_id, from_step)
         return web.json_response({"ok": True, "task_id": task_id})
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
@@ -721,8 +819,9 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
     input_text = body.get("input", "")
     source = body.get("source", "text")
     spec_path = body.get("spec", "")
-    agent = body.get("agent", "")
-    workspace_dir = body.get("workspace_dir", "")
+    agent, workspace_dir, refusal = await _agent_selection(body, state.task_runner)
+    if refusal is not None:
+        return refusal
     if source == "file":
         from kiro_crew.member_memory_auth import private_memory_store_for_session
 
@@ -863,9 +962,32 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    agent = body.get("agent", "")
+    # Resolve the agent against the directory this run will actually execute in.
+    # `execute_plan` honours a `workspace_dir` override only while the run is still
+    # "planned"; a resumed one (paused/cancelled/failed) keeps its own `work_dir`,
+    # so vetting a resume against the body's override would check the agent against
+    # a folder the run then discards — accepting a project agent that does not exist
+    # where it runs, and rejecting the one that does. An unknown task_id resolves to
+    # "", which falls back to the body value and lets `execute_plan` raise its own
+    # not-found error rather than being pre-empted here.
+    _run = state.task_runner._runs.get(_canonical_task_reference(state.task_runner, task_id))
+    if _run is not None and _run.status != "planned":
+        # The retained dir, EMPTY INCLUDED: a resumed run with no work_dir runs
+        # against no project, so the right resolution scope is user-level agents
+        # only. Passing None here would fall back to the body's override, which is
+        # exactly the value this run discards.
+        _project_dir: str | None = _run.work_dir or ""
+    else:
+        # Planned or unknown: the override is what the run adopts, so let
+        # `_agent_selection` read it from the body. An unknown task_id also lets
+        # `execute_plan` raise its own not-found rather than being pre-empted here.
+        _project_dir = None
+    agent, workspace_dir, refusal = await _agent_selection(
+        body, state.task_runner, project_dir=_project_dir
+    )
+    if refusal is not None:
+        return refusal
     fresh = body.get("fresh", False)
-    workspace_dir = body.get("workspace_dir", "")
     # Same provenance gate as /start: an app/proxy-embedded caller cannot mint
     # trust on the resume/execute path either (no source claim here — the run
     # already exists — so only the dashboard-context check applies). The gate
