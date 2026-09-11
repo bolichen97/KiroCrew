@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1623,6 +1625,210 @@ class TestTriggerPerformance:
 
         triggered = loader.get_triggered_skills("shorten url")
         assert len(triggered) == 2
+
+
+class _CountingLock:
+    """A walk guard that reports how many callers reached it.
+
+    Lets the test wait on the observable fact it needs — every walker is parked on
+    the guard — instead of sleeping toward it. See
+    docs/system-specs/common/testing-conventions.md, flake class 2.
+
+    Delegation rather than subclassing: ``threading.Lock`` is a factory returning
+    an unsubclassable ``_thread.lock``. ``skills._iter`` uses the guard as a
+    context manager, so both protocols are provided.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count_guard = threading.Lock()
+        self.acquires = 0
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        with self._count_guard:
+            self.acquires += 1
+        return self._lock.acquire(*args, **kwargs)  # type: ignore[arg-type]
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> "_CountingLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+class TestIterSingleFlight:
+    """Concurrent cold misses coalesce onto one skill-tree walk (perf)."""
+
+    def _loader(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        _create_skill(
+            skills_dir,
+            "tiny-url",
+            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
+        )
+        return SkillsLoader(skills_path=skills_dir, install_builtins=False)
+
+    def test_concurrent_cold_misses_walk_once(self, tmp_path, monkeypatch):
+        """A burst that all misses the same cache slot must run one walk, not N.
+
+        The gateway's single loader is walked by callers that are not staggered
+        against each other, on a bounded worker pool, so a plain check-then-walk
+        turns one cold miss into N identical multi-root walks — each parking a
+        worker for the duration of a walk whose result is already being computed.
+        """
+        loader = self._loader(tmp_path)
+        walkers = 6
+        # Injected into the real seam: ``_iter_lock`` hands back a pre-seeded
+        # ``setdefault`` entry, and ``_invalidate_iter_cache`` never clears
+        # ``_iter_locks``, so it stays live for the whole body. ``""`` is the
+        # project-free cache key.
+        guard = _CountingLock()
+        loader._iter_locks[""] = guard  # type: ignore[assignment]
+        walk_entered = threading.Semaphore(0)
+        release = threading.Event()
+        calls: list[str | None] = []
+        orig = loader._iter_uncached
+
+        def _blocking(project_key=None):
+            calls.append(project_key)
+            walk_entered.release()
+            assert release.wait(timeout=10)
+            return orig(project_key)
+
+        monkeypatch.setattr(loader, "_iter_uncached", _blocking)
+        # +1 for this thread: every worker is past the gate before the walk that
+        # won is allowed to finish, so none of them can observe a warm cache.
+        gate = threading.Barrier(walkers + 1, timeout=10)
+        errors: list[Exception] = []
+
+        def _walk() -> None:
+            try:
+                gate.wait()
+                loader._iter()
+            except Exception as exc:  # pragma: no cover — re-raised by the assert
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_walk) for _ in range(walkers)]
+        for thread in threads:
+            thread.start()
+        gate.wait()
+        assert walk_entered.acquire(timeout=10)
+        # Wait for the LOSERS to actually park on the guard before letting the
+        # winner publish. A fixed sleep here is a bet that five just-released
+        # threads each run a few bytecodes inside it; a starved runner that loses
+        # the bet lets the winner publish first, the losers then satisfy the FIRST
+        # cache check and never touch the guard, and `calls == [None]` passes with
+        # the coalescing path never contended — it passes against a plain
+        # check-then-walk too (measured). Capture the verdict, release
+        # unconditionally, assert after the joins: asserting first would leave
+        # every walker serializing through its own 10s `release.wait` with the
+        # main thread already gone (testing-conventions class 6).
+        deadline = time.monotonic() + 10
+        while guard.acquires < walkers and time.monotonic() < deadline:
+            time.sleep(0.001)
+        contended = guard.acquires == walkers
+        release.set()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert errors == []
+        assert calls == [None]
+        assert contended, (
+            f"only {guard.acquires}/{walkers} walkers reached the single-flight "
+            "guard — the coalescing path was never contended"
+        )
+
+    def test_invalidate_still_forces_a_fresh_walk(self, tmp_path, monkeypatch):
+        """The guard coalesces callers; it must not outlive the cache it fills."""
+        loader = self._loader(tmp_path)
+        calls: list[str | None] = []
+        orig = loader._iter_uncached
+
+        def _counting(project_key=None):
+            calls.append(project_key)
+            return orig(project_key)
+
+        monkeypatch.setattr(loader, "_iter_uncached", _counting)
+        loader._iter()
+        loader._iter()
+        assert calls == [None]
+
+        loader._invalidate_iter_cache()
+        loader._iter()
+        assert calls == [None, None]
+
+    def test_walk_in_flight_when_a_mutation_lands_does_not_publish(self, tmp_path, monkeypatch):
+        """An invalidation during a walk must not be overwritten by that walk.
+
+        The mutator's own read queues on this key's lock, so a stale publish here
+        is what every reader gets for the full TTL — including the writer. The
+        sequential test above cannot see it.
+        """
+        loader = self._loader(tmp_path)
+        in_walk = threading.Event()
+        release = threading.Event()
+        calls: list[str | None] = []
+        orig = loader._iter_uncached
+
+        def _blocking(project_key=None):
+            calls.append(project_key)
+            in_walk.set()
+            assert release.wait(timeout=10)
+            return orig(project_key)
+
+        monkeypatch.setattr(loader, "_iter_uncached", _blocking)
+        walker = threading.Thread(target=loader._iter)
+        walker.start()
+        assert in_walk.wait(timeout=10)
+        loader._invalidate_iter_cache()  # a mutation lands mid-walk
+        release.set()
+        walker.join(timeout=10)
+        assert not walker.is_alive()
+        assert loader._iter_cache == {}, "the stale walk refilled the slot it cleared"
+        loader._iter()
+        assert len(calls) == 2, "the next reader reused the pre-mutation result"
+
+    def test_walks_for_different_projects_are_not_serialized(self, tmp_path, monkeypatch):
+        """The guard is per cache key, because keys select different skill roots.
+
+        One project's walk cannot satisfy another's, so a single shared lock would
+        only add tail latency to a multi-project burst.
+        """
+        loader = self._loader(tmp_path)
+        monkeypatch.setattr(loader, "_trusted_project_key", lambda project_dir: str(project_dir))
+        both_walking = threading.Barrier(2, timeout=5)
+
+        def _rendezvous(project_key=None):
+            # BrokenBarrierError here means the second project's walk could not
+            # start while the first project's walk was still in flight.
+            both_walking.wait()
+            return []
+
+        monkeypatch.setattr(loader, "_iter_uncached", _rendezvous)
+        errors: list[Exception] = []
+
+        def _walk(project_dir: str) -> None:
+            try:
+                loader._iter(project_dir)
+            except Exception as exc:  # pragma: no cover — re-raised by the assert
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_walk, args=(project_dir,))
+            for project_dir in ("/proj-a", "/proj-b")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert errors == []
 
 
 class TestResolveDollarSkills:

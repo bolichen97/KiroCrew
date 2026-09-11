@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import stat
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -1781,6 +1782,18 @@ class SkillsLoader:
         # slot would serve one session's project skills to a session working in
         # a different project for the whole TTL. (monotonic_deadline, results)
         self._iter_cache: dict[str, tuple[float, list[tuple[str, Path, str | None]]]] = {}
+        # Single-flight guards for that walk, one per cache key — see _iter_lock.
+        # Deliberately NOT reset by _invalidate_iter_cache: the locks guard the
+        # walk, not the cached result.
+        self._iter_locks: dict[str, threading.Lock] = {}
+        self._iter_locks_guard = threading.Lock()
+        # Bumped by _invalidate_iter_cache. A walk already in flight when a
+        # mutation lands must NOT publish: its results predate the write, and the
+        # mutator's own read is parked on this key's lock waiting for exactly that
+        # publish, so it would be served the pre-mutation list for a whole TTL.
+        # Snapshot-then-publish-if-current, as history's cache generations do
+        # (history_projection.py's _tab_id_generation).
+        self._iter_generation = 0
         self._disabled_apps_cache: tuple[float, frozenset[str]] | None = None
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
@@ -1914,15 +1927,48 @@ class SkillsLoader:
         over a trusted project's own skills. The underlying os.walk is cached
         for ``_ITER_CACHE_TTL_SECS`` because this runs on every message via
         ``get_triggered_skills`` — re-walking the skills tree (plus every extra
-        path) per message was a per-message latency cost.
+        path) per message was a per-message latency cost. Concurrent callers that
+        all miss the same cache slot are single-flighted onto one walk.
         """
         key = self._trusted_project_key(project_dir)
         cached = self._iter_cache.get(key)
         if cached is not None and time.monotonic() < cached[0]:
             return cached[1]
-        results = self._iter_uncached(key or None)
-        self._iter_cache[key] = (time.monotonic() + _ITER_CACHE_TTL_SECS, results)
-        return results
+        # Cold-miss single flight. The one gateway loader is walked by callers that
+        # are not staggered with each other (subagent runs, dashboard chat, the chat
+        # bridges, messaging dispatch, the task executor/planner, hooks), all of them
+        # on the bounded mc-embed pool — so a check-then-walk lets N of them each run
+        # the same full multi-root walk and park a worker for its duration. First
+        # caller walks, the rest wait and reuse the result it just cached.
+        with self._iter_lock(key):
+            # Re-read the slot rather than trusting `cached` above: the walker that
+            # held the lock has just filled it, and _invalidate_iter_cache rebinds
+            # the whole dict, so a reference taken before the wait can be stale in
+            # both directions.
+            cached = self._iter_cache.get(key)
+            if cached is not None and time.monotonic() < cached[0]:
+                return cached[1]
+            generation = self._iter_generation
+            results = self._iter_uncached(key or None)
+            # Publish only if no mutation landed while this walk was running.
+            # _invalidate_iter_cache rebinds the dict, so an unconditional write
+            # here refills the slot it just cleared with pre-mutation results — and
+            # the mutator's own read, queued on this lock, consumes them.
+            if self._iter_generation == generation:
+                self._iter_cache[key] = (time.monotonic() + _ITER_CACHE_TTL_SECS, results)
+            return results
+
+    def _iter_lock(self, key: str) -> threading.Lock:
+        """The walk lock for one cache key (``""`` is the project-free slot).
+
+        Per key rather than one shared lock, for the reason the prompt-catalog
+        assembly locks are: the keys select different skill roots, so a global lock
+        would make a burst across several projects queue behind walks whose results
+        it cannot use. Entries are never evicted — one small lock per project seen in
+        this process is cheaper than freeing one another thread is about to take.
+        """
+        with self._iter_locks_guard:
+            return self._iter_locks.setdefault(key, threading.Lock())
 
     def _get_disabled_app_names(self) -> frozenset[str]:
         now = time.monotonic()
@@ -2051,9 +2097,14 @@ class SkillsLoader:
         read, so keying the frontmatter cache on mtime alone would return the
         stale parse. Dropping it here keeps the mutator's edit immediately
         reflected in ``list_skills`` / ``get_triggered_skills``.
+
+        Also bumps ``_iter_generation`` so a walk already in flight under
+        ``_iter_lock`` discards its pre-mutation results instead of publishing
+        them over this clear.
         """
         self._disabled_apps_cache = None
         self._iter_cache = {}
+        self._iter_generation += 1
         self._fm_cache.clear()
 
     def _read_enumerated_skill_bytes(

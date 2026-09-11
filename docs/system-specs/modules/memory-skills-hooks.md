@@ -3075,7 +3075,19 @@ every non-custom-agent message via the context builder, scoring word-overlap of
 the message against each skill's `triggers` (negative `!`-prefixed triggers
 exclude). To keep it off the per-message filesystem/config hot path:
 - the discovered skill-file list is TTL-cached (`_iter`, `_ITER_CACHE_TTL_SECS`),
-  invalidated by `create_auto_skill`;
+  invalidated by `create_auto_skill`; concurrent callers that all miss one cache
+  slot are single-flighted onto one walk by `_iter_lock` — one `threading.Lock`
+  per cache key, in a `setdefault` registry behind a small guard lock. Per key
+  rather than global for the same reason the catalog assembly locks are (the keys
+  select different skill roots, so a shared lock would only add tail latency to a
+  multi-project burst), and a test pins that parallelism. The winner walks; the
+  rest re-read the slot under the lock — never a reference taken before the wait,
+  since `_invalidate_iter_cache` rebinds the whole dict. The locks are
+  deliberately not cleared on invalidation: they guard the walk, not the result;
+  and a walk that was in flight when `_invalidate_iter_cache` ran discards its
+  result rather than publishing it — `_iter_generation` is snapshotted before the
+  walk and re-compared before the write — so the mutator's own read, which is
+  queued on that walk's lock, still sees its write;
 - the `max_triggered` cap is snapshotted on the loader in `__init__`
   (`self._max_triggered`) — no `KiroCrewConfig.load()` per message — refreshed
   when the loader is rebuilt (per gateway), matching `extra_paths` semantics;
