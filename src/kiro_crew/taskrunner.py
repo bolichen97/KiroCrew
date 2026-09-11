@@ -944,6 +944,19 @@ class TaskRunner:
         _override = _resolve_workspace_dir(workspace_dir)
         if _override and run.status == "planned":
             run.work_dir = _override
+
+        # Guard: limit concurrent running tasks — check BEFORE mutating state
+        active = sum(1 for t in self._tasks.values() if not t.done())
+        if active >= _MAX_CONCURRENT_TASKS:
+            raise ValueError(
+                f"Too many concurrent tasks ({active}/{_MAX_CONCURRENT_TASKS}). "
+                "Cancel or wait for a running task to finish."
+            )
+        # CLAIMED here: after every check that can refuse this request, so a refused
+        # one leaves nothing claimed, and before the first await below, so no
+        # overlapping request can slip between the check and the claim. Released in
+        # the `finally` once the execution task exists — from then on `run.status`
+        # is what refuses a second execute.
         # Stamp the run's own agent from an EXPLICIT execute-time selection, the
         # way retry_from_task does — the executor reads `run.agent`, not
         # `self._agent`, so without this a plan created under agent A but executed
@@ -965,19 +978,6 @@ class TaskRunner:
         if agent:
             run.agent = agent
             run.agent_named = True
-
-        # Guard: limit concurrent running tasks — check BEFORE mutating state
-        active = sum(1 for t in self._tasks.values() if not t.done())
-        if active >= _MAX_CONCURRENT_TASKS:
-            raise ValueError(
-                f"Too many concurrent tasks ({active}/{_MAX_CONCURRENT_TASKS}). "
-                "Cancel or wait for a running task to finish."
-            )
-        # CLAIMED here: after every check that can refuse this request, so a refused
-        # one leaves nothing claimed, and before the first await below, so no
-        # overlapping request can slip between the check and the claim. Released in
-        # the `finally` once the execution task exists — from then on `run.status`
-        # is what refuses a second execute.
         self._starting.add(task_id)
         try:
 
@@ -1792,6 +1792,18 @@ class TaskRunner:
         prior = self._tasks.get(task_id)
         if prior is not None and not prior.done():
             raise ValueError("Cannot retry while the previous run is still finishing")
+        # Same reauthorization `execute_plan` applies, and BEFORE any run state
+        # changes: a retry is a fresh execution of the remaining tasks, so a run
+        # whose named agent this gateway cannot identify must not resume through
+        # this door either. Without it, an agentless retry of a restored named run
+        # executes under the configured default -- the widening the refusal exists
+        # to stop -- and reaches it by skipping the check rather than passing it.
+        if run.agent_named and not run.agent and not agent:
+            raise ValueError(
+                f"Run {task_id} was started under a named agent this gateway cannot "
+                "identify (the selection does not survive a restart). "
+                "Retry it with an explicit agent."
+            )
         for task in run.tasks:
             if task.index >= from_task:
                 task.status = TaskStatus.PENDING
