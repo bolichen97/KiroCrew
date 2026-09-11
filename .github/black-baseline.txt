@@ -849,7 +849,6 @@ test/test_options_click_validation.py
 test/test_options_submit.py
 test/test_orphaned_approval_card.py
 test/test_outbox_binary.py
-test/test_outbox_notify_broadcast.py
 test/test_override_expiry_notice.py
 test/test_papyrus_gitops.py
 test/test_papyrus_latex.py

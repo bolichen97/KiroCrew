@@ -179,6 +179,216 @@ class TestDecomposeYamlWithAudit:
         assert kwargs["outcome"] == "error"
         assert kwargs["metadata"]["task_id"] == "plan_2"
 
+    def test_provenance_is_recorded_when_supplied(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sourced denial is attributed to its origin, not to the dashboard."""
+        audit = MagicMock()
+        monkeypatch.setattr(tr, "sel", lambda: audit)
+        with pytest.raises(ValueError):
+            tr._decompose_yaml_with_audit(
+                "not: a workflow\n", "plan_3", source="cron", spec_name="wf.yaml"
+            )
+        kwargs = audit.log_tool_invocation.call_args.kwargs
+        assert kwargs["session_key"] == "cron"
+        assert kwargs["metadata"]["source"] == "cron"
+        assert kwargs["metadata"]["spec_name"] == "wf.yaml"
+
+
+# ── YAML spec routing in run() ──
+
+
+class TestYamlSpecDecomposeRouting:
+    """A ``.yaml``/``.yml`` spec decomposes deterministically for every source."""
+
+    @staticmethod
+    def _write(tmp_path: Path, body: str, name: str = "wf.yaml") -> Path:
+        spec = tmp_path / name
+        spec.write_text(body, encoding="utf-8", newline="\n")
+        return spec
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["cron", "mcp"])
+    async def test_sourced_workflow_spec_bypasses_llm(self, tmp_path: Path, source: str) -> None:
+        spec = self._write(tmp_path, _YAML_SPEC)
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_1", source=source)
+        dec.assert_not_awaited()
+        assert [t.index for t in run.tasks] == [1, 2]
+        assert run.tasks[1].depends_on == [1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["cron", "mcp"])
+    async def test_sourced_invalid_spec_denies_llm_fallback(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_2", source=source)
+        dec.assert_not_awaited()
+        assert run.status == "failed"
+        assert run.tasks == []
+
+    @pytest.mark.asyncio
+    async def test_sourced_denial_audit_carries_provenance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        audit = MagicMock()
+        monkeypatch.setattr(tr, "sel", lambda: audit)
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()),
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_3", source="cron")
+        assert run.status == "failed"
+        denials = [
+            call.kwargs
+            for call in audit.log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_name") == "decompose_yaml"
+            and call.kwargs.get("outcome") == "error"
+        ]
+        assert len(denials) == 1
+        assert denials[0]["session_key"] == "cron"
+        assert denials[0]["metadata"]["source"] == "cron"
+        assert denials[0]["metadata"]["spec_name"] == "wf.yaml"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["chat", "dashboard"])
+    async def test_attended_invalid_spec_still_falls_back_to_llm(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """Attended surfaces keep the LLM fallback for a non-workflow ``.yaml``.
+
+        ``/task run <file>.yaml`` (``source="chat"``) and the dashboard both always
+        supply a source, so a truthiness gate would have killed a path that worked
+        before the deny-by-default rule — with an operator right there to read the
+        plan the LLM produces.
+        """
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id=f"yaml_att_{source}", source=source)
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
+    #: A spec that YAML itself cannot parse — an unterminated flow sequence, so
+    #: ``safe_load`` raises out of the scanner rather than returning a mapping
+    #: the shape checks then reject. This is the ORDINARY way a hand-written
+    #: spec is wrong, and it takes a different code path from a parseable
+    #: non-workflow document: the shape checks raise ``ValueError``, the parser
+    #: raises ``yaml.YAMLError``, and only one of those two classes is what the
+    #: routing gate below decides on.
+    _UNPARSEABLE = "agents:\n  first: [unterminated\n"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["chat", "dashboard"])
+    async def test_attended_unparseable_spec_still_falls_back_to_llm(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """A syntax error is a rejected spec, not a broken runtime.
+
+        The attended fallback is selected on the exception class, so a spec that
+        fails in the scanner has to arrive as the same class as one that fails a
+        shape check. Otherwise the most common authoring mistake is the one case
+        the fallback does not cover, and an operator watching a plan get built
+        instead sees the run fail.
+        """
+        spec = self._write(tmp_path, self._UNPARSEABLE)
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id=f"yaml_unp_{source}", source=source)
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["cron", "mcp"])
+    async def test_sourced_unparseable_spec_is_still_denied(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """Normalizing the parser error must not open the unattended path."""
+        spec = self._write(tmp_path, self._UNPARSEABLE)
+        runner = _runner(tmp_path)
+        with (
+            patch.object(TaskRunner, "_decompose", AsyncMock()) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id=f"yaml_unp_deny_{source}", source=source)
+        dec.assert_not_awaited()
+        assert run.status == "failed"
+        assert run.tasks == []
+
+    @pytest.mark.asyncio
+    async def test_local_invalid_spec_still_falls_back_to_llm(self, tmp_path: Path) -> None:
+        """Unsourced (local) runs keep the pre-existing LLM fallback."""
+        spec = self._write(tmp_path, "not: a workflow\n")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_4")
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
+    @pytest.mark.asyncio
+    async def test_sourced_markdown_spec_still_uses_llm(self, tmp_path: Path) -> None:
+        """Widening the suffix gate must not divert non-YAML specs."""
+        spec = self._write(tmp_path, _YAML_SPEC, name="TASK.md")
+        runner = _runner(tmp_path)
+        with (
+            patch.object(
+                TaskRunner,
+                "_decompose",
+                AsyncMock(return_value=[Task(index=1, title="T", description="d")]),
+            ) as dec,
+            patch.object(TaskRunner, "_execute_tasks", AsyncMock()),
+            patch.object(TaskRunner, "_watchdog_loop", AsyncMock()),
+            patch.object(tr.git_coord, "init_workspace", AsyncMock()),
+        ):
+            run = await runner.run(spec, task_id="yaml_5", source="cron")
+        dec.assert_awaited_once()
+        assert [t.title for t in run.tasks] == ["T"]
+
 
 # ── current_run ──
 

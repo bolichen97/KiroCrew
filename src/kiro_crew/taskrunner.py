@@ -98,6 +98,10 @@ _HEARTBEAT_INTERVAL = 30  # watchdog checks process liveness every 30s
 _DEAD_THRESHOLD = 2  # consecutive dead checks before fail-fast reset
 _RESULT_MEM_CAP = 4000  # truncate task.result in memory after step completes
 _WORKFLOW_RESULT_SUMMARY_CAP = 120
+# Sources with no operator watching the run: an invalid workflow spec must fail
+# with the SEL denial rather than degrade to the LLM decomposer. Attended sources
+# (chat, dashboard, CLI/unsourced) keep the fallback.
+_UNATTENDED_SOURCES = frozenset({"cron", "mcp"})
 
 
 class WorkflowRunPublisher(Protocol):
@@ -220,25 +224,42 @@ def _read_spec_prefix(path: str, max_chars: int) -> str:
         return spec_file.read(max_chars).strip()
 
 
-def _decompose_yaml_with_audit(yaml_content: str, task_id: str) -> list[Task]:
-    """Decompose YAML with SEL audit logging."""
+def _decompose_yaml_with_audit(
+    yaml_content: str,
+    task_id: str,
+    source: str = "",
+    spec_name: str = "",
+) -> list[Task]:
+    """Decompose YAML with SEL audit logging.
+
+    ``source``/``spec_name`` carry the run's provenance. Without them a
+    cron/MCP-sourced denial is recorded against ``dashboard`` — the one surface
+    that did not start the run — which makes the audit trail unusable for
+    exactly the unattended callers it exists to record.
+    """
+    metadata: dict[str, Any] = {"task_id": task_id}
+    if source:
+        metadata["source"] = source
+    if spec_name:
+        metadata["spec_name"] = spec_name
+    caller = source or "dashboard"
     try:
         tasks = decompose_yaml(yaml_content)
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="ok",
-            metadata={"task_id": task_id, "task_count": len(tasks)},
+            metadata={**metadata, "task_count": len(tasks)},
         )
         return tasks
     except Exception as exc:
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="error",
-            metadata={"task_id": task_id, "error": str(exc)},
+            metadata={**metadata, "error": str(exc)},
         )
         raise
 
@@ -672,7 +693,12 @@ class TaskRunner:
                 self._ctx, session_key, f"{_SESSION_PREFIX}:{task_id}:runtime"
             )
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(decompose_input, task_id)
+                run.tasks = _decompose_yaml_with_audit(
+                    decompose_input,
+                    task_id,
+                    source=source,
+                    spec_name=Path(spec_path).name if spec_path else "",
+                )
             else:
                 try:
                     run.tasks = await asyncio.wait_for(
@@ -1027,11 +1053,25 @@ class TaskRunner:
             await self._apersist_runs()  # persist immediately so crash recovery works
             await self._notify("\U0001f680 Task started", f"Spec: `{spec_path.name}`", run=run)
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
-            elif not source and spec_path.suffix in (".yaml", ".yml"):
+                run.tasks = _decompose_yaml_with_audit(
+                    spec_content, task_id, source=source, spec_name=spec_path.name
+                )
+            elif spec_path.suffix in (".yaml", ".yml"):
+                # The suffix decides the decomposer, not the caller: a cron- or
+                # MCP-sourced workflow spec must decompose deterministically too.
                 try:
-                    run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
+                    run.tasks = _decompose_yaml_with_audit(
+                        spec_content, task_id, source=source, spec_name=spec_path.name
+                    )
                 except (ValueError, KeyError):
+                    # Deny by default for UNATTENDED callers (cron/MCP): nobody is
+                    # watching, so an invalid spec fails with the audit trail above
+                    # rather than degrading to the unaudited LLM decomposer.
+                    # Attended callers (chat, dashboard, CLI) keep the fallback —
+                    # an operator is present to see the plan, and `/task run
+                    # <file>.yaml` on a non-workflow YAML worked before the gate.
+                    if source in _UNATTENDED_SOURCES:
+                        raise
                     logger.warning(
                         "YAML spec %s is not in workflow format; falling back to LLM decomposition",
                         spec_path.name,

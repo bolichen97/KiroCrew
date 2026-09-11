@@ -533,6 +533,14 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
     """Parse a YAML workflow definition directly into Task objects.
 
     Bypasses the LLM decomposer entirely — depends_on is enforced as-is.
+
+    Every "this is not a valid workflow spec" outcome leaves here as
+    ``ValueError``, INCLUDING an unparseable document. Callers distinguish a
+    rejected spec from a broken runtime by that class alone (``taskrunner``
+    decides between the LLM fallback and a hard failure on it), so leaking
+    ``yaml``'s own exception hierarchy through would make a syntax error — the
+    most ordinary way for a hand-written spec to be wrong — take the runtime
+    path instead.
     """
     if len(yaml_content) > _MAX_YAML_SIZE:
         raise ValueError(f"YAML too large ({len(yaml_content)} bytes, max {_MAX_YAML_SIZE})")
@@ -542,7 +550,10 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         raise ImportError(
             "PyYAML is required for YAML workflow decomposition: pip install PyYAML"
         ) from exc
-    wf = _yaml.safe_load(yaml_content)
+    try:
+        wf = _yaml.safe_load(yaml_content)
+    except _yaml.YAMLError as exc:
+        raise ValueError(f"YAML is not parseable: {exc}") from exc
     if not wf or not isinstance(wf, dict) or "agents" not in wf:
         raise ValueError("YAML must have an 'agents' key with agent definitions")
 

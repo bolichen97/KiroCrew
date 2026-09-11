@@ -6106,7 +6106,93 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     cached_project_agent_names(slot.project or None) or frozenset()
                 )
                 if not is_project_agent:
-                    new_project = default_project_dir(workspace)
+                    # A slot filed into a project-linked folder keeps that
+                    # folder's directory rather than the new agent's workspace
+                    # default: the link is an explicit choice about where this
+                    # chat's tools run, and `api_chat_slot_create` already
+                    # prefers it over the workspace default — an agent pick must
+                    # not silently undo it. Resolved through the SAME helper as
+                    # the create path, which walks the parent_id chain (so a
+                    # project inherited from an ancestor folder counts too) and
+                    # RE-VALIDATES the stored path instead of trusting
+                    # folders.json: a directory recorded there can since have
+                    # been moved, or become sensitive, and this value becomes
+                    # the agent subprocess's cwd. Off the loop, as the helper's
+                    # docstring requires (realpath/isdir priming).
+                    folder_project = ""
+                    if slot.folder_id:
+                        try:
+                            # REVALIDATED against the id the snapshot was taken
+                            # for. `read_folders` and the off-loop resolve are two
+                            # awaits, and a concurrent assignment can file this
+                            # slot into a folder CREATED after the snapshot -- whose
+                            # id is then absent from it, resolving to nothing and
+                            # committing the workspace default as this chat's
+                            # directory. One retry is enough for an assignment that
+                            # has already landed; a slot being reassigned faster
+                            # than that has no stable answer to commit, so it keeps
+                            # the documented fall-through.
+                            folder_error: str | None = ""
+                            for _ in range(2):
+                                folder_id_at_read = slot.folder_id
+                                if not folder_id_at_read:
+                                    break
+                                folder_snapshot = await state.read_folders(
+                                    lambda folders: [dict(folder) for folder in folders]
+                                )
+                                folder_project, folder_error = await asyncio.to_thread(
+                                    _resolve_folder_project_dir,
+                                    folder_snapshot,
+                                    folder_id_at_read,
+                                )
+                                if slot.folder_id == folder_id_at_read:
+                                    break
+                                # Reassigned mid-resolve: what came back describes a
+                                # folder other than the one this slot now holds, so
+                                # it is discarded rather than committed.
+                                folder_project, folder_error = "", ""
+                            if folder_error:
+                                # Deliberately NOT the create path's 400: that
+                                # validator also rejects a directory that no
+                                # longer exists, so failing the request here
+                                # would make the agent permanently unswitchable
+                                # for any folder whose project was moved or
+                                # deleted. Fall through to the workspace default.
+                                logger.warning(
+                                    "Slot %s folder project unusable (%s); "
+                                    "falling back to the workspace default",
+                                    name,
+                                    folder_error,
+                                )
+                                folder_project = ""
+                        except Exception:
+                            # Same fall-through for an unreadable or corrupt
+                            # folder store: letting it reach the outer handler
+                            # would leave the workspace advanced with the
+                            # project stale — a half-applied switch.
+                            logger.warning(
+                                "Failed to resolve folder project for slot %s", name, exc_info=True
+                            )
+                            folder_project = ""
+                    if folder_project:
+                        new_project = folder_project
+                    elif ws_name not in ("default", cfg.default_workspace):
+                        # Only a workspace the agent RESOLVED TO DELIBERATELY may
+                        # retarget the project. Two names fail that test and both
+                        # have to be excluded:
+                        #
+                        # * the literal "default" — `_workspace_name_for_dir`
+                        #   answers it both for an agent bound to no workspace and
+                        #   for one naming a workspace absent from the config;
+                        # * `cfg.default_workspace` — on an install that renames
+                        #   its default, the resolver falls back to that NAME, so
+                        #   the same "no deliberate choice" case arrives spelled
+                        #   differently and a literal-only gate lets it through.
+                        #
+                        # Either way the agent expressed no workspace preference,
+                        # and retargeting on a fallback discards the directory the
+                        # user chose and runs the next turn's tools elsewhere.
+                        new_project = default_project_dir(workspace)
         except Exception:
             logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
 

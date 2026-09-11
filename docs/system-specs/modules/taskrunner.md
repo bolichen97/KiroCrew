@@ -225,6 +225,34 @@ dashboard_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
 | `plan()` API | `"text"`, `"spec"`, `"file"` | ✅ |
 | Cron job | must pass `source="cron"` | ❌ (filtered out) |
 
+### Decomposer Selection
+
+`run()` picks the decomposer from the spec's suffix, not from the caller. A spec whose
+path ends in `.yaml`/`.yml` is decomposed deterministically by `decompose_yaml` for
+every `source`, so a cron- or MCP-started workflow spec produces the same task DAG as
+the same file started from the dashboard. Inline YAML submitted with `source="yaml"` is
+likewise decomposed deterministically. Any other spec is decomposed by the LLM.
+
+Deny-by-default governs the invalid case, and it is keyed on whether anyone is
+watching. When an **unattended** run's `.yaml`/`.yml` spec is not workflow-shaped —
+`source` in `_UNATTENDED_SOURCES` = `{"cron", "mcp"}` — the run fails and is never
+retried through the LLM decomposer. **Attended** sources (`chat`, `dashboard`, and
+unsourced CLI runs) fall back to the LLM decomposer, because an operator is present to
+read the plan and both of those surfaces always supply a source, so a truthiness gate
+would have removed a path that worked before the rule. The SEL `decompose_yaml` `error`
+event is recorded either way.
+
+"Not workflow-shaped" includes a document YAML cannot parse at all. `decompose_yaml`
+raises `ValueError` for every rejected spec, its own shape checks and a `yaml.YAMLError`
+out of `safe_load` alike, and this gate selects on that one class — so a syntax error,
+the most ordinary way a hand-written spec is wrong, takes the same branch as a semantic
+one instead of failing an attended run that would otherwise have been given the LLM
+fallback.
+
+Every `decompose_yaml` audit event carries the run's provenance — `source` and
+`spec_name` in its metadata, and the source as its caller identity (`dashboard` for
+unsourced runs), so a denial is attributed to the surface that started the run.
+
 ### Data Types
 
 Named `TaskStatus`/`Task`/`Project` in `task_models.py`; `StepStatus`/`Step`/`TaskRun`
