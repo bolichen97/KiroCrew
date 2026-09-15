@@ -1980,6 +1980,27 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "invalid agent kind", "code": "invalid_agent_kind"}, status=400
         )
+    # A palette command naming its app's own agent stamps the owning app here, so
+    # every turn can refuse to run when the bare name resolves to any OTHER spec
+    # (see _ChatSlot.app_agent_owner). Only meaningful beside an explicit template
+    # pick of that agent; anything else is refused rather than half-applied.
+    app_agent_owner_raw = body.get("app_agent_owner", "")
+    app_agent_owner = ""
+    if app_agent_owner_raw:
+        from kiro_crew.apps.manifest import app_name_error
+
+        if (
+            not isinstance(app_agent_owner_raw, str)
+            or app_name_error(app_agent_owner_raw)
+            or not isinstance(agent, str)
+            or not agent
+            or agent_kind != "template"
+        ):
+            return web.json_response(
+                {"error": "invalid app agent owner", "code": "invalid_app_agent_owner"},
+                status=400,
+            )
+        app_agent_owner = f"{app_agent_owner_raw}/{agent}"
     model = body.get("model", "")
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
     # visibly too late: get_or_create_slot broadcasts the new slot before this
@@ -2224,6 +2245,15 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             if denied is not None:
                 return denied
             is_new_slot = _requested_key not in state._slots
+        # The binding is stamped only on the owner's own fresh local create below;
+        # any request that would skip that branch is refused, never left unbound.
+        if app_agent_owner and not (
+            is_new_slot and cfg is not None and is_owner_dashboard_request(request)
+        ):
+            return web.json_response(
+                {"error": "invalid app agent owner", "code": "invalid_app_agent_owner"},
+                status=400,
+            )
         try:
             slot = state.get_or_create_slot(
                 name,
@@ -2484,6 +2514,8 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                     # Availability was settled before the mint; this records
                     # the namespace the pick was committed in.
                     slot.agent_kind = chosen.selection_kind
+                    if app_agent_owner:
+                        slot.app_agent_owner = app_agent_owner
                     selection_change = await _record_explicit_agent_selection(
                         assignment_key,
                         assignment_agent,
@@ -2545,6 +2577,39 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # A pinned title must persist too (not just a folder move): without the
         # write, a restart rehydrates the previous title with a refreshable
         # "auto" origin and the background refresh may rewrite the pin.
+        if app_agent_owner:
+            # The app-agent binding is what makes every turn re-check the agent,
+            # and nothing else records it: the selection record omits it, and a
+            # message-less newborn has no metadata line, so the save path's
+            # empty-window merge writes nothing and a restart would restore the
+            # slot unbound. The birth line is written here, awaited and checked,
+            # and the create fails rather than hand the palette a session that
+            # would lose its binding. The newborn is retracted on that failure,
+            # the same retraction `session_control.py`'s create uses: left in
+            # `state._slots` it would still go out in the coalesced broadcast
+            # this suspension owes, so every client would show a session the
+            # caller was told did not get created, a retry would mint a second
+            # one, and -- message-less, so the dirty re-save writes no line -- a
+            # restart would bring it back without its binding. Retracted only
+            # while it is still provably the newborn: a turn that started on it
+            # during the write keeps the slot (liveness over tidiness).
+            if not await _persist_app_agent_owner(state, slot):
+                if (
+                    is_new_slot
+                    and not slot.running
+                    and not slot.messages
+                    and state._slots.get(slot.key) is slot
+                ):
+                    state._slots.pop(slot.key, None)
+                else:
+                    slot._dirty = True
+                return web.json_response(
+                    {
+                        "error": "Could not save the new session. Try again.",
+                        "code": "app_agent_owner_unpersisted",
+                    },
+                    status=503,
+                )
         if folder_id or title:
             # The create/recreate request has been authorized against this
             # transcript.  Do not let a rebind while the off-loop write waits on
@@ -4950,6 +5015,51 @@ class SlotCloseError(Exception):
 # and leaves the tab the user still has open, rather than retracting the name
 # while a worker thread is still on its way to the rename.
 _GUARDED_WRITE_WAIT_SECS = 5.0
+
+
+async def _persist_app_agent_owner(state: DashboardState, slot: _ChatSlot) -> bool:
+    """Durably record *slot*'s app-agent binding before its create is answered.
+
+    A line-less newborn gets the full metadata line a first save would write;
+    a slot that already has a line takes the force save, whose merge carries
+    the binding. False when neither write committed.
+    """
+    log = state.conversation_log
+    if log is None:
+        return False
+    history_key = slot_history_key(slot)
+    from kiro_crew.dashboard.slot_persistence import metadata_codec
+
+    line = {
+        "_type": "metadata",
+        **metadata_codec.encode(
+            slot,
+            folds=metadata_codec.SaveFolds(
+                memory_mode=getattr(slot, "memory_mode", "persistent"),
+                created_at=slot.created_at,
+                tab_id=getattr(slot, "_tab_id", None),
+            ),
+        ),
+    }
+    try:
+        if await drained_to_thread(
+            log.update_metadata_if, history_key, line, lambda meta: not meta
+        ):
+            return True
+        return await save_slot_off_loop(
+            state,
+            slot,
+            force=True,
+            best_effort=False,
+            expected_history_key=history_key,
+        )
+    except Exception:
+        logger.warning(
+            "chat_slot_create: could not persist the app agent owner for slot=%s",
+            slot.key,
+            exc_info=True,
+        )
+        return False
 
 
 async def _record_explicit_agent_selection(

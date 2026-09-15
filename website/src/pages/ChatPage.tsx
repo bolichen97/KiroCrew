@@ -3260,7 +3260,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const {
     continuable, interrupted, sendUnconfirmed, continuing, handleContinue,
     openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting,
-    featureRequestRefused, sessionStartRepeated,
+    featureRequestRefused, sessionStartRepeated, appAgentRefused,
   } = useTurnRecovery({
     activeSlot,
     slotRunning,
@@ -6581,8 +6581,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                  the ordinary Send button; typing still works.
                  `sessionStartRepeated` is the same rule for a session start
                  that failed twice in a row: the card names the remedy and
-                 withholds Resume, so the composer falls back to Send. */
-              continuable={continuable && interrupted && !featureRequestRefused && !sessionStartRepeated}
+                 withholds Resume, so the composer falls back to Send.
+                 `appAgentRefused` is the same rule for a refused app-owned
+                 agent turn. */
+              continuable={continuable && interrupted && !featureRequestRefused && !sessionStartRepeated && !appAgentRefused}
               continueIsRecovery={interrupted}
               onContinue={handleContinue}
               continuing={continuing}

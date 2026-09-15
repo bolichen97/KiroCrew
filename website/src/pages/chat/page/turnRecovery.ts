@@ -8,7 +8,7 @@ import { useAppSelector } from '../../../store'
 import { selectContinuable, selectTrailingSendUnconfirmed, selectTurnInterrupted } from '../../../store/chatSlice'
 import type { ChatMessage } from '../../../types'
 import { KIRO_SIGN_IN_PATH } from '../../developer/kiroSignInLink'
-import { featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../transcriptRenderers'
+import { appAgentRefusalIsNewest, featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../transcriptRenderers'
 
 interface TurnRecoveryOptions {
   activeSlot: string | null
@@ -131,6 +131,9 @@ export function useTurnRecovery({
   // composer must not urge the press beneath it. Typing still works and is
   // what resets the count.
   const sessionStartRepeated = sessionStartRepeatIsNewest(messages)
+  // Same rule for a refused app-owned agent turn: a retry re-runs the same
+  // refusal, so the card withholds Resume and the composer must not urge it.
+  const appAgentRefused = appAgentRefusalIsNewest(messages)
 
   const handleContinue = useCallback(() => {
     if (!activeSlot || continuing || !continuable) return
@@ -149,6 +152,6 @@ export function useTurnRecovery({
   return {
     continuable, interrupted, sendUnconfirmed, continuing, handleContinue,
     openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting,
-    featureRequestRefused, sessionStartRepeated,
+    featureRequestRefused, sessionStartRepeated, appAgentRefused,
   }
 }

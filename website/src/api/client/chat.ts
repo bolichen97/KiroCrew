@@ -101,7 +101,7 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
     },
     /** Create a chat slot on this machine. A session on a connected crew is
      *  created on that crew and opened through its window, never here. */
-    createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, agent_kind?: 'member' | 'template', no_session_folder?: boolean) => {
+    createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, agent_kind?: 'member' | 'template', no_session_folder?: boolean, app_agent_owner?: string) => {
       const resolvedMemoryMode = memory_mode ?? await resolveDefaultMemoryMode(
         () => fetch('/api/dashboard/config').then(j),
       )
@@ -110,6 +110,9 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
         ...(agent ? { agent } : {}),
         // Only beside an agent: a namespace without a name selects nothing.
         ...(agent && agent_kind ? { agent_kind } : {}),
+        // The app whose OWN agent a palette command named. The backend refuses
+        // every turn on which that bare name would resolve to any other spec.
+        ...(agent && agent_kind === 'template' && app_agent_owner ? { app_agent_owner } : {}),
         ...(model ? { model } : {}),
         ...(mode ? { mode } : {}),
         ...(resolvedMemoryMode ? { memory_mode: resolvedMemoryMode } : {}),
