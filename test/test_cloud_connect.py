@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import pytest
@@ -282,24 +283,55 @@ class TestKillProcessTree:
             "time.sleep(30)"
         )
         proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
-        # Wait for the grandchild pid to be recorded.
-        for _ in range(50):
-            if pidfile.exists() and pidfile.read_text(encoding="utf-8").strip():
-                break
-            time.sleep(0.1)
-        child_pid = int(pidfile.read_text(encoding="utf-8").strip())
-        assert _pid_alive(child_pid), "grandchild should be alive before teardown"
+        # Bound BEFORE the try: the pidfile read below raises FileNotFoundError /
+        # ValueError whenever the 5s poll budget expires on a loaded host, and the
+        # finally must still be able to skip the grandchild reap in that case.
+        child_pid: int | None = None
+        try:
+            # Wait for the grandchild pid to be recorded.
+            for _ in range(50):
+                if pidfile.exists() and pidfile.read_text(encoding="utf-8").strip():
+                    break
+                time.sleep(0.1)
+            child_pid = int(pidfile.read_text(encoding="utf-8").strip())
+            assert _pid_alive(child_pid), "grandchild should be alive before teardown"
 
-        connect._kill_process_tree(proc)
+            connect._kill_process_tree(proc)
 
-        # Both the parent and the grandchild must be gone.
-        assert proc.poll() is not None, "parent should be reaped"
-        # Poll: the tree kill is asynchronous w.r.t. the grandchild exiting.
-        for _ in range(50):
-            if not _pid_alive(child_pid):
-                break
-            time.sleep(0.1)
-        assert not _pid_alive(child_pid), "grandchild (same tree) must also be killed"
+            # Both the parent and the grandchild must be gone.
+            assert proc.poll() is not None, "parent should be reaped"
+            # Poll: the tree kill is asynchronous w.r.t. the grandchild exiting.
+            for _ in range(50):
+                if not _pid_alive(child_pid):
+                    break
+                time.sleep(0.1)
+            assert not _pid_alive(child_pid), "grandchild (same tree) must also be killed"
+        finally:
+            # `connect._kill_process_tree` is the ONLY reaper in the body above and
+            # it is the code under test, so every failing exit — the pidfile read
+            # raising when the 5s poll budget expires, either assertion, a real
+            # regression in the tree kill — abandons a live `time.sleep(30)`
+            # wrapper AND its grandchild for 30s past the test. Both sit in their
+            # own session thanks to start_new_session=True, i.e. in a group no
+            # run-level sweep of the xdist worker's group can reach. Reap through
+            # `platform_compat` (`killpg` on POSIX, `taskkill /T /F` on Windows) —
+            # an implementation independent of `ssm.kill_port_forward`, so the
+            # broken subject cannot also break its own cleanup. Group first, then
+            # the grandchild by pid: once the wrapper has been reaped,
+            # getpgid(proc.pid) no longer resolves the group and the reparented
+            # grandchild is only reachable by its own pid — which is exactly the
+            # regression this test is written to catch.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                pc.kill_process_tree(proc.pid, pc.SIGKILL)
+            if child_pid is not None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    pc.kill_pid(child_pid, pc.SIGKILL)
+            if proc.returncode is None:
+                # Bounded: SIGKILL cannot be blocked, so this returns at once —
+                # the ceiling only exists so a wedged wait in a `finally` cannot
+                # replace the real assertion failure with a hang.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=10)
 
     def test_windows_uses_a_tree_kill_not_a_parent_only_terminate(self, monkeypatch):
         """On Windows the group signal can never work, so the tree kill must run.

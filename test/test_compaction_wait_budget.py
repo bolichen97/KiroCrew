@@ -14,13 +14,11 @@ from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
 
 import pytest
+from source_corpus import parsed_candidates, src_root
 
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
-
-_SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 
 
 def _wait_default(func) -> object:
@@ -126,8 +124,18 @@ def test_no_call_site_pins_a_shorter_wait():
     they are derived from the shared budget and covered by the tests above.
     """
     offenders: list[str] = []
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    # A call to ``wait_for_compaction`` cannot exist in a file whose text does
+    # not hold that name, so the shared corpus parses the ~20 files that mention
+    # it instead of all ~1550 modules under ``src/`` (a full-tree parse this gate
+    # used to pay alone: ~3.5s idle, far worse under xdist contention, for an
+    # answer available in ~0.05s). The filter matches on NFKC-normalized text, so
+    # a Unicode homoglyph spelling that CPython folds to the guarded name at
+    # parse time is still a candidate. ``skip_syntax_errors=False`` keeps the
+    # old behaviour that an unparseable module fails the run loudly rather than
+    # dropping silently out of this gate's coverage.
+    for path, _text, tree in parsed_candidates(
+        require_all=["wait_for_compaction"], skip_syntax_errors=False
+    ):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -143,7 +151,11 @@ def test_no_call_site_pins_a_shorter_wait():
                     continue  # non-literal (derived) timeouts are exempt
                 if isinstance(value, (int, float)) and value < COMPACT_WAIT_TIMEOUT_SECS:
                     offenders.append(
-                        f"{path.relative_to(_SRC_ROOT.parent.parent)}:{node.lineno}"
+                        # Rooted at the corpus' own ``src_root()``: the yielded
+                        # paths live under the importable package, which need not
+                        # be the in-repo path, and a mismatch would raise
+                        # ValueError here instead of reporting the offender.
+                        f"{path.relative_to(src_root().parent.parent)}:{node.lineno}"
                         f" (timeout={value})"
                     )
     assert not offenders, (

@@ -70,8 +70,21 @@ LEGACY_READER_SCRIPTS = frozenset(
     }
 )
 
-# Directories that are vendored, generated, or dependency trees.
-SKIP_DIR_PARTS = frozenset({"node_modules", "_vendor", ".venv", "build", "dist", ".git"})
+# Directories that are vendored, generated, or dependency trees -- or, in the case
+# of ``.worktrees``, ANOTHER BRANCH'S ENTIRE CHECKOUT.
+#
+# ``.worktrees/`` is gitignored (.gitignore:144) and is where this repo's own
+# documented worktree workflow puts sibling checkouts (the ``kirocrew-worktree-dev``
+# skill, docs/guides/worktree-verification-recipes.md). Without it here, this gate
+# audits code that is not on this branch and reports offenders nobody on this branch
+# can fix: on a developer box carrying two worktrees it failed naming
+# ``.worktrees/*/test/test_runtime_home_write_paths.py:237`` -- this file's OWN
+# docstring, quoted from another branch. CI has no ``.worktrees``, so CI stays green
+# and only the developer sees it. ``_shell_scripts()`` below never had this problem
+# because it asks ``git ls-files`` instead of walking the filesystem, and says so.
+SKIP_DIR_PARTS = frozenset(
+    {"node_modules", "_vendor", ".venv", "build", "dist", ".git", ".worktrees"}
+)
 
 
 @functools.lru_cache(maxsize=1)

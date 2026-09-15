@@ -1811,6 +1811,38 @@ def _signal_installer_group(pid: int, sig: int) -> None:
         pass
 
 
+#: Ceiling on the wait for the installer to reach the promotion window. A hermetic
+#: bootstrap (fake curl, a few-KB tarball) gets there in well under a second, so
+#: this only ever trips when the run died earlier -- and it stays well under the
+#: drain timeout below so that the named assertion, not ``communicate``, is what
+#: reports that failure.
+_MOVE_ASIDE_WAIT = 30.0
+
+
+def _await_move_aside(proc: subprocess.Popen[str], marker: Path) -> None:
+    """Block until the ``mv`` stub reports the promotion window is open.
+
+    The window this test needs is between ``mv "$PREFIX/node" "$_backup"`` and
+    ``mv "$_stage/tree" "$PREFIX/node"`` -- two adjacent renames, microseconds
+    apart -- and it opens only after the download, the checksum and the runtime
+    probe. Continuing without the marker would send the interrupt somewhere the
+    test did not choose, where "a Node is present" holds trivially because nothing
+    ever touched ``$PREFIX/node``, so this raises rather than pass quietly.
+    """
+    deadline = time.monotonic() + _MOVE_ASIDE_WAIT
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(0.02)
+    raise AssertionError(
+        "the installer never reached the move-aside window (exit status "
+        f"{proc.poll()}) -- an interrupt outside that window proves nothing "
+        "about the rollback"
+    )
+
+
 @posix_only
 def test_an_interrupted_rebootstrap_restores_the_previous_node(
     tmp_path: Path, stubs: Path, node_mirror: Path
@@ -1820,23 +1852,36 @@ def test_an_interrupted_rebootstrap_restores_the_previous_node(
     the new one is not yet in place. The EXIT handler puts it back, so the wrapper
     never ends up pinned to a Node that is not there.
 
-    Driven by making the tarball enormous enough that `tar` is still unpacking when
-    the signal arrives, rather than by asserting on the script's text.
+    The window is NAMED rather than slept toward: a test-owned `mv` stub does the
+    real move-aside, records that it happened, and then blocks, so the signal
+    provably arrives with `$PREFIX/node` gone and the replacement still in staging.
+    The earlier shape slept a fixed 2.5 s over a 60 MB incompressible tarball hoping
+    to catch `tar` mid-unpack, and it never once entered the window. Two independent
+    reasons, both verified by running it: the tarball's own `node` answered the
+    `process.versions.node.split(".")[0]` probe with `22.0.0`, so the pre-promotion
+    runtime probe rejected it and the run exited EX_NODE_BOOTSTRAP with
+    `$PREFIX/node` never touched -- and even with a runnable tree the sleep was
+    timing the wrong half, because gzip is asymmetric (1.3 s to compress those bytes
+    in the test process, 0.1 s to inflate them in the child) and the window opens
+    only AFTER the unpack. So the signal reached an already-exited process and both
+    assertions were satisfied by a prefix nothing had modified, for ~1.5 s of CPU and
+    ~300 MB of temp I/O a run.
     """
     base = _expected_node_base(TESTED_NODE_VERSION)
-    tree = tmp_path / "slowsrc" / base / "bin"
-    tree.mkdir(parents=True)
-    _write_stub(tree / "node", "#!/bin/sh\necho 22.0.0\nexit 0\n")
-    _write_stub(tree / "npm", "#!/bin/sh\nexit 0\n")
-    # ~60 MB of incompressible filler, so the unpack takes long enough to interrupt.
-    (tmp_path / "slowsrc" / base / "filler").write_bytes(os.urandom(60 * 1024 * 1024))
-    archive = tmp_path / f"{base}.tar.gz"
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(tmp_path / "slowsrc" / base, arcname=base)
+    archive = _node_tarball(tmp_path, base)
     shutil.copy(archive, node_mirror / archive.name)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (node_mirror / "SHASUMS256.txt").write_text(f"{digest}  {archive.name}\n")
     _fake_curl(stubs, node_mirror)
+    # Stubbed even though this test means to be INTERRUPTED before npm runs: if the
+    # interrupt misses its window the installer carries on to the install step, and
+    # an unstubbed `npm` there is a real `@playwright/cli` fetch from
+    # registry.npmjs.org followed by a browser-binary download. That is exactly what
+    # happened while this test was being rewritten -- the run completed, the promotion
+    # finished, and the sentinel assertion below failed for a reason that had nothing
+    # to do with signals. A missed window must fail as an assertion, never as network
+    # egress.
+    _fake_npm_succeeding(stubs)
 
     node_dir = tmp_path / "datahome" / "playwright-cli" / "node"
     (node_dir / "bin").mkdir(parents=True)
@@ -1844,6 +1889,27 @@ def test_an_interrupted_rebootstrap_restores_the_previous_node(
     (node_dir / ".kirocrew-playwright-cli-node").write_text("")
     sentinel = node_dir / "bin" / "sentinel"
     sentinel.write_text("the tree that must survive")
+
+    # An `mv` that holds the promotion window open. Written BEFORE `_env`, which
+    # symlinks a BASE_UTILS binary only when the name is not already taken, so this
+    # shadows the host's `mv` on the isolated PATH. Keyed on the DESTINATION,
+    # because the installer runs four other renames through this same stub
+    # (`$_stage/tree`, `$PREFIX/node` on both promotion and restore, and the
+    # redacted log) and only `$_stage/previous` is the move-aside. The real tools
+    # are addressed by absolute path rather than through the stub's own PATH, which
+    # would re-enter this script for `mv` and has no `sleep` on it at all.
+    real_mv = shutil.which("mv")
+    real_sleep = shutil.which("sleep")
+    assert real_mv and real_sleep, "the stub needs the host's own mv and sleep"
+    marker = tmp_path / "moved-aside"
+    _write_stub(
+        stubs / "mv",
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        f'  */previous) "{real_mv}" "$@" || exit $?; : > "{marker}"; "{real_sleep}" 30 ;;\n'
+        f'  *) exec "{real_mv}" "$@" ;;\n'
+        "esac\n",
+    )
 
     env = _env(tmp_path, stubs, isolated=True)
     proc = subprocess.Popen(  # noqa: S603 - the installer under test
@@ -1862,19 +1928,28 @@ def test_an_interrupted_rebootstrap_restores_the_previous_node(
         start_new_session=True,
     )
     try:
-        # Long enough to be inside the bootstrap, short enough to be mid-unpack.
-        time.sleep(2.5)
+        # The stub is still blocking when this returns, so the prefix is provably
+        # mid-promotion: the old tree is under $_stage/previous and nothing is at
+        # $PREFIX/node.
+        _await_move_aside(proc, marker)
         _signal_installer_group(proc.pid, signal.SIGINT)
-        proc.communicate(timeout=60)
+        stdout, stderr = proc.communicate(timeout=60)
     finally:
         if proc.poll() is None:
             _signal_installer_group(proc.pid, signal.SIGKILL)
             proc.communicate()
 
-    # Whatever stage it died in, a Node must be present and it must be the old one
-    # if promotion never happened. The one thing forbidden is: nothing there.
-    assert node_dir.exists(), "the interrupt left the prefix with no Node at all"
-    assert (node_dir / "bin" / "node").exists()
+    # The interrupt landed with promotion incomplete, so the ONLY acceptable outcome
+    # is the previous tree back in place -- not merely "some Node is there", which
+    # the new tree would also satisfy.
+    assert node_dir.exists(), f"the interrupt left the prefix with no Node at all\n{stderr}"
+    assert (node_dir / "bin" / "node").exists(), stdout + stderr
+    assert sentinel.is_file(), (
+        "the restored tree is not the one that was moved aside: the previous "
+        "install's own files are gone, so the Ctrl-C cost the user the toolchain "
+        f"the wrapper is pinned to\n{stdout}{stderr}"
+    )
+    assert sentinel.read_text() == "the tree that must survive"
 
 
 @posix_only

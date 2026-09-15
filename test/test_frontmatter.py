@@ -881,7 +881,17 @@ class TestTheRepoSkillFileCorpus:
         out: list[tuple[str, str]] = []
         for path in sorted(root.rglob("SKILL.md")):
             rel = path.relative_to(root).as_posix()
-            if any(part in ("node_modules", ".git", "dist", "build") for part in path.parts):
+            # ``.worktrees`` is another BRANCH'S whole checkout, not a tree this one
+            # ships. It is gitignored (.gitignore:144) and is where this repo's own
+            # worktree workflow puts sibling checkouts, so leaving it in makes
+            # NOT_VALID_YAML below a statement about whatever branches happen to be
+            # checked out beside this one: on a box with two worktrees this corpus
+            # grew four unexpected entries and both gates here failed, while CI --
+            # which has no ``.worktrees`` -- stayed green.
+            if any(
+                part in ("node_modules", ".git", "dist", "build", ".worktrees")
+                for part in path.parts
+            ):
                 continue
             out.append((rel, path.read_text(encoding="utf-8")))
         return out

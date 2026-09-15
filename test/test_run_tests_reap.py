@@ -8,11 +8,12 @@ nothing keeps holding CPU/memory/file handles across runs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
 import pytest
 
-from kiro_crew import task_executor
+from kiro_crew import platform_compat, task_executor
 
 
 @pytest.mark.asyncio
@@ -27,24 +28,54 @@ async def test_reap_process_group_kills_children() -> None:
         stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
-    assert proc.stdout is not None
-    line = await asyncio.wait_for(proc.stdout.readline(), timeout=5)
-    child_pid = int(line.decode().strip())
+    child_pid: int | None = None
+    try:
+        assert proc.stdout is not None
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+        child_pid = int(line.decode().strip())
 
-    await task_executor._reap_process_group(proc)
+        await task_executor._reap_process_group(proc)
 
-    # Parent (sh) reaped.
-    assert proc.returncode is not None
+        # Parent (sh) reaped.
+        assert proc.returncode is not None
 
-    # The forked `sleep` child in the same group must be gone too.
-    for _ in range(50):
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            break
-        await asyncio.sleep(0.1)
-    else:
-        pytest.fail("child process in the group survived reaping")
+        # The forked `sleep` child in the same group must be gone too.
+        for _ in range(50):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("child process in the group survived reaping")
+    finally:
+        # Every failing exit above — the readline timeout, the int() parse, the
+        # returncode assertion and the for-else pytest.fail — leaves a REAL
+        # `sh` + `sleep 300` pair alive, and `start_new_session=True` put that
+        # pair in its own session, i.e. in a group no run-level sweep can reach.
+        # So a regression in _reap_process_group would park two live processes
+        # in the host process table for the sleep's full five minutes on top of
+        # reporting the failure. Kill the group first (that is the path the
+        # readline timeout needs, where `sh` is still the group leader), then
+        # the forked `sleep` by pid: once `sh` has been reaped, getpgid(proc.pid)
+        # no longer resolves the group and the reparented child is only
+        # reachable by its own pid. Routed through platform_compat rather than
+        # os.killpg per the POSIX-call rule.
+        with contextlib.suppress(ProcessLookupError, OSError):
+            platform_compat.kill_process_tree(proc.pid, platform_compat.SIGKILL)
+        if child_pid is not None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                platform_compat.kill_pid(child_pid, platform_compat.SIGKILL)
+        if proc.returncode is None:
+            # Bounded: SIGKILL cannot be blocked, so this returns at once — the
+            # ceiling only exists so a wedged wait in a `finally` cannot replace
+            # the real assertion failure with a hang.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=10)
+        # Close the transport the test would otherwise leak: its __del__ emits
+        # ResourceWarning and can raise "Event loop is closed" once the loop is
+        # gone, attributed to whichever later test happens to trigger the GC.
+        task_executor._close_proc_pipes(proc)
 
 
 @pytest.mark.asyncio

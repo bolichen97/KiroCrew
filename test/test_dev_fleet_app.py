@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -31,6 +32,7 @@ from kiro_crew.apps.builtins.dev_fleet import npm_preflight
 from kiro_crew.apps.builtins.dev_fleet import repository as repository_mod
 from kiro_crew.apps.builtins.dev_fleet import runtime as runtime_mod
 from kiro_crew.apps.builtins.dev_fleet import worktree_ops as worktree_ops_mod
+from kiro_crew.loop_lock import LoopBoundLock
 
 # These Dev Fleet make-live / cancel / sync / build tests assert POSIX-only
 # behaviour that has no Windows equivalent: os.geteuid, the ``.venv/bin`` layout
@@ -1010,6 +1012,57 @@ def _install_step(steps):
         if st["label"] == "pip install":
             return st
     raise AssertionError("no 'pip install' step found in the step list")
+
+
+#: Temp-directory prefixes the dev-fleet sync stages and `_start_run`'s finally owns.
+#:
+#: Kept next to :func:`_sweep_staged_sync_tempdirs`, which needs them because the
+#: `cleanup_paths` list is not reachable from a test that stubbed `_start_run` itself.
+_STAGED_SYNC_PREFIXES = (
+    "kirocrew-sync-runner-",
+    "kirocrew-npm-preflight-",
+    "kirocrew-dep-sync-",
+)
+
+
+@pytest.fixture(autouse=True)
+def _sweep_staged_sync_tempdirs():
+    """Remove sync snapshot dirs left by any test that stubbed ``_start_run``.
+
+    ``_sync_start_locked`` stages three kinds of snapshot into the temp root — the
+    runner source + its steps JSON, the npm preflight, and the dependency-only
+    ``dep_sync`` copy — and registers every one in the ``cleanup_paths`` list that
+    ``runtime._start_run``'s ``finally`` unlinks. Stubbing ``_start_run`` therefore
+    stubs out the ONLY cleanup, and eight tests here patch it inline with their own
+    ``AsyncMock`` rather than going through ``_run_sync`` (which already calls
+    :func:`_cleanup_sync_tempdirs`). MEASURED with ``KIROCREW_TMP_PER_TEST=1``:
+    fifteen directories outlived one run of this file, named after the eight tests.
+
+    An autouse SWEEP rather than a call each of those tests must remember, because
+    the next test to patch ``_start_run`` inline would leak again and nothing would
+    say so until a residue report blamed whichever test happened to run last. It is
+    sound here in a way a general temp sweep is not (see the residue rules in
+    testing-conventions): the scan is confined to THIS run's own redirected temp base
+    and to prefixes this app owns, and it only removes entries that were not present
+    before the test — so a concurrent run's directory, which lives under its own base,
+    is never a candidate.
+    """
+    base = Path(tempfile.gettempdir())
+
+    def staged() -> set[Path]:
+        try:
+            return {
+                p
+                for p in base.iterdir()
+                if p.is_dir() and p.name.startswith(_STAGED_SYNC_PREFIXES)
+            }
+        except OSError:
+            return set()
+
+    before = staged()
+    yield
+    for path in staged() - before:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _cleanup_sync_tempdirs(mock_start):
@@ -7008,16 +7061,24 @@ async def _await_prune_idle(timeout: float = 5.0) -> None:
 
 
 @pytest.fixture
-def reset_prune_state():
-    """Fresh prune locks + state bound to the CURRENT test's event loop.
+def reset_prune_state(monkeypatch):
+    """Fresh prune locks + state, restored to production's objects at teardown.
 
-    ``_PRUNE_LOCK`` / ``_GIT_MUTATION_LOCK`` are module-global asyncio.Locks and
-    an asyncio.Lock raises if reused across event loops; pytest-asyncio gives
-    each test its own loop, so re-create them (and clear the shared state) per
-    test.
+    ``_PRUNE_LOCK`` / ``_GIT_MUTATION_LOCK`` are declared as
+    :class:`~kiro_crew.loop_lock.LoopBoundLock`, not bare asyncio.Locks, so the
+    cross-loop ``RuntimeError`` that once justified re-creating them per test is
+    already handled upstream (a per-loop lock table plus a closed-loop sweep).
+    What still has to be per-test is the lock STATE: a prune worker these tests
+    fake out must not leave a queue behind for the next one. So substitute, but
+    substitute the production TYPE and do it through monkeypatch: raw-assigning
+    a bare ``asyncio.Lock()`` here left the module holding a loop-affine lock
+    for the rest of the worker process — silently voiding, for every later test
+    in the process, the exact guarantee ``scripts/check_loop_bound_locks.py``
+    exists to enforce, with the eventual ``RuntimeError`` surfacing from
+    production code in a file that never touched this fixture.
     """
-    worktree_ops_mod._PRUNE_LOCK = asyncio.Lock()
-    worktree_ops_mod._GIT_MUTATION_LOCK = asyncio.Lock()
+    monkeypatch.setattr(worktree_ops_mod, "_PRUNE_LOCK", LoopBoundLock())
+    monkeypatch.setattr(worktree_ops_mod, "_GIT_MUTATION_LOCK", LoopBoundLock())
     mod._PRUNE_STATE.update({
         "running": False, "total": 0, "done": 0, "current": None,
         "results": [], "items": {},

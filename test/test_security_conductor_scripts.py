@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,38 @@ SCRIPTS = (
     / "security-conductor"
     / "scripts"
 )
+
+
+@pytest.fixture
+def runnable_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the bare name ``python3`` in a PoC reach a REAL interpreter.
+
+    Every test here that lets a ``cmd::`` proof actually run needs this, and the
+    cost of not having it is measured: four runs of this file left NINE processes
+    reparented to init, spinning at 1464% CPU between them for six days, each with
+    a deleted ``pytest-of-*/garbage-*/scratch-checkout`` cwd.
+
+    The cause is the interaction of two deliberate decisions in
+    ``verify_finding.child_env``: PATH is inherited (a PoC needs an interpreter)
+    while HOME is repointed at the throwaway worktree (the blast-radius bound). On
+    a host whose PATH leads with a version-manager shim directory -- mise, asdf,
+    pyenv, volta, nodenv -- the bare name IS the manager, and a manager that
+    cannot find its tool state under the substituted HOME never execs an
+    interpreter at all; it spins. Verified on such a host: with the shim dir first
+    and HOME repointed, ``python3 -c "raise SystemExit(3)"`` had to be SIGKILLed
+    at 20s instead of exiting 3 in milliseconds.
+
+    So the interpreter's own directory goes FIRST. It cannot be spelled in the PoC
+    instead: ``refusal_reason`` refuses a proof whose argv names an absolute path
+    outside the worktree, which is correct and stays. And the tests that are about
+    the PARSER deliberately do NOT take this fixture -- there ``python3`` is the
+    input under test and nothing is spawned.
+
+    Patched through ``monkeypatch`` on ``os.environ`` because ``child_env`` reads
+    PATH at call time, so the pin has to be live during ``main()`` and gone after.
+    """
+    interpreter_dir = str(Path(sys.executable).resolve().parent)
+    monkeypatch.setenv("PATH", os.pathsep.join([interpreter_dir, os.environ.get("PATH", "")]))
 
 
 @pytest.fixture
@@ -1187,7 +1220,7 @@ def test_posix_leaves_the_canonical_python3_command_unchanged(verify_finding, mo
 
 
 def test_a_nonzero_command_proof_confirms_and_a_zero_one_rejects(
-    ledger, verify_finding, db, worktree, capsys
+    ledger, verify_finding, db, worktree, capsys, runnable_python
 ):
     """Run real Python commands and preserve both verdict directions.
 
@@ -1284,7 +1317,7 @@ def test_a_directory_that_is_not_a_git_worktree_is_refused(
 
 
 def test_a_proof_that_outlives_the_deadline_is_needs_human(
-    ledger, verify_finding, db, worktree, capsys
+    ledger, verify_finding, db, worktree, capsys, runnable_python
 ):
     finding_id = a_finding(ledger, db, poc='cmd::python3 -c "import time; time.sleep(30)"')
 
@@ -1917,7 +1950,7 @@ def test_a_command_that_never_ran_does_not_confirm(verify_finding, returncode, v
 
 
 def test_a_command_proof_that_crashes_is_not_confirmed(
-    ledger, verify_finding, db, worktree, capsys
+    ledger, verify_finding, db, worktree, capsys, runnable_python
 ):
     """End to end: a PoC dying on a missing import must not persist `confirmed`."""
     finding_id = a_finding(ledger, db, poc='cmd::python3 -c "import no_such_module_anywhere_xyz"')
@@ -1939,7 +1972,9 @@ def test_a_command_proof_that_crashes_is_not_confirmed(
     " signal-death shape this drives end to end cannot arise there; judge_cmd's"
     " mapping for it is covered directly by the unit test above.",
 )
-def test_a_signal_killed_command_records_needs_human(ledger, verify_finding, db, worktree, capsys):
+def test_a_signal_killed_command_records_needs_human(
+    ledger, verify_finding, db, worktree, capsys, runnable_python
+):
     """The launch-failure mapping, driven end to end rather than unit-only."""
     finding_id = a_finding(
         ledger, db, poc='cmd::python3 -c "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"'
@@ -1991,7 +2026,7 @@ def test_the_proof_shapes_are_declared_once(finding_entry, verify_finding):
 
 
 def test_an_output_flood_does_not_buffer_into_the_verifier(
-    ledger, verify_finding, db, worktree, capsys
+    ledger, verify_finding, db, worktree, capsys, runnable_python
 ):
     """The PoC's output is discarded, so a printing PoC cannot exhaust memory.
 
@@ -2018,6 +2053,71 @@ def test_an_output_flood_does_not_buffer_into_the_verifier(
     assert code == 0
     assert payload["verdict"] == "confirmed"
     assert verdict_rows(ledger, db, finding_id) == [("verifier", "confirmed")]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
+def test_a_wedged_grandchild_does_not_outlive_the_deadline(
+    ledger, verify_finding, db, worktree, capsys, runnable_python
+):
+    """The timeout path reaps the proof's whole GROUP, not just the pid it spawned.
+
+    A PoC is routinely a wrapper that forks -- a version-manager shim is one, and
+    that is how four runs of this file left nine processes reparented to init,
+    spinning at 1464% CPU between them for six days. Killing only the direct
+    child leaves the forked half burning a core with nothing left on the machine
+    that can name what it belonged to.
+
+    The grandchild here outlives its parent deliberately, so it survives iff the
+    reap is a single ``kill``. Asserted by polling for its death rather than by
+    reading a status: the parent's own exit says nothing about a process it left
+    behind.
+    """
+    program = (
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        "with open('grandchild.pid', 'w', encoding='utf-8') as fh:\n"
+        "    fh.write(str(child.pid))\n"
+        "    fh.flush()\n"
+        "    os.fsync(fh.fileno())\n"
+        # Outlive the verifier's deadline so the reap, not a natural exit, is what
+        # ends this tree.
+        "time.sleep(300)\n"
+    )
+    (worktree / "wedged.py").write_text(program, encoding="utf-8")
+    finding_id = a_finding(ledger, db, poc="cmd::python3 wedged.py")
+
+    code = verify_finding.main(
+        [
+            "--db",
+            str(db),
+            "--finding-id",
+            str(finding_id),
+            "--worktree",
+            str(worktree),
+            "--timeout",
+            "1",
+        ]
+    )
+
+    payload = out_json(capsys)
+    assert code == 20
+    assert payload["verdict"] == "needs-human"
+
+    pid_file = worktree / "grandchild.pid"
+    assert pid_file.exists(), "the PoC never reported its grandchild"
+    grandchild = int(pid_file.read_text(encoding="utf-8").strip())
+    # Generous, and only reached when the property is broken: a killpg is
+    # immediate, so this bound exists to fail by name rather than to be waited on.
+    give_up_at = time.monotonic() + 10.0
+    while True:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            return
+        assert (
+            time.monotonic() < give_up_at
+        ), f"grandchild {grandchild} outlived the reap -- the kill did not reach the group"
+        time.sleep(0.05)
 
 
 def test_run_poc_returns_a_bare_status_and_captures_nothing(verify_finding):

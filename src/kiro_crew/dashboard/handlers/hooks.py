@@ -1291,22 +1291,34 @@ async def _run_hook_agent(
     the agent calls ``register_hook`` to persist context_summary, and this
     handler injects it into the next fresh session.
     """
-    # Load persisted context from hooks.json (written by register_hook MCP tool)
+    # Pure, cannot raise, so it may sit outside the try below.
     hook_id = session_key.removeprefix(_HOOK_SESSION_PREFIX)
-    saved_context = await asyncio.to_thread(_load_hook_context, hook_id)
-    if saved_context:
-        message = (
-            f"=== Restored Context (from prior session) ===\n"
-            f"{saved_context}\n"
-            f"=== End Restored Context ===\n\n"
-            f"{message}"
-        )
 
     started_at = time.time()
     result_text = ""
     outcome = "completed"
     detail = ""
     try:
+        # Loading the persisted context (written by the register_hook MCP tool)
+        # is INSIDE the try because the caller's permit and the in-flight claim
+        # are released only by this function's finally. A corrupt or unreadable
+        # hooks.json, an OSError out of the worker thread, or a cancellation
+        # while this await is pending used to escape before the try was entered
+        # -- and then neither was ever given back. Six of those wedge the
+        # endpoint at 429 `capacity_reached` permanently and one wedges that
+        # session key at 409 `session_busy`, until the gateway restarts, which
+        # contradicts the invariants stated above at the semaphore and at
+        # `_hook_inflight_sessions`. A failure here now lands in the `except
+        # Exception` leg and is recorded as an `error` run instead of vanishing.
+        saved_context = await asyncio.to_thread(_load_hook_context, hook_id)
+        if saved_context:
+            message = (
+                f"=== Restored Context (from prior session) ===\n"
+                f"{saved_context}\n"
+                f"=== End Restored Context ===\n\n"
+                f"{message}"
+            )
+
         result_text = await asyncio.wait_for(
             _run_hook_inner(state, session_key, message, agent), timeout=timeout_secs
         )
