@@ -71,13 +71,47 @@ carried, per the campaign scope ("原有 SOQL / reports / Bulk / Apex … 一律
 
 The live transport is the W01 · L09 executor
 (`connections.control_plane.executor.execute` / `PageWalk`), composed with real
-vault custody + HTTP by `connections.control_plane.production`. It is **injected**
-at connector construction — the framework's own dependency-injection seam, the
-same one `production.py` fills — not a second HTTP client and not a permanent
-bypass hook; the real production assembly supplies the real executor. When no
-transport is wired, `fetch` / `detect_changes` **refuse** (fail-closed) rather
-than returning a partial or mocked dataset.
+vault custody + HTTP by `connections.control_plane.production`. The vendor-owned
+request-shaping and result-decoding it injects live in
+`connections/vendors/salesforce/transport.py` (owned): a `RequestLocator` that
+turns each operation + its args into one `https` `HttpRequest` (credential-free
+headers — the transport adds `Authorization`), and a `ResultDecode` per
+operation — SOQL query/query-more (a `CollectionPayload` whose cursor is the real
+`nextRecordsUrl`), Analytics report (a bounded snapshot, no cursor), sObject
+describe (an `ObjectPayload`).
 
-The executor slice (`feat/connector-control-plane-executor`) is a separate stack
-branch; final production factory registration and the executor-backed `fetch`
-body land as that dependency stabilises and is threaded beneath this slice.
+`fetch` is **real**, not a stub: it drives describe → FLS-gated SOQL → a real
+`PageWalk` over the L1 query-locator (SOQL path), or runs the Analytics report
+(report path), converts every vendor payload into a typed row, advances the
+`SystemModstamp` watermark, and returns `(text, meta)` with each row's
+`ProviderResourceRef` under `meta['rows']`. `detect_changes` issues a bounded
+one-row probe past the watermark (SOQL) / reports changed (report full-snapshot).
+The executor is reached through an **injected `SalesforceCallRunner`** the factory
+composes (vault custody, handle issuance, binding resolution, per-operation
+transport) — the connector holds no secret and composes no transport. When no
+runner is wired, `fetch`/`detect_changes` refuse fail-closed (a mock is not a
+live read).
+
+## ACL persistence is a shared ingest-path dependency (not this slice's to own)
+
+`render_row_metadata` produces the `salesforce` `ProviderResourceRef`
+(`instanceUrl`/`sobjectType`/`recordId`/`reportId`/`fieldSet`) for every row, and
+`fetch` carries it under `meta['rows']`. Persisting it via
+`store.set_item_acl(resource_ref=..., managed=True)` requires an **ingest→ACL
+bridge** that does not exist yet: the ingest pipeline (`ingest_text`) returns a
+job id, not item ids, and calls `set_item_acl` nowhere. That bridge is the shared
+store/ingest owner's (chat408), not this slice. Until it lands, a Salesforce
+managed item's grant is unpersisted → the query-time gate denies it (fail-closed,
+the correct posture); this slice invents no grant and, with field-/object-level
+permission unknown, selects no field / emits no query.
+
+## Report identity is a real record id or snapshot hash — never the grid ordinal
+
+A Salesforce Analytics report result is a fact grid ordered by the report's
+`sortBy`, capped at the first 2000 rows, and a re-run reflects current data (rows
+added/removed/**re-sorted**) — so the grid ordinal is not a stable identity
+(search-snippet corroborated; official pages 403). A `ReportRow`'s identity is the
+real record Id from an id detail-column's `dataCells[*].value` when present, else
+a content snapshot hash (`is_snapshot_identity`, a bounded full-snapshot
+full-replaced each refresh). The 2000-row cap and `allData=false` truncation are
+refused. `row_ordinal` is display-only, in no key or checkpoint.
