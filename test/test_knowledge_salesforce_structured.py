@@ -29,6 +29,7 @@ from kiro_crew.knowledge.connectors.salesforce_structured import (
     ENTITY_SOBJECT_RECORD,
     PATH_ANALYTICS_REPORT,
     PATH_SOQL_OBJECT,
+    REPORT_MAX_ROWS,
     SOURCE_TYPE,
     Checkpoint,
     ReportRow,
@@ -183,8 +184,38 @@ class TestFlsGating(unittest.TestCase):
 
 
 # ── Analytics report path: grid → rows, independence from SOQL ─────────────
-def _report_payload():
+def _report_payload_with_id():
+    # Detail columns include a record Id column; the id lives in dataCells[*].value.
     return {
+        "allData": True,
+        "reportMetadata": {"detailColumns": ["ACCOUNT.ID", "ACCOUNT.NAME", "AMOUNT"]},
+        "factMap": {
+            "T!T": {
+                "rows": [
+                    {
+                        "dataCells": [
+                            {"value": "001A00000000001", "label": "001A00000000001"},
+                            {"label": "Acme"},
+                            {"label": "$100"},
+                        ]
+                    },
+                    {
+                        "dataCells": [
+                            {"value": "001B00000000002", "label": "001B00000000002"},
+                            {"label": "Globex"},
+                            {"label": "$200"},
+                        ]
+                    },
+                ]
+            }
+        },
+    }
+
+
+def _report_payload_no_id():
+    # A summary/aggregate report with no record-id column -> snapshot identity.
+    return {
+        "allData": True,
         "reportMetadata": {"detailColumns": ["ACCOUNT.NAME", "AMOUNT"]},
         "factMap": {
             "T!T": {
@@ -197,63 +228,80 @@ def _report_payload():
     }
 
 
+def _report_rows(payload, report_id="00O000000000001"):
+    return report_rows_from_payload(
+        report_id,
+        payload,
+        source_id=SRC,
+        instance_url=INSTANCE,
+        org_id=ORG,
+        fetched_at=NOW,
+    )
+
+
 class TestReportRows(unittest.TestCase):
-    def test_report_grid_becomes_ordered_rows(self):
-        rows = report_rows_from_payload(
-            "00O000000000001",
-            _report_payload(),
-            source_id=SRC,
-            instance_url=INSTANCE,
-            org_id=ORG,
-            fetched_at=NOW,
-        )
+    def test_report_grid_becomes_rows(self):
+        rows = _report_rows(_report_payload_with_id())
         self.assertEqual(len(rows), 2)
         self.assertIsInstance(rows[0], ReportRow)
-        self.assertEqual(rows[0].row_ordinal, 0)
-        self.assertEqual(rows[0].columns, ("ACCOUNT.NAME", "AMOUNT"))
-        self.assertEqual(rows[0].cells, ("Acme", "$100"))
-        self.assertEqual(rows[1].row_ordinal, 1)
+        self.assertEqual(rows[0].columns, ("ACCOUNT.ID", "ACCOUNT.NAME", "AMOUNT"))
+        self.assertEqual(rows[0].cells, ("001A00000000001", "Acme", "$100"))
 
-    def test_report_row_key_is_report_and_ordinal(self):
-        rows = report_rows_from_payload(
-            "00O000000000001",
-            _report_payload(),
-            source_id=SRC,
-            instance_url=INSTANCE,
-            org_id=ORG,
-            fetched_at=NOW,
-        )
+    def test_identity_is_real_record_id_not_ordinal(self):
+        rows = _report_rows(_report_payload_with_id())
+        self.assertFalse(rows[0].is_snapshot_identity)
+        self.assertEqual(rows[0].record_id, "001A00000000001")
+        self.assertEqual(rows[0].report_row_key, "001A00000000001")
         pk = rows[0].primary_key
         self.assertIn(PATH_ANALYTICS_REPORT, pk)
         self.assertIn(ENTITY_REPORT_ROW, pk)
-        self.assertIn("00O000000000001/0", pk)
+        self.assertIn("001A00000000001", pk)
         self.assertNotEqual(rows[0].primary_key, rows[1].primary_key)
+
+    def test_resort_does_not_change_identity(self):
+        # A re-sort between refreshes must not churn identities: record-id keys
+        # are order-independent.
+        p = _report_payload_with_id()
+        keys_a = {r.primary_key for r in _report_rows(p)}
+        p["factMap"]["T!T"]["rows"].reverse()
+        keys_b = {r.primary_key for r in _report_rows(p)}
+        self.assertEqual(keys_a, keys_b)
+
+    def test_no_id_column_uses_snapshot_hash_not_ordinal(self):
+        rows = _report_rows(_report_payload_no_id())
+        self.assertTrue(rows[0].is_snapshot_identity)
+        self.assertIsNone(rows[0].record_id)
+        self.assertTrue(rows[0].report_row_key.startswith("snap-"))
+        # identical content in two reads yields the same snapshot key (stable)
+        rows2 = _report_rows(_report_payload_no_id())
+        self.assertEqual(rows[0].report_row_key, rows2[0].report_row_key)
 
     def test_report_path_refuses_a_record_list(self):
         # A SOQL page (records list, no reportMetadata) must NOT parse as a report.
         with self.assertRaises(SalesforceLineageError):
-            report_rows_from_payload(
-                "00O000000000001",
-                query_page_first(),
-                source_id=SRC,
-                instance_url=INSTANCE,
-                org_id=ORG,
-                fetched_at=NOW,
-            )
+            _report_rows(query_page_first())
+
+    def test_truncated_report_is_refused(self):
+        p = _report_payload_with_id()
+        p["allData"] = False
+        with self.assertRaises(SalesforceLineageError):
+            _report_rows(p)
+
+    def test_over_cap_is_refused(self):
+        p = _report_payload_no_id()
+        p["factMap"]["T!T"]["rows"] = [
+            {"dataCells": [{"label": f"r{i}"}, {"label": "$1"}]} for i in range(REPORT_MAX_ROWS + 1)
+        ]
+        with self.assertRaises(SalesforceLineageError):
+            _report_rows(p)
 
     def test_report_lineage_has_report_id_not_sobject(self):
-        rows = report_rows_from_payload(
-            "00O000000000001",
-            _report_payload(),
-            source_id=SRC,
-            instance_url=INSTANCE,
-            org_id=ORG,
-            fetched_at=NOW,
-        )
+        rows = _report_rows(_report_payload_with_id())
         lin = rows[0].lineage
         self.assertEqual(lin.report_id, "00O000000000001")
         self.assertIsNone(lin.sobject_type)
         self.assertIsNone(lin.record_id)
+        self.assertEqual(lin.report_row_key, "001A00000000001")
 
 
 # ── rendering + ProviderResourceRef metadata ───────────────────────────────
@@ -270,18 +318,22 @@ class TestRendering(unittest.TestCase):
         self.assertIn("Name", rr["locator"]["fieldSet"])
 
     def test_report_metadata_carries_report_resource_ref(self):
-        rows = report_rows_from_payload(
-            "00O000000000001",
-            _report_payload(),
-            source_id=SRC,
-            instance_url=INSTANCE,
-            org_id=ORG,
-            fetched_at=NOW,
-        )
+        # A snapshot (no-id) report row: resource_id is the report id.
+        rows = _report_rows(_report_payload_no_id())
         rr = render_row_metadata(rows[0])["resource_ref"]
         self.assertEqual(rr["resource_id"], "00O000000000001")
         self.assertEqual(rr["locator"]["reportId"], "00O000000000001")
         self.assertNotIn("sobjectType", rr["locator"])
+        self.assertTrue(rr["locator"]["reportRowKey"].startswith("snap-"))
+
+    def test_report_metadata_with_record_id_carries_record_locator(self):
+        # An id-bearing report row: the real record id rides the locator so the
+        # item can be revalidated as that record, and is the resource_id.
+        rows = _report_rows(_report_payload_with_id())
+        rr = render_row_metadata(rows[0])["resource_ref"]
+        self.assertEqual(rr["resource_id"], "001A00000000001")
+        self.assertEqual(rr["locator"]["recordId"], "001A00000000001")
+        self.assertEqual(rr["locator"]["reportId"], "00O000000000001")
 
     def test_text_projection_is_legible(self):
         text = render_row_text(mk_record())

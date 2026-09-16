@@ -15,11 +15,14 @@ the other:
   query-locator contract (``{done, records, nextRecordsUrl}``). One row per
   record; the record's ``Id`` is its entity key.
 * **Report / Analytics path** -- a report is discovered and read through the
-  Analytics REST API (``/analytics/reports/{id}``), whose result shape is a fact
-  grid, NOT a record list. It is a genuinely different endpoint, response shape,
-  and identity (a report id + row ordinal within a described column set), and it
-  is read on its OWN path. A SOQL ``SELECT`` against the report's source object
-  is NOT a report and this connector never substitutes one for the other.
+  Analytics REST API (``/analytics/reports/{id}``), whose result is a fact grid,
+  NOT a record list. It is a genuinely different endpoint, response shape, and
+  identity, read on its OWN path. A row's identity is the real RECORD ID in its
+  detail cells when the report exposes an id column; otherwise the report is a
+  bounded (<=2000-row) full-snapshot and each row is keyed by a content hash --
+  NEVER the grid ordinal, which re-sorts/adds/removes between refreshes. A SOQL
+  ``SELECT`` against the report's source object is NOT a report and this
+  connector never substitutes one for the other.
 
 What it owns, and what it borrows
 ---------------------------------
@@ -67,6 +70,7 @@ functions this module exposes and their tests regardless.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -141,10 +145,21 @@ class SalesforceRowLineage:
 
     ``source_id`` + ``instance_url`` + ``org_id`` + ``path`` + ``entity_type``
     are the key DOMAIN -- the qualifiers that keep two records sharing an entity
-    key (the same 15-char id in two orgs, row ordinal 0 of two reports) from
-    colliding when they belong to different sources, orgs, paths or kinds. The
-    entity key (record id / ``report_id/ordinal``) is appended by
-    :func:`primary_key_for`.
+    key from colliding when they belong to different sources, orgs, paths or
+    kinds. The entity key is appended by :func:`primary_key_for`.
+
+    **Report identity is NOT the ordinal.** A Salesforce Analytics report result
+    is a fact grid ordered by the report's own ``sortBy`` and capped at the first
+    2000 rows; a re-run reflects CURRENT data, so rows are added, removed and
+    RE-SORTED between refreshes and grid position N is not the same logical row
+    across two reads (search-snippet corroborated; official pages 403). So a
+    report row's entity key is the real RECORD ID carried in its detail cells
+    when the report exposes one (``report_id/<recordId>``); when it exposes none,
+    the row has no stable per-row identity and the report is a bounded
+    full-snapshot whose row key is ``report_id/<snapshot_hash>`` -- content
+    identity within one snapshot, never a grid ordinal. ``report_row_key`` holds
+    that entity key. The ordinal is kept on the row for display order ONLY and is
+    never part of any key or checkpoint.
 
     ``resource_ref`` fields are the shared-ACL ``ProviderResourceRef`` locator
     (``salesforce: {instanceUrl, sobjectType, recordId, [reportId],
@@ -164,6 +179,9 @@ class SalesforceRowLineage:
     sobject_type: Optional[str]
     record_id: Optional[str]
     report_id: Optional[str]
+    # The report row's stable entity key (real record id, or snapshot content
+    # hash) -- NEVER the grid ordinal. None on the SOQL path.
+    report_row_key: Optional[str]
     field_set: Tuple[str, ...]
     fetched_at: str
 
@@ -195,11 +213,18 @@ class SalesforceRowLineage:
                 raise SalesforceLineageError(
                     "a soql_object row needs both sobject_type and record_id"
                 )
-            if self.report_id:
-                raise SalesforceLineageError("a soql_object row must not carry a report_id")
+            if self.report_id or self.report_row_key:
+                raise SalesforceLineageError(
+                    "a soql_object row must not carry a report_id/report_row_key"
+                )
         else:  # PATH_ANALYTICS_REPORT
             if not (self.report_id or "").strip():
                 raise SalesforceLineageError("an analytics_report row needs a report_id")
+            if not (self.report_row_key or "").strip():
+                raise SalesforceLineageError(
+                    "an analytics_report row needs a report_row_key (real record id or "
+                    "snapshot hash) -- the grid ordinal is not a stable identity"
+                )
             if self.sobject_type or self.record_id:
                 raise SalesforceLineageError(
                     "an analytics_report row must not carry sobject_type/record_id"
@@ -234,17 +259,26 @@ class SObjectRecordRow:
 class ReportRow:
     """One row of a Salesforce Analytics report (the report path).
 
-    A report's result is a fact grid, not a record list, so a row's identity is
-    the report id plus its ORDINAL within the described, ordered column set --
-    there is no per-row provider id to key on. ``columns`` names the report's
-    detail-column labels in order; ``cells`` are this row's values in that same
-    order. Keying on the ordinal is why a report refresh is a full re-read
-    (see :func:`diff_rows`): a report has no stable per-row id to diff by.
+    A report's result is a fact grid, NOT a record list, and its rows are ordered
+    by the report's ``sortBy`` and capped at the first 2000 rows; a re-run
+    reflects current data, so rows are added/removed/re-sorted between refreshes.
+    A grid ORDINAL is therefore not a stable identity.
+
+    Identity is ``report_row_key``: the real RECORD ID carried in the row's
+    detail cells when the report exposes an id column, else a content
+    ``snapshot_hash`` of the row within one snapshot. ``is_snapshot_identity``
+    says which -- when True the whole report is a bounded full-snapshot with no
+    per-row incremental identity (each refresh full-replaces the source's report
+    items). ``row_ordinal`` is kept for DISPLAY ORDER only and is never part of
+    any key or checkpoint.
     """
 
-    PRIMARY_KEY_FIELDS = ("report_id", "row_ordinal")
+    PRIMARY_KEY_FIELDS = ("report_id", "report_row_key")
 
     report_id: str
+    report_row_key: str
+    is_snapshot_identity: bool
+    record_id: Optional[str]
     row_ordinal: int
     columns: Tuple[str, ...]
     cells: Tuple[Any, ...]
@@ -298,6 +332,7 @@ def _make_soql_lineage(
         sobject_type=sobject_type,
         record_id=record_id,
         report_id=None,
+        report_row_key=None,
         field_set=tuple(field_set),
         fetched_at=fetched_at,
     )
@@ -311,7 +346,7 @@ def _make_report_lineage(
     instance_url: str,
     org_id: str,
     report_id: str,
-    row_ordinal: int,
+    report_row_key: str,
     fetched_at: str,
 ) -> SalesforceRowLineage:
     primary_key = _PK_SEP.join(
@@ -321,7 +356,7 @@ def _make_report_lineage(
             org_id,
             PATH_ANALYTICS_REPORT,
             ENTITY_REPORT_ROW,
-            f"{report_id}/{row_ordinal}",
+            f"{report_id}/{report_row_key}",
         )
     )
     lineage = SalesforceRowLineage(
@@ -334,6 +369,7 @@ def _make_report_lineage(
         sobject_type=None,
         record_id=None,
         report_id=report_id,
+        report_row_key=report_row_key,
         field_set=(),
         fetched_at=fetched_at,
     )
@@ -382,6 +418,34 @@ def record_from_payload(
     )
 
 
+#: The Analytics Reports API returns at most the first 2000 report rows; more is
+#: officially unsupported (search-snippet corroborated). A payload exceeding this
+#: is vendor drift the caller must see, not silently truncate.
+REPORT_MAX_ROWS = 2000
+
+#: The report detail columns whose value is a stable Salesforce record id. When a
+#: report exposes one of these, its per-row ``value`` is the row's real identity;
+#: otherwise the report has no stable per-row id and is a bounded full-snapshot.
+_RECORD_ID_COLUMNS = frozenset(
+    {"Id", "CONTACT_ID", "ACCOUNT_ID", "USER_ID", "OPPORTUNITY_ID", "LEAD_ID", "CASE_ID"}
+)
+
+
+def _report_id_column_index(columns: Sequence[str]) -> Optional[int]:
+    """Index of the detail column that carries a stable record id, or None.
+
+    Matches a column whose name is (or ends in) a known id column -- Salesforce
+    detail-column API names are dotted (``Contact.Id``), so the last dotted
+    segment is compared. None when the report exposes no id column, which puts
+    the report on the snapshot-identity path.
+    """
+    for i, col in enumerate(columns):
+        tail = str(col).rsplit(".", 1)[-1].upper()
+        if tail == "ID" or tail in _RECORD_ID_COLUMNS or str(col).upper() in _RECORD_ID_COLUMNS:
+            return i
+    return None
+
+
 def report_rows_from_payload(
     report_id: str,
     payload: Mapping[str, Any],
@@ -391,15 +455,27 @@ def report_rows_from_payload(
     org_id: str,
     fetched_at: str,
 ) -> Tuple[ReportRow, ...]:
-    """Convert an Analytics report result payload into ordered :class:`ReportRow` s.
+    """Convert an Analytics report result payload into :class:`ReportRow` s.
 
     The Analytics REST report result is a fact grid: ``reportMetadata.
     detailColumns`` is the ordered detail-column set, and
-    ``factMap["T!T"].rows[*].dataCells[*].label`` are the cell values in that
-    order. This reads that shape into one :class:`ReportRow` per grid row, keyed
-    by ordinal. A payload that is not a report result (no ``reportMetadata`` /
+    ``factMap["T!T"].rows[*].dataCells[*]`` are the row's cells (a cell carries a
+    display ``label`` and, for an id/reference column, the underlying record
+    ``value``). A payload that is not a report result (no ``reportMetadata`` /
     ``factMap``) raises rather than being coerced -- the report path never
     accepts an sObject record list in a report's place.
+
+    **Identity is NOT the grid ordinal** (rows re-sort/add/remove between
+    refreshes). When the report exposes a record-id detail column, that column's
+    per-row ``value`` is the row's ``report_row_key`` (real record identity, so a
+    refresh diffs by identity). When it exposes none, each row's key is a content
+    ``snapshot_hash`` and the whole report is a bounded full-snapshot (each
+    refresh full-replaces the source's report items). The ordinal is kept for
+    display order only.
+
+    Enforces the API's ``REPORT_MAX_ROWS`` (2000) cap and refuses a payload that
+    reports itself truncated (``allData`` false) rather than storing a partial
+    report as if complete.
     """
     meta = payload.get("reportMetadata")
     fact_map = payload.get("factMap")
@@ -408,27 +484,68 @@ def report_rows_from_payload(
             "report payload missing reportMetadata/factMap; a SOQL record list is "
             "not a report result and must not be read as one"
         )
+    # allData is present on a report-run result: False means the report exceeded
+    # the row cap and the payload is only the first page -- a partial snapshot,
+    # which must not be stored as a complete one.
+    all_data = payload.get("allData")
+    if all_data is False:
+        raise SalesforceLineageError(
+            "report result reports allData=false (truncated beyond the 2000-row API "
+            "cap); refusing to store a partial report snapshot as complete"
+        )
     columns = tuple(str(c) for c in (meta.get("detailColumns") or ()))
+    id_col = _report_id_column_index(columns)
     # The grand-total fact-map key for a report's detail rows.
     grid = fact_map.get("T!T") or {}
     raw_rows = grid.get("rows") if isinstance(grid, Mapping) else None
     if not isinstance(raw_rows, list):
         raw_rows = []
+    if len(raw_rows) > REPORT_MAX_ROWS:
+        raise SalesforceLineageError(
+            f"report returned {len(raw_rows)} rows, over the {REPORT_MAX_ROWS}-row API "
+            "cap; narrow the report with filters rather than storing a partial set"
+        )
     out: list[ReportRow] = []
     for ordinal, raw in enumerate(raw_rows):
         cells_raw = raw.get("dataCells") if isinstance(raw, Mapping) else None
-        cells = tuple((c.get("label") if isinstance(c, Mapping) else c) for c in (cells_raw or ()))
+        cells_raw = list(cells_raw or ())
+        cells = tuple((c.get("label") if isinstance(c, Mapping) else c) for c in cells_raw)
+        record_id: Optional[str] = None
+        if id_col is not None and id_col < len(cells_raw):
+            cell = cells_raw[id_col]
+            # A record-id column carries the id in ``value`` (the label may be a
+            # display name); fall back to the label only if value is absent.
+            raw_id = cell.get("value") if isinstance(cell, Mapping) else None
+            if raw_id is None and isinstance(cell, Mapping):
+                raw_id = cell.get("label")
+            if isinstance(raw_id, str) and raw_id.strip():
+                record_id = raw_id.strip()
+        if record_id is not None:
+            report_row_key = record_id
+            is_snapshot = False
+        else:
+            # No stable per-row id: content hash of this row within the snapshot.
+            # NOT the ordinal -- two identical rows collapse (last-writer-wins in
+            # the diff), and a re-sorted-but-unchanged row keeps its key.
+            digest = hashlib.sha256(
+                json.dumps([columns, cells], sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
+            report_row_key = f"snap-{digest}"
+            is_snapshot = True
         lineage = _make_report_lineage(
             source_id=source_id,
             instance_url=instance_url,
             org_id=org_id,
             report_id=report_id,
-            row_ordinal=ordinal,
+            report_row_key=report_row_key,
             fetched_at=fetched_at,
         )
         out.append(
             ReportRow(
                 report_id=report_id,
+                report_row_key=report_row_key,
+                is_snapshot_identity=is_snapshot,
+                record_id=record_id,
                 row_ordinal=ordinal,
                 columns=columns,
                 cells=cells,
@@ -658,7 +775,16 @@ def render_row_metadata(row: TypedRow) -> dict:
         resource_id = lin.record_id or ""
     else:
         locator["reportId"] = lin.report_id
-        resource_id = lin.report_id or ""
+        # When the report exposed a real record id for this row, carry it so the
+        # item can be revalidated as that record; otherwise the row is a report
+        # snapshot with no per-record locator (revalidated at report grain).
+        if isinstance(row, ReportRow) and row.record_id:
+            locator["recordId"] = row.record_id
+        if lin.report_row_key:
+            locator["reportRowKey"] = lin.report_row_key
+        resource_id = (
+            row.record_id if isinstance(row, ReportRow) and row.record_id else (lin.report_id or "")
+        )
     return {
         "primary_key": row.primary_key,
         "source_id": lin.source_id,
@@ -825,6 +951,7 @@ __all__ = [
     "SOURCE_TYPE",
     "PATH_SOQL_OBJECT",
     "PATH_ANALYTICS_REPORT",
+    "REPORT_MAX_ROWS",
     "ENTITY_SOBJECT_RECORD",
     "ENTITY_REPORT_ROW",
     "Checkpoint",
