@@ -90,6 +90,8 @@ from .base import BaseConnector
 if TYPE_CHECKING:
     from kiro_crew.connections.control_plane.executor import ExecutionOutcome, PageWalk
     from kiro_crew.connections.control_plane.operation import OperationDescriptor
+    from kiro_crew.knowledge.acl import ProviderResourceRef
+    from kiro_crew.knowledge.rows import SourceRow
 
 # ── the knowledge source_type this connector answers to ────────────────────
 SOURCE_TYPE = "salesforce"
@@ -810,6 +812,51 @@ def render_row_metadata(row: TypedRow) -> dict:
     }
 
 
+def row_resource_ref(row: TypedRow) -> "ProviderResourceRef":
+    """Build the shared-ACL :class:`acl.ProviderResourceRef` for one row.
+
+    Reuses :func:`render_row_metadata`'s locator so the ref persisted on the
+    grant is exactly the one a query-time probe resolves. ``account`` is the
+    vendor-side org, the (provider, account) pair a per-candidate binding
+    resolver keys on.
+    """
+    from kiro_crew.knowledge.acl import ProviderResourceRef
+
+    rr = render_row_metadata(row)["resource_ref"]
+    return ProviderResourceRef(
+        provider=rr["provider"],
+        account=rr["account"],
+        resource_id=rr["resource_id"],
+        locator=rr["locator"],
+    )
+
+
+def to_source_row(row: TypedRow) -> "SourceRow":
+    """Convert one typed row into a shared :class:`rows.SourceRow` (managed).
+
+    Each row carries ITS OWN grant -- never merged with another row's -- so
+    different-permission rows never share an item/chunk. ``subjects`` is
+    **fail-closed**: Salesforce per-record subject sharing (org-wide defaults,
+    sharing rules, manual shares) is NOT determinable from an offline describe or
+    a record read, so the ingest-time grant is the EMPTY tuple -- an explicit
+    deny-all, never :data:`acl.PUBLIC_SUBJECT` and never a blank default. A real
+    subject set is established at QUERY time by the shared revalidation hook
+    (chat408) against the provider; until then a managed row is denied, which is
+    the correct posture. ``tenant`` is the vendor org id (non-empty). ``text`` is
+    this row's own projection only.
+    """
+    from kiro_crew.knowledge.rows import SourceRow
+
+    return SourceRow(
+        key=row.primary_key,
+        text=render_row_text(row),
+        subjects=(),  # fail-closed deny; NEVER PUBLIC, NEVER a blank default
+        tenant=row.lineage.org_id,
+        resource_ref=row_resource_ref(row),
+        title=row.primary_key,
+    )
+
+
 # ── config validation for a source ─────────────────────────────────────────
 @dataclass(frozen=True)
 class SourceSpec:
@@ -1038,21 +1085,17 @@ class SalesforceStructuredConnector(BaseConnector):
         outcome = await runner.run(soql_query_descriptor(), args)
         return len(_outcome_items(outcome)) > 0
 
-    async def fetch(self, source: dict) -> tuple[str, dict]:
-        """Live read of one source, rendered into the ingest ``(text, meta)`` shape.
+    async def _collect_rows(self, source: dict) -> "tuple[list[TypedRow], SourceSpec, Checkpoint]":
+        """Live-read one source into typed rows + its advanced checkpoint.
 
+        The shared collection path both :meth:`fetch` and :meth:`fetch_rows` use.
         SOQL object path: describe -> FLS-gated SOQL -> a real
-        :class:`PageWalk` over the L1 query-locator, converting every record to a
-        typed row. Report path: run the Analytics report (bounded <=2000-row
-        snapshot) and convert its fact grid. Every row renders to a stable text
-        projection and metadata carrying the ``ProviderResourceRef``; the rows'
-        combined text is returned for the pipeline to chunk and store, and the
-        per-row metadata (including each row's resource ref) travels in ``meta``
-        under ``rows`` so a downstream ACL hook can persist it per item.
-
-        Fail-closed: an unauthorized/failed read raises; an FLS-unreadable field
-        or unqueryable object is never selected; a report over the row cap or a
-        truncated report is refused by the converter.
+        :class:`PageWalk` over the L1 query-locator (incremental: a ``since``
+        watermark, advanced past the max ``SystemModstamp`` seen). Report path:
+        run the Analytics report (a bounded <=2000-row full snapshot, no
+        watermark). Fail-closed: an unauthorized/failed read raises; an
+        FLS-unreadable field or unqueryable object is never selected; a report
+        over the cap or a truncated report is refused by the converter.
         """
         runner = self._require_runner()
         spec = parse_source_spec(source)
@@ -1063,9 +1106,7 @@ class SalesforceStructuredConnector(BaseConnector):
 
         rows: list[TypedRow] = []
         if spec.path == PATH_SOQL_OBJECT:
-            from kiro_crew.connections.vendors.salesforce.transport import (
-                soql_query_descriptor,
-            )
+            from kiro_crew.connections.vendors.salesforce.transport import soql_query_descriptor
 
             describe = await self._describe(runner, spec, source)
             checkpoint = read_checkpoint(source)
@@ -1097,7 +1138,6 @@ class SalesforceStructuredConnector(BaseConnector):
                 modstamps=modstamps or None,
                 full_listing=False,
             )
-            # Advance the watermark; the report path has none.
             new_checkpoint = Checkpoint(
                 since=plan.next_since, query_locator=None, in_progress=False
             )
@@ -1122,7 +1162,59 @@ class SalesforceStructuredConnector(BaseConnector):
                 )
             )
             new_checkpoint = Checkpoint(since=None, query_locator=None, in_progress=False)
+        return rows, spec, new_checkpoint
 
+    def supports_rows(self) -> bool:
+        # Salesforce is a STRUCTURED source: every record/report row has its own
+        # identity AND its own per-user ACL, so the sync scheduler must drive the
+        # per-row ingest path (fetch_rows -> ingest_rows -> per-row set_item_acl),
+        # never the single-text-blob path that would collapse many rows' grants
+        # into one chunk.
+        return True
+
+    async def fetch_rows(self, source: dict):
+        """The per-row ingest contract: ``(rows, snapshot, checkpoint)``.
+
+        Each :class:`~kiro_crew.knowledge.rows.SourceRow` carries ITS OWN key,
+        text, ProviderResourceRef and ACL grant, so the shared pipeline writes a
+        distinct ``set_item_acl`` per row and different-permission rows never
+        share a chunk. ``subjects`` is the EMPTY tuple -- a fail-closed deny, not
+        PUBLIC (see :func:`to_source_row`): Salesforce per-record sharing is
+        established at query time by the shared revalidation hook, not inferred
+        here.
+
+        Snapshot semantics differ per path and are NOT shared:
+
+        * **SOQL object path -> incremental (``snapshot=False``)**: a ``since``
+          window returns only changed records, so an absent row is "not changed",
+          never deleted. The checkpoint is the advanced ``SystemModstamp``
+          watermark.
+        * **Report / Analytics path -> full snapshot (``snapshot=True``)**: a
+          report is a bounded <=2000-row re-read with no per-row delta, so a row
+          absent from the snapshot is genuinely gone. No watermark checkpoint.
+
+        The returned ``checkpoint`` is the connector resume token the SHARED sync
+        persists into ``props['checkpoint']`` ONLY after every row's data + ACL
+        landed -- this connector never writes that key itself.
+        """
+        rows, spec, new_checkpoint = await self._collect_rows(source)
+        source_rows = [to_source_row(r) for r in rows]
+        snapshot = spec.path == PATH_ANALYTICS_REPORT  # report=full snapshot; SOQL=incremental
+        checkpoint = None if spec.path == PATH_ANALYTICS_REPORT else new_checkpoint.to_dict()
+        return source_rows, snapshot, checkpoint
+
+    async def fetch(self, source: dict) -> tuple[str, dict]:
+        """Legacy single-blob path (kept for the BaseConnector contract).
+
+        The production ingest for Salesforce goes through :meth:`fetch_rows`
+        (``supports_rows`` is True), which the sync scheduler drives instead of
+        this. ``fetch`` is retained because ``BaseConnector.fetch`` is abstract;
+        it reuses the same live collection and renders the rows to the older
+        ``(text, meta)`` shape, with each row's ProviderResourceRef under
+        ``meta['rows']``. It never merges different-permission rows for storage --
+        the per-row grants live on the ``fetch_rows`` path.
+        """
+        rows, spec, new_checkpoint = await self._collect_rows(source)
         text = "\n\n".join(render_row_text(r) for r in rows)
         meta = {
             "source_type": SOURCE_TYPE,
@@ -1130,11 +1222,9 @@ class SalesforceStructuredConnector(BaseConnector):
             "instance_url": spec.instance_url,
             "org_id": spec.org_id,
             "row_count": len(rows),
-            "fetched_at": fetched_at,
-            # Per-row metadata incl. each row's ProviderResourceRef, for a
-            # downstream ACL hook to persist via store.set_item_acl.
+            # Per-row metadata incl. each row's ProviderResourceRef.
             "rows": [render_row_metadata(r) for r in rows],
-            # The advanced checkpoint, for the scheduler's per-source state write.
+            # The advanced checkpoint (SOQL watermark); the report path has none.
             _CHECKPOINT_KEY: new_checkpoint.to_dict(),
         }
         return text, meta
@@ -1168,6 +1258,8 @@ __all__ = [
     "record_from_payload",
     "render_row_metadata",
     "render_row_text",
+    "row_resource_ref",
+    "to_source_row",
     "report_rows_from_payload",
     "write_checkpoint",
 ]

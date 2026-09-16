@@ -387,3 +387,122 @@ class TestTwoPathTlsFactoryToFetch:
         )
         # report path carries no SOQL watermark
         assert meta["salesforce_structured_checkpoint"]["since"] is None
+
+
+# ── real SyncScheduler ingest: TLS -> fetch_rows -> ingest_rows -> ACL ─────
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+
+from kiro_crew.knowledge.acl import ProviderResourceRef  # noqa: E402
+from kiro_crew.knowledge.ingestion import IngestionPipeline  # noqa: E402
+from kiro_crew.knowledge.store import KnowledgeStore  # noqa: E402
+from kiro_crew.knowledge.sync import SyncScheduler  # noqa: E402
+
+
+def _pipeline(store: KnowledgeStore) -> IngestionPipeline:
+    extractor = MagicMock()
+    extractor._pool = None
+    extractor.extract_batch = AsyncMock(
+        side_effect=lambda chunks: [
+            {"category": "document", "summary": "s", "entities": []} for _ in chunks
+        ]
+    )
+    chunker = MagicMock()
+    chunker.chunk.side_effect = lambda text, **k: [
+        {"content": text, "chunk_index": 0, "section_title": None}
+    ]
+    return IngestionPipeline(
+        store=store, extractor=extractor, chunker=chunker, reader=MagicMock(), embedder=None
+    )
+
+
+class TestSyncSchedulerRealIngest:
+    def test_soql_rows_ingest_with_deny_acl_and_checkpoint(
+        self, trust_loopback, real_vault, tmp_path
+    ):
+        certfile, keyfile = trust_loopback
+        script = {
+            "/services/data/v60.0/sobjects/Account/describe": _b(_DESCRIBE_BODY),
+            "/services/data/v60.0/query": _b(_SOQL_PAGE1),
+            _SOQL_CURSOR_PATH: _b(_SOQL_PAGE2),
+        }
+        server, served, port = _serve(script, certfile, keyfile)
+        store = KnowledgeStore(str(tmp_path / "sf.db"))
+        try:
+            handle = _handle()
+            runner = _runner(handle, real_vault, port)
+            conn = SalesforceStructuredConnector(call_runner=runner)
+            assert conn.supports_rows() is True
+            src = store.add_source(
+                "SF Account",
+                "salesforce",
+                "salesforce://object/Account",
+                properties={"instance_url": f"https://localhost:{port}", "org_id": ORG},
+            )
+            sched = SyncScheduler(store, _pipeline(store), {"salesforce": conn})
+            out = asyncio.run(sched.sync_source(src))
+        finally:
+            server.shutdown()
+            # keep store open for readback below; closed at the end
+        try:
+            # both rows ingested, each its OWN item group + grant
+            assert out["synced"] is True
+            state = store.get_connector_row_state(src)
+            assert len(state) == 2
+            # every grant: managed=True, empty subjects (DENY, fail-closed), the
+            # row's own ProviderResourceRef -- proof ACL was really persisted.
+            item_ids = [state[k]["item_ids"][0] for k in state]
+            grants = store.get_item_grants(item_ids)
+            for iid in item_ids:
+                g = grants[iid]
+                assert g["managed"] is True
+                # empty subjects == explicit deny-all, NOT public
+                assert json.loads(g["subjects"]) == []
+                rr = ProviderResourceRef.from_json(g["resource_ref"])
+                assert rr.provider == "salesforce"
+                assert rr.locator["sobjectType"] == "Account"
+            # props['checkpoint'] written by the SHARED sync ONLY after full
+            # persistence -- its presence is the "ACL landed" signal (SOQL
+            # watermark advanced to the max modstamp).
+            row = store.db.execute("SELECT properties FROM sources WHERE id = ?", (src,)).fetchone()
+            props = json.loads(row["properties"])
+            assert props["checkpoint"]["since"] == "2026-03-01T00:00:00Z"
+        finally:
+            store.close()
+
+    def test_report_rows_ingest_full_snapshot(self, trust_loopback, real_vault, tmp_path):
+        certfile, keyfile = trust_loopback
+        script = {
+            "/services/data/v60.0/analytics/reports/00O000000000001": _b(_REPORT_BODY),
+        }
+        server, served, port = _serve(script, certfile, keyfile)
+        store = KnowledgeStore(str(tmp_path / "sfrep.db"))
+        try:
+            handle = _handle()
+            runner = _runner(handle, real_vault, port)
+            conn = SalesforceStructuredConnector(call_runner=runner)
+            src = store.add_source(
+                "SF Report",
+                "salesforce",
+                "salesforce://report/00O000000000001",
+                properties={"instance_url": f"https://localhost:{port}", "org_id": ORG},
+            )
+            sched = SyncScheduler(store, _pipeline(store), {"salesforce": conn})
+            out = asyncio.run(sched.sync_source(src))
+        finally:
+            server.shutdown()
+        try:
+            assert out["synced"] is True
+            state = store.get_connector_row_state(src)
+            assert len(state) == 2  # two report rows, each its own grant
+            item_ids = [state[k]["item_ids"][0] for k in state]
+            grants = store.get_item_grants(item_ids)
+            for iid in item_ids:
+                g = grants[iid]
+                assert g["managed"] is True
+                assert json.loads(g["subjects"]) == []  # deny, not public
+                assert (
+                    ProviderResourceRef.from_json(g["resource_ref"]).locator["reportId"]
+                    == "00O000000000001"
+                )
+        finally:
+            store.close()
