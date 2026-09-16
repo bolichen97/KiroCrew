@@ -302,16 +302,20 @@ def conditional_write_args(
 # =============================================================================
 # SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult.
 # =============================================================================
-# NOTE ON ROWS (a W01-owned gap, NOT worked around here): W01's OperationResult
-# is a two-member TypedDict -- ``status`` and ``next_cursor`` -- with NO payload
-# slot. The ResultDecode seat is contracted to return that type, so on the real
-# dispatch path a page's ``value`` rows have NOWHERE to go and ARE DROPPED. This
-# module does not invent a side channel to smuggle them out (that would be a
+# NOTE ON ROWS (a W01-owned gap, NOT worked around here): W01's envelope chain
+# has NO data slot anywhere -- ``OperationResult`` is a two-member TypedDict
+# (``status`` / ``next_cursor``), and ``TransportResponse`` / ``ExecutionOutcome``
+# carry no data field either; W01's own ``Decoded2xx`` docstring says it "keeps
+# what OperationResult has no room for", and the loss happens at the ``.result``
+# narrowing. So on the real dispatch path a page's ``value`` rows (and a read's
+# field values) have NOWHERE to go and ARE DROPPED. This module does not invent a
+# side channel, capture the raw reply, or keep a store to smuggle them out (a
 # claim the type cannot back). :class:`DecodedPage` / :func:`decode_page` exist
-# only as a local reading that retains the rows for THIS module's own use; they
-# are NOT on the seat's return path and do NOT deliver rows to a W01 caller. The
-# missing member is W01's to add to ``result.py``; until it does, rows do not
-# reach a caller through this seat.
+# only as a local reading that retains rows for THIS module's own use; they are
+# NOT on the seat's return path and do NOT deliver rows to a W01 caller. Root has
+# handed W01 a single NEUTRAL PAYLOAD SLOT to add (rows / object / bytes + cursor)
+# with permission to change ``result.py`` and bump the schema; until that commit
+# lands, rows do not reach a caller through this seat.
 @dataclass(frozen=True)
 class DecodedPage:
     """A local reading of a 2xx reply that retains the page's rows for this module.
@@ -554,9 +558,17 @@ class DispatchResult:
     """What one authorized ``execute`` hop returns to the orchestrator.
 
     ``outcome`` -- the executor's :class:`ExecutionOutcome` (result / error /
-    precondition / write_outcome). ``body`` -- the decoded reply body for a read
-    (the resource's fields), needed because the L01 result envelope carries no
-    rows; ``None`` for a hop that produced no readable body.
+    precondition / write_outcome). ``body`` -- the resource's field values for a
+    READ hop, when the dispatch can supply them.
+
+    On the SHIPPED path today ``body`` is ``None``: W01's envelope chain
+    (``OperationResult`` / ``TransportResponse`` / ``ExecutionOutcome``) carries
+    NO data slot -- W01's own ``Decoded2xx`` docstring says it "keeps what
+    OperationResult has no room for", and the loss happens at ``.result``. Root
+    has handed W01 a single neutral payload slot to add; until that commit lands,
+    a production dispatch has nowhere the fields can legitimately arrive, and this
+    module does NOT smuggle them around the envelope. A test may inject a
+    ``Dispatch`` that supplies ``body`` to exercise the field-level steps.
     """
 
     outcome: ExecutionOutcome
@@ -585,20 +597,25 @@ def build_graph_write_dispatch(
     :func:`graph_500_unknown_transport` wrapper and W01's real
     :func:`~kiro_crew.connections.control_plane.production.urllib_http_send`, then
     returns a :class:`Dispatch` that runs ONE ``execute`` per call. Every hop
-    therefore passes W01's custody, pre-send gates, trusted-binding identity and
+    passes W01's custody, pre-send gates, trusted-binding identity and
     unknown-outcome mapping; nothing here issues a raw send or touches a secret.
 
-    The returned dispatch reads the reply BODY via a capturing wrapper around
-    W01's sender -- it only RECORDS the reply W01's transport already produced, so
-    it bypasses nothing (``http_send`` is a seat W01 itself parameterizes). The
-    body is needed for the baseline / read-back field comparison; the L01 result
-    envelope has no payload slot (the rows gap is W01's, see the SEAT 2 note), so
-    the fields are read from the recorded reply, never smuggled through the seat.
+    ``DispatchResult.body`` is ``None`` on this path. The resource FIELD values
+    the orchestrator's baseline / read-back steps compare are not on W01's
+    envelope chain -- ``OperationResult`` / ``TransportResponse`` /
+    ``ExecutionOutcome`` have no data slot (W01's own source admits this), so
+    there is nowhere the fields can legitimately arrive yet. This module does NOT
+    capture the raw reply, keep a side store, or otherwise smuggle the body around
+    the envelope. The field-level baseline/read-back verification therefore WAITS
+    for W01's neutral payload slot; when that commit lands, this entry reads the
+    fields from the envelope and fills ``body``. Until then the version / If-Match
+    / 412 / 500-unknown dispositions all run through ``execute`` here; the
+    field-level checks conservatively report unverified rather than acting on data
+    obtained by a bypass.
 
     ``handle`` / ``selector`` / ``permitted`` / ``layers`` are W01 types passed in
     by the composing caller (kept as ``Any`` here so this vendor module does not
-    re-import W01's whole type surface). ``now`` is for a deterministic test only;
-    unset uses ``execute``'s own server clock.
+    re-import W01's whole type surface). ``now`` is for a deterministic test only.
 
     NOTE: W01's auth chain (L03 auth-code, L04 rotation fencing,
     principal->binding) is NOT complete and carries reported gaps; this entry
@@ -613,26 +630,18 @@ def build_graph_write_dispatch(
         urllib_http_send,
     )
 
-    _captured: dict = {"reply": None}
-
-    def _capturing_send(request: HttpRequest, **kw: Any) -> HttpReply:
-        reply = urllib_http_send(request, **kw)
-        _captured["reply"] = reply
-        return reply
-
     locator = functools.partial(graph_request_locator, endpoint_host=endpoint_host)
     transport = graph_500_unknown_transport(
         build_production_transport(
             selector=selector,
             vault=vault,
             locator=locator,
-            http_send=_capturing_send,
+            http_send=urllib_http_send,
             decode=graph_result_decode,
         )
     )
 
     def _dispatch(request_args: Mapping[str, Any]) -> DispatchResult:
-        _captured["reply"] = None
         outcome = _execute(
             descriptor,
             handle,
@@ -645,13 +654,11 @@ def build_graph_write_dispatch(
             governance_item=governance_item,
             request_args=request_args,
         )
-        reply = _captured["reply"]
-        body: Optional[Mapping[str, Any]] = None
-        if reply is not None and 200 <= reply.status < 300:
-            parsed = _json_or_none(reply.body)
-            if isinstance(parsed, Mapping):
-                body = parsed
-        return DispatchResult(outcome=outcome, body=body)
+        # body stays None on the shipped path: W01's envelope has no data slot
+        # yet, and this entry does NOT capture the raw reply to smuggle fields
+        # around it. When W01's neutral payload slot lands, read the fields off
+        # the envelope here.
+        return DispatchResult(outcome=outcome, body=None)
 
     return _dispatch
 

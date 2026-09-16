@@ -36,7 +36,7 @@ from kiro_crew.connections.control_plane.binding import (
     binding_secret_ref,
     create_binding,
 )
-from kiro_crew.connections.control_plane.executor import ExecutionOutcome
+from kiro_crew.connections.control_plane.executor import ExecutionOutcome, execute
 from kiro_crew.connections.control_plane.handle import (
     derive_handle,
     ensure_usable,
@@ -46,6 +46,7 @@ from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
     BindingSecretSelector,
     HttpReply,
+    urllib_http_send,
 )
 from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
 from kiro_crew.secrets import SecretValue, SecretVault
@@ -69,6 +70,7 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     baseline_conflict,
     build_graph_write_dispatch,
     conditional_write_args,
+    graph_500_unknown_transport,
     decode_page,
     extract_version,
     graph_request_locator,
@@ -393,25 +395,62 @@ def trust_loopback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Tuple[Pat
 
 
 def _make_execute_dispatch(*, host: str, vault, selector, handle, descriptor):
-    """Build the dispatch via the PRODUCTION entry build_graph_write_dispatch.
+    """TEST DOUBLE Dispatch: runs the REAL execute (custody + gates) AND supplies
+    the read body.
 
-    F3: the tests exercise the SHIPPED entry, not a test-only closure. The entry
-    composes W01's real transport from the two seats + the D9 wrapper + W01's
-    real urllib_http_send and runs one execute per hop.
+    This is NOT the shipped entry. build_graph_write_dispatch (the production
+    entry, exercised by test_f3) correctly returns body=None because W01's
+    envelope has no data slot yet. To exercise the orchestrator's field/version
+    steps BEFORE that W01 payload-slot commit lands, this test double composes the
+    same real transport (two seats + D9 wrapper + W01's real urllib_http_send) so
+    every hop still passes W01 custody + gates, and additionally captures the
+    reply IN THE TEST to stand in for the fields W01's forthcoming slot will
+    carry. The capture lives here in the test, not in the module.
     """
-    return build_graph_write_dispatch(
-        descriptor=descriptor,
-        handle=handle,
-        endpoint_host=host,
-        selector=selector,
-        vault=vault,
-        offered_mode="oauth_user",
-        permitted=declare_permitted_modes(("oauth_user",)),
-        layers=LayerCeilings(),
-        governance_scope="tools",
-        governance_item="listitem.update",
-        now=_T0,
+    import functools
+
+    from kiro_crew.connections.control_plane.production import build_production_transport
+
+    captured: Dict[str, Optional[HttpReply]] = {"reply": None}
+
+    def _capturing_send(request, **kw):
+        reply = urllib_http_send(request, **kw)
+        captured["reply"] = reply
+        return reply
+
+    locator = functools.partial(graph_request_locator, endpoint_host=host)
+    transport = graph_500_unknown_transport(
+        build_production_transport(
+            selector=selector,
+            vault=vault,
+            locator=locator,
+            http_send=_capturing_send,
+            decode=graph_result_decode,
+        )
     )
+
+    def _dispatch(request_args: Mapping[str, Any]) -> DispatchResult:
+        captured["reply"] = None
+        outcome = execute(
+            descriptor,
+            handle,
+            transport,
+            now=_T0,
+            offered_mode="oauth_user",
+            permitted=declare_permitted_modes(("oauth_user",)),
+            layers=LayerCeilings(),
+            governance_scope="tools",
+            governance_item="listitem.update",
+            request_args=request_args,
+        )
+        reply = captured["reply"]
+        body = None
+        if reply is not None and 200 <= reply.status < 300 and reply.body:
+            parsed = json.loads(reply.body)
+            body = parsed if isinstance(parsed, dict) else None
+        return DispatchResult(outcome=outcome, body=body)
+
+    return _dispatch
 
 
 def _compose(tmp_path: Path):
@@ -678,15 +717,7 @@ def test_f3_production_dispatch_entry_is_module_level(
     vault, selector, handle = _compose(tmp_path)
 
     def script(st, method, if_match, body):
-        if method == "GET":
-            return (
-                200,
-                {},
-                json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": st.quantity}).encode(),
-            )
-        st.quantity = json.loads(body.decode())["Quantity"]
-        st.etag = _ETAG_V2
-        return 200, {}, json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag}).encode()
+        return 200, {}, json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": 1}).encode()
 
     state = _Scripted(script=script)
     with _https_server(_handler_for(state), certfile, keyfile) as port:
@@ -703,11 +734,20 @@ def test_f3_production_dispatch_entry_is_module_level(
             governance_item="listitem.update",
             now=_T0,
         )
+        # One GET hop through the SHIPPED entry: it runs the real execute + W01
+        # custody (vault consulted) and returns body=None because W01's envelope
+        # has no data slot yet -- NOT a captured/smuggled body.
+        result = dispatch({ARG_METHOD: "GET", ARG_PATH: _PATH})
+        # The orchestrator, given the shipped entry, cannot yet verify fields: it
+        # conservatively reports no readable body rather than acting on a bypass.
         outcome = run_version_safe_write(
             mode=ConcurrencyMode.LISTITEM_ETAG,
             path=_PATH,
             intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
             dispatch=dispatch,
         )
-    assert outcome.applied is True and outcome.verified is True
-    assert vault.asked  # the production entry ran W01 custody
+
+    assert vault.asked  # the production entry ran W01 custody through execute
+    assert result.outcome.error is None  # the GET authorized and 2xx'd
+    assert result.body is None  # honest: fields await W01's neutral payload slot
+    assert outcome.applied is False and "readable body" in outcome.reason
