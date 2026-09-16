@@ -9,9 +9,22 @@ container or the parser.
 
 Import discipline: this slice depends on the sibling W07 OOXML engine
 (``office_documents.container`` / ``.constants`` / ``.errors``) BY NAME. Those
-modules are not on ``main`` yet (they land with the sibling PR), so this whole
-module is skipped when they cannot be imported rather than failing collection —
-the dependency is declared, not copied.
+modules are owned by the sibling leaf (chat-398, the #11072 family) and are not
+on ``main`` yet. This slice therefore has a REAL, unmet integration dependency
+until that sibling engine is committed.
+
+That dependency is made VISIBLE, not hidden: importing this leaf's own
+``xlsx`` module transitively imports the sibling modules, so when they are
+absent the import raises :class:`ModuleNotFoundError` and this test module
+FAILS COLLECTION with a named error. It is deliberately NOT wrapped in
+``pytest.importorskip`` — a silent skip would read as "not failing" and conceal
+the missing dependency. When the sibling engine lands, collection succeeds and
+the real tests run.
+
+openpyxl (below) is different: it is a DECLARED dependency of this repo, so a
+soft skip when it is genuinely absent from an install is acceptable — but a skip
+is NOT a pass either, and this file never presents an openpyxl-skip as
+verification.
 """
 
 from __future__ import annotations
@@ -20,14 +33,19 @@ import zipfile
 
 import pytest
 
-pytest.importorskip("openpyxl", reason="openpyxl is a declared dep; skip if absent")
+# openpyxl is a declared dependency; a soft skip is acceptable when it is absent
+# from an install, but a skip is NOT a pass and is never reported as one.
+pytest.importorskip("openpyxl", reason="openpyxl is a declared dep; skip if absent (skip != pass)")
 
-# The by-name sibling dependency. Skip cleanly (not error) when it is not yet
-# present in the tree, so this file is honest about being an integration
-# dependent rather than pretending to own the sibling's code.
-_xlsx = pytest.importorskip(
-    "kiro_crew.connections.vendors.microsoft.office_documents.xlsx",
-    reason="sibling office_documents engine (container/constants/errors) not present",
+# The by-name sibling dependency, imported HARD (not importorskip). The sibling
+# W07 OOXML engine modules — office_documents.{constants,container,errors},
+# owned by chat-398 (the #11072 family) — are not on main yet. If they are
+# absent this import raises ModuleNotFoundError and collection FAILS with a
+# named error, which is the correct, visible signal for an unmet integration
+# dependency. It must NOT be a silent skip: a skip would hide that this leaf
+# cannot yet be verified because the sibling engine it depends on is uncommitted.
+from kiro_crew.connections.vendors.microsoft.office_documents import (  # noqa: E402
+    xlsx,
 )
 from kiro_crew.connections.vendors.microsoft.office_documents.errors import (  # noqa: E402
     DocumentEditError,
@@ -35,9 +53,6 @@ from kiro_crew.connections.vendors.microsoft.office_documents.errors import (  #
     ProtectedDocument,
     UnsupportedDocument,
 )
-
-xlsx = _xlsx
-
 
 # ── Fixtures: build real workbooks ───────────────────────────────────────────
 
