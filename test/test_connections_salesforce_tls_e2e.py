@@ -439,6 +439,15 @@ class TestSyncSchedulerRealIngest:
                 properties={"instance_url": f"https://localhost:{port}", "org_id": ORG},
             )
             sched = SyncScheduler(store, _pipeline(store), {"salesforce": conn})
+            # PRE-STATE: a freshly-added source carries NO checkpoint. This is
+            # what lets the post-sync value prove a THIS-BATCH advance rather
+            # than the reuse of some older watermark -- there is no old value.
+            pre_props = json.loads(
+                store.db.execute("SELECT properties FROM sources WHERE id = ?", (src,)).fetchone()[
+                    "properties"
+                ]
+            )
+            assert "checkpoint" not in pre_props
             out = asyncio.run(sched.sync_source(src))
         finally:
             server.shutdown()
@@ -446,6 +455,9 @@ class TestSyncSchedulerRealIngest:
         try:
             # both rows ingested, each its OWN item group + grant
             assert out["synced"] is True
+            # the shared sync advanced the watermark BECAUSE this batch fully
+            # persisted -- bound to THIS batch, not "a checkpoint exists".
+            assert out["checkpoint_advanced"] is True
             state = store.get_connector_row_state(src)
             assert len(state) == 2
             # every grant: managed=True, empty subjects (DENY, fail-closed), the
@@ -461,11 +473,15 @@ class TestSyncSchedulerRealIngest:
                 assert rr.provider == "salesforce"
                 assert rr.locator["sobjectType"] == "Account"
             # props['checkpoint'] written by the SHARED sync ONLY after full
-            # persistence -- its presence is the "ACL landed" signal (SOQL
-            # watermark advanced to the max modstamp).
+            # persistence. Bound to THIS batch: pre-state had no checkpoint
+            # (asserted above), and the value now equals THIS batch's max
+            # SystemModstamp -- max(2026-02-01, 2026-03-01) == 2026-03-01 -- so
+            # it was advanced by this batch, not carried over from an older one.
             row = store.db.execute("SELECT properties FROM sources WHERE id = ?", (src,)).fetchone()
             props = json.loads(row["properties"])
             assert props["checkpoint"]["since"] == "2026-03-01T00:00:00Z"
+            batch_modstamps = ["2026-02-01T00:00:00Z", "2026-03-01T00:00:00Z"]
+            assert props["checkpoint"]["since"] == max(batch_modstamps)
         finally:
             store.close()
 
@@ -504,5 +520,76 @@ class TestSyncSchedulerRealIngest:
                     ProviderResourceRef.from_json(g["resource_ref"]).locator["reportId"]
                     == "00O000000000001"
                 )
+        finally:
+            store.close()
+
+    def test_soql_partial_failure_does_not_advance_checkpoint(
+        self, trust_loopback, real_vault, tmp_path
+    ):
+        """A partial ingest MUST NOT advance the watermark.
+
+        This is the negative half of the checkpoint contract: the presence of a
+        checkpoint only means SOME batch fully persisted. Here the second row
+        (the one carrying the batch-max SystemModstamp 2026-03-01) fails to
+        persist, so ``fully_persisted`` is False, the shared sync leaves the
+        checkpoint where it was (absent), and no "false complete" deletion runs.
+        The next sync therefore re-attempts from the same watermark.
+        """
+        certfile, keyfile = trust_loopback
+        script = {
+            "/services/data/v60.0/sobjects/Account/describe": _b(_DESCRIBE_BODY),
+            "/services/data/v60.0/query": _b(_SOQL_PAGE1),
+            _SOQL_CURSOR_PATH: _b(_SOQL_PAGE2),
+        }
+        server, served, port = _serve(script, certfile, keyfile)
+        store = KnowledgeStore(str(tmp_path / "sfpartial.db"))
+
+        class _FailSecondRowPipeline(IngestionPipeline):
+            # Fail ONLY the batch-max row (Globex / 2026-03-01). The first row
+            # (Acme / 2026-02-01) persists; the batch is therefore PARTIAL.
+            async def ingest_text(self, text, *a, **k):  # type: ignore[override]
+                if "Globex" in text:
+                    raise RuntimeError("injected per-row persist failure")
+                return await super().ingest_text(text, *a, **k)
+
+        base = _pipeline(store)
+        pipeline = _FailSecondRowPipeline(
+            store=store,
+            extractor=base.extractor,
+            chunker=base.chunker,
+            reader=base.reader,
+            embedder=None,
+        )
+        try:
+            handle = _handle()
+            runner = _runner(handle, real_vault, port)
+            conn = SalesforceStructuredConnector(call_runner=runner)
+            src = store.add_source(
+                "SF Account partial",
+                "salesforce",
+                "salesforce://object/Account",
+                properties={"instance_url": f"https://localhost:{port}", "org_id": ORG},
+            )
+            sched = SyncScheduler(store, pipeline, {"salesforce": conn})
+            out = asyncio.run(sched.sync_source(src))
+        finally:
+            server.shutdown()
+        try:
+            # Partial: not fully persisted -> checkpoint NOT advanced.
+            assert out["synced"] is False
+            assert out["checkpoint_advanced"] is False
+            props = json.loads(
+                store.db.execute("SELECT properties FROM sources WHERE id = ?", (src,)).fetchone()[
+                    "properties"
+                ]
+            )
+            # The watermark stayed where it was (absent) -- NOT advanced to the
+            # batch-max modstamp, because the max-modstamp row is exactly the one
+            # that failed. The next sync re-attempts from here.
+            assert "checkpoint" not in props or props.get("checkpoint", {}).get("since") is None
+            # Only the row that succeeded is in the ledger; the failed row is not
+            # recorded active (no item without its grant, no phantom completion).
+            state = store.get_connector_row_state(src)
+            assert len(state) == 1
         finally:
             store.close()
