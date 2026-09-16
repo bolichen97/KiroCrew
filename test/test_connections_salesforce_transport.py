@@ -100,8 +100,9 @@ class TestDecode(unittest.TestCase):
         payload = result["payload"]
         self.assertIsInstance(payload, CollectionPayload)
         self.assertEqual(len(payload.items), 2)
-        self.assertEqual(payload.next_cursor, "/services/data/v60.0/query/01g-200")
-        self.assertEqual(result["next_cursor"], payload.next_cursor)
+        # RESULT3: cursor lives on the envelope, NOT the collection.
+        self.assertEqual(result["next_cursor"], "/services/data/v60.0/query/01g-200")
+        self.assertFalse(hasattr(payload, "next_cursor"))
 
     def test_soql_decode_terminal_has_no_cursor(self):
         result = salesforce_soql_decode(
@@ -113,8 +114,8 @@ class TestDecode(unittest.TestCase):
                 }
             )
         )
-        self.assertIsNone(result["payload"].next_cursor)
         self.assertIsNone(result["next_cursor"])
+        self.assertEqual(len(result["payload"].items), 1)
 
     def test_report_decode_is_snapshot_no_cursor(self):
         body = {
@@ -125,7 +126,7 @@ class TestDecode(unittest.TestCase):
         payload = result["payload"]
         self.assertIsInstance(payload, CollectionPayload)
         self.assertEqual(len(payload.items), 1)  # the whole report body as one object
-        self.assertIsNone(payload.next_cursor)
+        self.assertIsNone(result["next_cursor"])
 
     def test_describe_decode_is_object(self):
         result = salesforce_describe_decode(_reply({"name": "Account", "fields": []}))

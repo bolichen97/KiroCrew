@@ -510,7 +510,7 @@ from kiro_crew.connections.vendors.salesforce.transport import (  # noqa: E402
 
 def _collection_outcome(items, cursor=None):
     return ExecutionOutcome(
-        result=result_with_payload(CollectionPayload(items=tuple(items), next_cursor=cursor))
+        result=result_with_payload(CollectionPayload(items=tuple(items)), next_cursor=cursor)
     )
 
 

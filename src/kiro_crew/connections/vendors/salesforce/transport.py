@@ -15,8 +15,9 @@ and the wire, but leaves TWO vendor-owned holes it INJECTS:
   2xx :class:`~kiro_crew.connections.control_plane.production.HttpReply` to the
   L01 success envelope, INCLUDING the ``payload`` (the items/object the caller
   reads), built with
-  :func:`~kiro_crew.connections.control_plane.result.result_with_payload` so the
-  envelope's ``next_cursor`` cannot disagree with the collection's.
+  :func:`~kiro_crew.connections.control_plane.result.result_with_payload` whose
+  ``next_cursor`` argument is the single authoritative cursor on the envelope
+  (RESULT3: ``CollectionPayload`` carries only ``items``).
 
 This module fills BOTH holes for Salesforce, and NOTHING else: it opens no
 socket, holds no secret, and builds no second transport/auth/vault. It shapes
@@ -33,8 +34,8 @@ the two structured read paths this connector serves:
 * **Report / Analytics path** -- ``GET /services/data/vXX.X/analytics/reports/
   {id}?includeDetails=true``. Its result is a fact grid, NOT a record list, and
   it is capped at 2000 rows with no continuation cursor, so the decode returns a
-  single-page :class:`CollectionPayload` with ``next_cursor=None`` (a report is a
-  bounded snapshot, not a paged stream).
+  single-page :class:`CollectionPayload` and the envelope's ``next_cursor`` stays
+  ``None`` (a report is a bounded snapshot, not a paged stream).
 
 Facts search-snippet corroborated (``developer.salesforce.com`` rejects
 automated fetches with HTTP 403).
@@ -220,7 +221,7 @@ def salesforce_soql_decode(reply: HttpReply, **_ignored: Any) -> OperationResult
 
     The body is the L1 REST query-page shape ``{totalSize, done, records,
     [nextRecordsUrl]}``. The records are carried as the collection's items and
-    the ``nextRecordsUrl`` becomes the collection's ``next_cursor`` (``None`` on
+    the ``nextRecordsUrl`` becomes the envelope's ``next_cursor`` (``None`` on
     the terminal page), so the executor's ``PageWalk`` advances on the REAL
     vendor locator -- never a fabricated one. Contract violations (a
     ``done=false`` page with no locator, etc.) are the L1 parser's to raise; here
@@ -234,8 +235,10 @@ def salesforce_soql_decode(reply: HttpReply, **_ignored: Any) -> OperationResult
     if done is False:
         locator = body.get("nextRecordsUrl")
         next_cursor = locator if isinstance(locator, str) and locator else None
-    payload = CollectionPayload(items=items, next_cursor=next_cursor)
-    return result_with_payload(payload, status="ok")
+    # RESULT3: CollectionPayload carries ONLY items; the single authoritative
+    # cursor lives on the envelope via result_with_payload(next_cursor=...).
+    payload = CollectionPayload(items=items)
+    return result_with_payload(payload, status="ok", next_cursor=next_cursor)
 
 
 def salesforce_report_decode(reply: HttpReply, **_ignored: Any) -> OperationResult:
@@ -243,15 +246,17 @@ def salesforce_report_decode(reply: HttpReply, **_ignored: Any) -> OperationResu
 
     A report result is a bounded (<=2000-row) fact grid with NO continuation
     cursor, so the whole report body is carried as ONE object in a
-    :class:`CollectionPayload` with ``next_cursor=None`` -- the connector's
-    report converter reads the grid out of it. It is a collection of one so the
-    connector's fetch loop treats both paths uniformly; the report is not a paged
-    stream, hence no cursor.
+    :class:`CollectionPayload` and the envelope's ``next_cursor`` stays ``None``
+    -- the connector's report converter reads the grid out of it. It is a
+    collection of one so the connector's fetch loop treats both paths uniformly;
+    the report is not a paged stream, hence no cursor.
     """
     body = _json_body(reply)
     # The full report result travels as a single object; the connector converts
-    # its factMap into rows. No cursor: a report is a bounded snapshot.
-    payload = CollectionPayload(items=(dict(body),), next_cursor=None)
+    # its factMap into rows. No cursor: a report is a bounded snapshot, so the
+    # envelope's next_cursor stays None (RESULT3: cursor only via
+    # result_with_payload, and never for a non-paged shape).
+    payload = CollectionPayload(items=(dict(body),))
     return result_with_payload(payload, status="ok")
 
 
