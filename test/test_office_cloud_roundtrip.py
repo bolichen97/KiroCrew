@@ -56,7 +56,7 @@ import threading
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 
@@ -78,18 +78,14 @@ from kiro_crew.connections.control_plane.binding import (  # noqa: E402
     create_binding,
 )
 from kiro_crew.connections.control_plane.handle import derive_handle, ensure_usable  # noqa: E402
-from kiro_crew.connections.control_plane.operation import (  # noqa: E402
-    Effect,
-    OperationDescriptor,
-)
 from kiro_crew.connections.control_plane.policy import LayerCeilings  # noqa: E402
 from kiro_crew.connections.control_plane.production import BindingSecretSelector  # noqa: E402
 from kiro_crew.secrets import SecretValue, SecretVault  # noqa: E402
 
-# The sibling W06 graph seam — imported HARD (the production dispatch entry).
+# The sibling W06 graph seam — imported HARD (used transitively via this leaf's
+# own factory build_office_cloud_dispatch, which binds build_graph_write_dispatch).
 from kiro_crew.connections.vendors.microsoft.graph.concurrency import (  # noqa: E402
     ConcurrencyError,
-    build_graph_write_dispatch,
 )
 
 # This leaf under test.
@@ -97,6 +93,8 @@ from kiro_crew.connections.vendors.microsoft.office_cloud import (  # noqa: E402
     DriveLocator,
     OfficeFormat,
     RoundtripOutcome,
+    WriteStatus,
+    build_office_cloud_dispatch,
     docx_pptx_edit,
     refuse_excel_range_version_safe_write,
     run_content_roundtrip,
@@ -178,16 +176,6 @@ def _verifier(*, claimed_subject: str, claimed_tenant: str, service_id: str) -> 
     return {
         "subject_ref": f"subject://verified/{claimed_subject}",
         "tenant_ref": f"tenant://verified/{claimed_tenant}",
-    }
-
-
-def _descriptor(service_id: str, effect: Effect = "write") -> OperationDescriptor:
-    return {
-        "operation_id": f"{service_id}.driveitem.content",
-        "service_id": service_id,  # type: ignore[typeddict-item]
-        "operation_kind": "mutation",
-        "effect": effect,
-        "credential_modes": ("oauth_user",),
     }
 
 
@@ -293,6 +281,19 @@ def _handler_for(item: _DriveItem):
             status, headers, out = item.handle(
                 self.command, self.path, self.headers.get("If-Match"), body
             )
+            if status == 0:
+                # Sentinel: the server ALREADY applied the effect (item.handle
+                # mutated state), then the connection drops before a valid
+                # response is sent. urllib sees a dropped connection, which W01's
+                # transport maps to write_outcome=UNKNOWN for a non-idempotent
+                # write — the "committed then disconnected" shape.
+                try:
+                    self.close_connection = True
+                    self.wfile.close()
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
             self.send_response(status)
             for k, v in headers.items():
                 self.send_header(k, v)
@@ -363,18 +364,24 @@ def _compose(tmp_path: Path, service_id: str):
 
 
 def _dispatch_for(*, host: str, service_id: str, tmp_path: Path):
+    """Drive tests through THIS leaf's OWN production factory (U2).
+
+    The factory binds W06's ``build_graph_write_dispatch`` itself, so what the
+    tests exercise is the shipped composition — not a Dispatch assembled in the
+    test. The W01 auth-chain seats come from ``_compose`` (a real encrypted
+    vault, a real binding/handle/selector); the factory does the
+    descriptor + ``build_graph_write_dispatch`` wiring.
+    """
     vault, selector, handle = _compose(tmp_path, service_id)
-    return build_graph_write_dispatch(
-        descriptor=_descriptor(service_id),
-        handle=handle,
+    return build_office_cloud_dispatch(
         endpoint_host=host,
+        handle=handle,
         selector=selector,
         vault=vault,
-        offered_mode="oauth_user",
         permitted=declare_permitted_modes(("oauth_user",)),
         layers=LayerCeilings(),
-        governance_scope="tools",
-        governance_item="driveitem.content",
+        offered_mode="oauth_user",
+        service_id=service_id,
         now=_T0,
     )
 
@@ -434,9 +441,13 @@ def test_content_roundtrip_commits_and_verifies_both_locations(
             read_back_check=check,
         )
     assert isinstance(outcome, RoundtripOutcome)
+    assert outcome.write_status is WriteStatus.COMMITTED, outcome.reason
     assert outcome.committed, outcome.reason
     assert outcome.verified, outcome.reason
     assert not outcome.conflict
+    assert not outcome.unknown
+    # A committed write is NOT safe to blind-replay (a replay would duplicate).
+    assert outcome.safe_to_replay is False
     assert outcome.downloaded_len == len(original)
     # The server now holds the committed (edited) bytes and a bumped eTag.
     assert item.content != original
@@ -529,11 +540,136 @@ def test_stale_if_match_is_a_412_conflict_nothing_clobbered(
             local_edit=edit,
             read_back_check=check,
         )
+    assert outcome.write_status is WriteStatus.CONFLICT, outcome.reason
     assert outcome.conflict is True, outcome.reason
     assert outcome.committed is False
+    assert outcome.unknown is False
     assert outcome.verified is False
+    # A 412 is a DETERMINATE not-applied: re-read and re-derive is safe.
+    assert outcome.safe_to_replay is True
     # NOTHING clobbered: the server still holds the original bytes.
     assert item.content == original_content
+
+
+# =============================================================================
+# U1 NEGATIVES — an UNKNOWN write must never read as a determinate "not committed".
+# Both go through THIS leaf's own factory -> W06 dispatch -> W01 execute, so the
+# unknown mapping is the SHIPPED one, not a stubbed transport.
+# =============================================================================
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "W01 transport gap (owner-crossing, NOT fixable in this leaf): "
+        "production.py:1276 catches only (urllib.error.URLError, TimeoutError, "
+        "TransportDeadlineExceededError). A connection dropped AFTER the request "
+        "was sent but BEFORE a response — urllib's getresponse() raises "
+        "http.client.RemoteDisconnected, an OSError/ConnectionResetError that is "
+        "NOT a URLError — escapes that clause UNCAUGHT and never maps to "
+        "write_outcome=UNKNOWN. This is exactly the canonical committed-then-"
+        "disconnected case. The fix is a one-line widen of production.py:1276 to "
+        "also catch ConnectionError (its docstring already says the two are "
+        "treated identically); it belongs to W01, so this negative is xfail until "
+        "the conductor coordinates that hunk. Negative (b) (500->UNKNOWN via the "
+        "shipped graph_500_unknown_transport) proves the outer-result UNKNOWN "
+        "invariant end-to-end today."
+    ),
+)
+@pytest.mark.parametrize("location,service_id,loc_factory", _LOCATIONS)
+def test_put_landed_then_connection_dropped_is_unknown_not_not_committed(
+    trust_loopback, tmp_path, location, service_id, loc_factory
+):
+    """(a) The write LANDS on the server, then the connection drops before a
+    response. The INTENDED contract: W01 maps a dropped connection on a
+    non-idempotent write to write_outcome=UNKNOWN, and the round-trip surfaces
+    WriteStatus.UNKNOWN (never a determinate not-committed, which would license a
+    duplicate retry of a write that already landed). This is xfail today because
+    W01's transport catch clause misses the RemoteDisconnected the drop raises
+    (see the xfail reason). The round-trip's OWN unknown handling is correct and
+    is proven by negative (b); this test documents the upstream gap and flips to
+    a real pass the moment production.py:1276 is widened to catch ConnectionError."""
+    certfile, keyfile = trust_loopback
+    original, media_type, edit, check = _fixture_for(OfficeFormat.DOCX)
+    item = _DriveItem(_ITEM_ID, _ETAG_V1, original, media_type)
+    real_handle = item.handle
+
+    def landing_then_drop(method, path, if_match, body):
+        if method == "PUT" and path.endswith("/content"):
+            # The effect LANDS: mutate content + bump eTag exactly as a real
+            # accepted PUT would, THEN signal the handler to drop the connection
+            # (status 0) instead of returning a response.
+            item.requests.append(
+                {"method": method, "path": path, "if_match": if_match, "len": len(body)}
+            )
+            item.content = body
+            item.etag = f'"{item.etag.strip(chr(34))}-n"'
+            return (0, {}, b"")
+        return real_handle(method, path, if_match, body)
+
+    item.handle = landing_then_drop  # type: ignore[assignment]
+    with _https_server(_handler_for(item), certfile, keyfile) as port:
+        host = f"127.0.0.1:{port}"
+        dispatch = _dispatch_for(host=host, service_id=service_id, tmp_path=tmp_path)
+        outcome = run_content_roundtrip(
+            location=location,
+            fmt=OfficeFormat.DOCX,
+            locator=loc_factory(_ITEM_ID),
+            dispatch=dispatch,
+            local_edit=edit,
+            read_back_check=check,
+        )
+    # The invariant this WOULD assert once W01 catches the drop:
+    assert outcome.write_status is WriteStatus.UNKNOWN, outcome.reason
+    assert outcome.unknown is True
+    assert outcome.committed is False
+    assert outcome.conflict is False
+    assert outcome.safe_to_replay is False
+    assert outcome.write_outcome == "unknown"
+    assert "not committed" not in outcome.reason.lower()
+    assert item.content != original
+
+
+@pytest.mark.parametrize("location,service_id,loc_factory", _LOCATIONS)
+def test_put_500_is_unknown_not_not_committed(
+    trust_loopback, tmp_path, location, service_id, loc_factory
+):
+    """(b) A 500 on the content PUT. Graph does not guarantee a 500 is
+    pre-commit, so W06's graph_500_unknown_transport marks a 500 on a
+    non-idempotent write as write_outcome=UNKNOWN. The round-trip must surface
+    WriteStatus.UNKNOWN, never a determinate not-committed."""
+    certfile, keyfile = trust_loopback
+    original, media_type, edit, check = _fixture_for(OfficeFormat.PPTX)
+    item = _DriveItem(_ITEM_ID, _ETAG_V1, original, media_type)
+    real_handle = item.handle
+
+    def five_hundred_on_put(method, path, if_match, body):
+        if method == "PUT" and path.endswith("/content"):
+            item.requests.append(
+                {"method": method, "path": path, "if_match": if_match, "len": len(body)}
+            )
+            # A 500 whose commit status is genuinely unknown to the client.
+            return (500, {"Content-Type": "application/json"}, b'{"error":{"code":"internal"}}')
+        return real_handle(method, path, if_match, body)
+
+    item.handle = five_hundred_on_put  # type: ignore[assignment]
+    with _https_server(_handler_for(item), certfile, keyfile) as port:
+        host = f"127.0.0.1:{port}"
+        dispatch = _dispatch_for(host=host, service_id=service_id, tmp_path=tmp_path)
+        outcome = run_content_roundtrip(
+            location=location,
+            fmt=OfficeFormat.PPTX,
+            locator=loc_factory(_ITEM_ID),
+            dispatch=dispatch,
+            local_edit=edit,
+            read_back_check=check,
+        )
+    assert outcome.write_status is WriteStatus.UNKNOWN, outcome.reason
+    assert outcome.unknown is True
+    assert outcome.committed is False
+    assert outcome.conflict is False
+    assert outcome.safe_to_replay is False
+    assert outcome.write_outcome == "unknown"
+    assert "not committed" not in outcome.reason.lower()
+    assert "unknown" in outcome.reason.lower()
 
 
 def test_excel_range_write_has_no_conditional_commit_zero_requests():

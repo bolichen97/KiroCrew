@@ -49,11 +49,40 @@ Verified per-operation on the official pages, NEVER extrapolated from a sibling:
   ``PUT …/content`` overwrite). So a version-safe content commit sends the eTag
   read from the item's metadata and a stale eTag is a 412 conflict, refused —
   never a blind overwrite that clobbers a concurrent change.
-* **Simple upload only** (files ≤ 250 MB, the shape every Office test document
-  here is). A file over 250 MB requires an upload SESSION
-  (``driveItem: createUploadSession``); that is a DIFFERENT operation with its
-  own chunk/range semantics and is deliberately out of scope here rather than
-  faked from the simple-upload contract.
+* **Two SIZE axes, not one — named separately, neither guessed from the other:**
+
+  1. *Graph's simple-upload ceiling — 250 MB.* The provider's own limit on the
+     ``PUT …/items/{id}/content`` single-shot upload. A file OVER 250 MB is not
+     "the same PUT, bigger": Graph requires an upload SESSION
+     (``driveItem: createUploadSession``, a DIFFERENT operation with its own
+     ``createUploadSession`` -> ranged ``PUT`` chunk protocol). This is a Graph
+     endpoint fact.
+
+  2. *W01's response-read cap — 8 MiB by default
+     (``production.DEFAULT_MAX_RESPONSE_BYTES``).* An ORTHOGONAL axis: it bounds
+     how many bytes W01's transport will BUFFER from a **response** body, and a
+     body past it is REFUSED (``ResponseTooLargeError`` -> the transport records
+     ``write_outcome`` per :meth:`run_content_roundtrip` U1 handling), never
+     silently truncated. This is a W01 transport fact about the DOWNLOAD /
+     read-back leg, not the upload leg, and 8 MiB < 250 MB — so a file that
+     Graph would happily accept on a simple upload can still exceed what W01 will
+     read back. The two limits live on different legs and different layers; this
+     module conflates neither.
+
+  **What the fixtures here actually exercise:** small real OOXML documents —
+  low-KiB ``docx`` (python-docx), low-KiB ``pptx`` (a hand-built OPC ZIP), low-KiB
+  ``xlsx`` (openpyxl) — all far under BOTH the 250 MB Graph ceiling and the 8 MiB
+  W01 response cap. A small fixture passing establishes the round-trip SHAPE and
+  the If-Match/412 contract; it does NOT establish behaviour at 250 MB, at the
+  8 MiB response boundary, or on the upload-session path — those are not claimed
+  as verified here.
+
+  **Still NAMED in scope, not documented away:** new-file / template *creation*
+  (a ``PUT`` to a not-yet-existing item path, or ``createUploadSession`` for one),
+  large-file handling, and the upload-SESSION chunked protocol all remain part of
+  this leaf's stated scope. They are UNIMPLEMENTED here rather than faked from the
+  simple-upload contract — naming them keeps the gap visible; shrinking the scope
+  to only what a small fixture proves would hide it.
 * **``excel.range.write`` stays REFUSED.** The Graph Excel range write documents
   NO eTag / optimistic-concurrency mechanism, so a version-safe conditional
   write cannot exist for it — W06's ``run_version_safe_write`` refuses it before
@@ -92,6 +121,8 @@ from kiro_crew.connections.control_plane.result import (
     BytesPayload,
     ObjectPayload,
 )
+from kiro_crew.connections.control_plane.operation import OperationDescriptor
+from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
 from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     ARG_BODY,
     ARG_IF_MATCH,
@@ -104,6 +135,7 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     DispatchResult,
     FieldChange,
     WriteIntent,
+    build_graph_write_dispatch,
     extract_resource_id,
     extract_version,
     run_version_safe_write,
@@ -302,31 +334,190 @@ def _metadata_object(hop: DispatchResult) -> Mapping[str, Any]:
 
 
 # =============================================================================
+# THIS leaf's own production factory — binds W06's build_graph_write_dispatch.
+# =============================================================================
+def build_office_cloud_dispatch(
+    *,
+    endpoint_host: str,
+    handle: Any,
+    selector: Any,
+    vault: Any,
+    permitted: Any,
+    layers: Any,
+    offered_mode: Any = "oauth_user",
+    service_id: str = "office_documents",
+    operation_id: Optional[str] = None,
+    governance_scope: str = "tools",
+    governance_item: str = "driveitem.content",
+    now: Optional[float] = None,
+) -> Dispatch:
+    """PRODUCTION entry for the cloud Office content round-trip — THIS leaf's own.
+
+    U2: a caller-supplied ``dispatch`` is the same gap as a test closure — it
+    proves nothing about the SHIPPED path. This is the leaf's own module-level
+    factory: it binds W06's production
+    :func:`~kiro_crew.connections.vendors.microsoft.graph.concurrency.build_graph_write_dispatch`
+    itself (not re-implemented, not forked), composing the descriptor for the
+    driveItem content operation and handing W06 the W01 auth-chain seats the
+    composing caller supplies. The returned :class:`Dispatch` runs one W01
+    ``execute`` per hop; every metadata GET, content GET, content PUT and
+    read-back GET the round-trip issues therefore passes W01's custody, pre-send
+    gates, trusted-binding identity and unknown-outcome mapping. This module
+    issues NO raw send and touches NO secret.
+
+    :func:`run_content_roundtrip` is driven with the dispatch THIS returns — and
+    so are the tests, which call this factory rather than assembling a Dispatch,
+    so what the tests exercise is the shipped composition.
+
+    The descriptor's ``effect`` is ``"write"``: the round-trip's defining hop is
+    the conditional content PUT, and pinning the effect to the non-idempotent
+    ``write`` is what makes W01 map a mid-flight failure to
+    :data:`~kiro_crew.connections.control_plane.writes.ATTEMPT_UNKNOWN` on the
+    PUT (a ``read``-effect descriptor would leave a write's ambiguous failure
+    unmarked) — which is precisely the U1 UNKNOWN signal
+    :func:`run_content_roundtrip` carries out. ``build_graph_write_dispatch``
+    binds ONE descriptor per Dispatch; the GET hops ride the same dispatch, which
+    is correct because a GET applies no effect for the write-gate to act on.
+
+    ``handle`` / ``selector`` / ``vault`` / ``permitted`` / ``layers`` /
+    ``offered_mode`` are W01 types the composing caller owns (kept ``Any`` here so
+    this vendor module does not re-import W01's whole type surface, mirroring
+    ``build_graph_write_dispatch``'s own signature). ``now`` is for a
+    deterministic test only.
+
+    NOTE: W01's auth chain (L03 auth-code, L04 rotation fencing,
+    principal->binding) is NOT complete and carries reported gaps, and W01's own
+    fresh install is still being corrected; this entry rides W01's chain but does
+    not make it complete or safe on its own.
+    """
+
+    descriptor: OperationDescriptor = {
+        "operation_id": operation_id or f"{service_id}.driveitem.content",
+        "service_id": service_id,  # type: ignore[typeddict-item]
+        "operation_kind": "mutation",
+        "effect": "write",
+        "credential_modes": (offered_mode,),
+    }
+    return build_graph_write_dispatch(
+        descriptor=descriptor,
+        handle=handle,
+        endpoint_host=endpoint_host,
+        selector=selector,
+        vault=vault,
+        offered_mode=offered_mode,
+        permitted=permitted,
+        layers=layers,
+        governance_scope=governance_scope,
+        governance_item=governance_item,
+        now=now,
+    )
+
+
+# =============================================================================
 # The round-trip outcome.
 # =============================================================================
+class WriteStatus(str, Enum):
+    """What is KNOWN about whether the content PUT's effect landed — four states.
+
+    This is the U1 invariant made a first-class type, not a bool: an UNKNOWN
+    write (the request may have been applied and then the connection dropped, or
+    a 5xx the provider marks post-commit-ambiguous) must NEVER collapse into a
+    determinate "not committed", because a caller told "not committed" retries,
+    and a retry of a write that DID land is exactly how a duplicate write or a
+    clobber happens.
+
+    * :attr:`COMMITTED` — the PUT returned 2xx; the effect is known to have
+      landed.
+    * :attr:`CONFLICT` — a 412 (stale ``If-Match``); the effect is known NOT to
+      have landed and nothing was overwritten. A determinate not-applied.
+    * :attr:`NOT_COMMITTED` — a determinate failure the transport marks as
+      **not applied** (a pre-flight refusal, a provider rejection W01 records as
+      ``failed_not_applied``). Safe to re-derive and retry.
+    * :attr:`UNKNOWN` — W01's transport handed back
+      :data:`~kiro_crew.connections.control_plane.writes.ATTEMPT_UNKNOWN` on
+      ``outcome.write_outcome``: the wire failed in a way that answers nothing
+      (dropped connection mid-flight, an overall-deadline cut, a
+      response-too-large refusal, or a 5xx a vendor owner marked ambiguous).
+      This state is carried OUT to the caller unchanged; the round-trip never
+      auto-replays it and never reports it as ``NOT_COMMITTED``. Replaying is a
+      decision only W01's L07 :func:`replay_decision` may make, and only when the
+      caller explicitly asserts idempotency.
+    """
+
+    COMMITTED = "committed"
+    CONFLICT = "conflict"
+    NOT_COMMITTED = "not_committed"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class RoundtripOutcome:
     """The result of one cloud Office CONTENT round-trip.
 
-    ``committed`` — the conditional content PUT was accepted (2xx). ``verified``
-    — the INDEPENDENT content read-back parsed and the intended edit holds on the
-    target resource. ``conflict`` — set when a stale ``If-Match`` produced a 412
-    and the sequence refused to clobber; ``committed``/``verified`` are then
-    False and NOTHING was overwritten. ``downloaded_len`` / ``committed_len`` —
-    the byte lengths downloaded and committed, for the evidence receipt.
-    ``read_back_kind`` — the DocumentKind the read-back parsed as. ``reason`` —
-    a human-readable account.
+    ``write_status`` — the authoritative four-state verdict on the content PUT
+    (:class:`WriteStatus`). It is the field a caller must branch on; the
+    ``committed`` / ``conflict`` booleans below are DERIVED conveniences and are
+    both ``False`` on :attr:`WriteStatus.UNKNOWN`, because neither "committed" nor
+    "conflict" is a true statement about an unknown outcome.
+
+    ``committed`` — derived: ``write_status is COMMITTED``. NEVER ``True`` for an
+    UNKNOWN outcome, and — the U1 invariant — an UNKNOWN outcome is NOT reported
+    as ``committed=False`` with a "not committed" reason: a caller reading
+    ``committed=False`` on an unknown write would retry and risk a duplicate.
+    Read :attr:`write_status` to tell UNKNOWN apart from a determinate
+    not-committed. ``verified`` — the INDEPENDENT content read-back parsed and
+    the intended edit holds on the target. ``conflict`` — derived:
+    ``write_status is CONFLICT`` (a stale ``If-Match`` -> 412, nothing
+    overwritten). ``write_outcome`` — W01's raw
+    :data:`~kiro_crew.connections.control_plane.writes.AttemptOutcome` string
+    carried through from ``outcome.write_outcome`` (``"unknown"`` /
+    ``"failed_not_applied"`` / ``"succeeded"`` / ``None``), so a caller can hand
+    it straight to L07's :func:`replay_decision` without re-deriving it. ``safe_to_replay``
+    — ``True`` ONLY for a determinate not-applied (CONFLICT / NOT_COMMITTED);
+    ``False`` for COMMITTED (a replay would duplicate) and for UNKNOWN (a replay
+    might duplicate and nothing here proves it would not). ``downloaded_len`` /
+    ``committed_len`` — the byte lengths, for the evidence receipt.
+    ``read_back_kind`` — the DocumentKind the read-back parsed as. ``reason`` — a
+    human-readable account; on UNKNOWN it says the outcome is UNKNOWN and must not
+    be replayed, and never the words "not committed".
     """
 
     location: str
     fmt: OfficeFormat
-    committed: bool
+    write_status: WriteStatus
     verified: bool
-    conflict: bool
     downloaded_len: int
     committed_len: int
     read_back_kind: Optional[object]
+    write_outcome: Optional[str]
     reason: str
+
+    @property
+    def committed(self) -> bool:
+        """Derived: the PUT is KNOWN to have landed. False on UNKNOWN — an unknown
+        write is never reported as committed, and never as a determinate
+        not-committed either (read :attr:`write_status`)."""
+        return self.write_status is WriteStatus.COMMITTED
+
+    @property
+    def conflict(self) -> bool:
+        """Derived: a 412 stale-``If-Match`` conflict; nothing was overwritten."""
+        return self.write_status is WriteStatus.CONFLICT
+
+    @property
+    def unknown(self) -> bool:
+        """Derived: W01 could not determine whether the write landed. The caller
+        must NOT auto-replay; only L07 may, and only under an explicit idempotency
+        assertion."""
+        return self.write_status is WriteStatus.UNKNOWN
+
+    @property
+    def safe_to_replay(self) -> bool:
+        """Whether re-issuing the write is safe WITHOUT an L07 idempotency
+        assertion. True only for a determinate not-applied (CONFLICT after a
+        re-read, or NOT_COMMITTED). False for COMMITTED (would duplicate) and for
+        UNKNOWN (might duplicate; nothing proves otherwise)."""
+        return self.write_status in (WriteStatus.CONFLICT, WriteStatus.NOT_COMMITTED)
 
 
 def _format_of(kind: object) -> OfficeFormat:
@@ -388,8 +579,13 @@ def run_content_roundtrip(
 ) -> RoundtripOutcome:
     """Drive the whole content round-trip for ONE (location, format).
 
-    Sequence, every network hop through ``dispatch`` (bound by the caller to
-    W06's :func:`build_graph_write_dispatch` -> W01's ``execute``):
+    Sequence, every network hop through ``dispatch`` — which is THIS leaf's own
+    production factory :func:`build_office_cloud_dispatch` binding W06's
+    :func:`build_graph_write_dispatch` -> W01's ``execute``. Callers on the
+    shipped path build the dispatch through that factory, not by hand-assembling
+    a :class:`Dispatch`; the parameter stays a :class:`Dispatch` so a
+    deterministic test can drive the SAME factory output rather than a bespoke
+    closure.
 
     1. **metadata GET** ``locator.item_path`` — read the item's ``eTag``/``cTag``
        and assert identity. This is the version the conditional commit conditions
@@ -400,15 +596,22 @@ def run_content_roundtrip(
        ``local_edit`` (B's engine for docx/pptx, C's for xlsx), producing edited
        bytes on disk.
     4. **conditional content PUT** ``locator.content_path`` with
-       ``If-Match: <eTag>`` and the edited bytes. A stale eTag -> 412 -> conflict,
-       nothing clobbered.
+       ``If-Match: <eTag>`` and the edited bytes. Four outcomes, on
+       ``put.outcome`` and its ``write_outcome`` (see :class:`WriteStatus`):
+       a 2xx -> ``COMMITTED``; a 412 -> ``CONFLICT`` (stale eTag, nothing
+       clobbered); a determinate failure the transport marks not-applied ->
+       ``NOT_COMMITTED``; and — the U1 invariant — ``outcome.write_outcome ==
+       ATTEMPT_UNKNOWN`` (dropped connection after the write may have landed, a
+       deadline cut, a response-too-large refusal, a vendor-marked ambiguous 5xx)
+       -> ``UNKNOWN``, carried out UNCHANGED and NEVER auto-replayed here.
     5. **independent content GET** ``locator.content_path`` — re-download and
        re-parse through the sibling engine's own reader; assert the intended edit
-       holds on the target.
+       holds on the target. Reached only on ``COMMITTED``.
 
-    Returns a :class:`RoundtripOutcome`. Raises :class:`CloudRoundtripError` only
-    for a broken invariant (a hop that returned the wrong payload shape); a
-    412 conflict is a normal ``conflict=True`` outcome, not an exception.
+    Returns a :class:`RoundtripOutcome` whose :attr:`RoundtripOutcome.write_status`
+    is the authoritative verdict. Raises :class:`CloudRoundtripError` only for a
+    broken invariant (a hop that returned the wrong payload shape); a 412
+    conflict and an UNKNOWN outcome are both normal outcomes, not exceptions.
     """
 
     # --- 1. metadata GET: the eTag the content commit will condition on -------
@@ -463,30 +666,63 @@ def run_content_roundtrip(
         )
         if put.outcome.precondition is not None:
             # A 412: the item moved since we read its eTag. Refuse to clobber.
+            # This is a DETERMINATE not-applied (nothing was overwritten), so it
+            # is safe to re-read and re-derive — distinct from UNKNOWN below.
             return RoundtripOutcome(
                 location=location,
                 fmt=fmt,
-                committed=False,
+                write_status=WriteStatus.CONFLICT,
                 verified=False,
-                conflict=True,
                 downloaded_len=downloaded_len,
                 committed_len=committed_len,
                 read_back_kind=None,
+                write_outcome=put.outcome.write_outcome,
                 reason="content PUT rejected with 412 (stale If-Match); refused "
                 "to overwrite a concurrently-changed file",
             )
         if not put.outcome.ok:
+            # The PUT did not return 2xx. Split on what W01 KNOWS about the
+            # effect, carried on outcome.write_outcome. An UNKNOWN outcome (a
+            # dropped connection after the request may have landed, a deadline
+            # cut, a response-too-large refusal, a vendor-marked ambiguous 5xx)
+            # must NOT read as a determinate "not committed" and must NOT be
+            # auto-replayed here: a caller told "not committed" retries, and a
+            # retry of a write that DID land is how a duplicate write / clobber
+            # happens. It is carried OUT as WriteStatus.UNKNOWN; only L07's
+            # replay_decision may reissue it, and only under an explicit
+            # idempotency assertion.
+            if put.outcome.write_outcome == ATTEMPT_UNKNOWN:
+                return RoundtripOutcome(
+                    location=location,
+                    fmt=fmt,
+                    write_status=WriteStatus.UNKNOWN,
+                    verified=False,
+                    downloaded_len=downloaded_len,
+                    committed_len=committed_len,
+                    read_back_kind=None,
+                    write_outcome=put.outcome.write_outcome,
+                    reason="content PUT outcome is UNKNOWN: the write may have "
+                    "landed and then the connection/response failed. This is NOT "
+                    "a determinate result and MUST NOT be blindly replayed "
+                    "(replaying a write that landed duplicates or clobbers); "
+                    "route to L07 replay_decision, which reissues only under an "
+                    "explicit idempotency assertion.",
+                )
+            # A determinate failure the transport did NOT mark unknown: the
+            # effect did not land (a pre-flight refusal, a provider rejection).
+            # Safe to re-derive and retry.
             return RoundtripOutcome(
                 location=location,
                 fmt=fmt,
-                committed=False,
+                write_status=WriteStatus.NOT_COMMITTED,
                 verified=False,
-                conflict=False,
                 downloaded_len=downloaded_len,
                 committed_len=committed_len,
                 read_back_kind=None,
-                reason="content PUT failed at the executor "
-                "(see typed error / write_outcome); not committed",
+                write_outcome=put.outcome.write_outcome,
+                reason="content PUT failed determinately and the transport "
+                "recorded the effect as not applied (see typed error / "
+                "write_outcome); safe to re-derive and retry",
             )
 
         # --- 5. INDEPENDENT content read-back -> re-parse -> verify the edit ---
@@ -501,12 +737,12 @@ def run_content_roundtrip(
         return RoundtripOutcome(
             location=location,
             fmt=fmt,
-            committed=True,
+            write_status=WriteStatus.COMMITTED,
             verified=verified,
-            conflict=False,
             downloaded_len=downloaded_len,
             committed_len=committed_len,
             read_back_kind=rb_kind,
+            write_outcome=put.outcome.write_outcome,
             reason=(
                 "content committed and the intended edit holds on the read-back " "target resource"
                 if verified
