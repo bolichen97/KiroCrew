@@ -99,12 +99,10 @@ def _verifier(*, claimed_subject: str, claimed_tenant: str, service_id: str) -> 
     }
 
 
-def _bound() -> Tuple[Binding, DerivedHandle]:
-    """A binding and a handle derived from it (the binding is needed to fence)."""
-
+def _make_default_binding() -> Binding:
     from kiro_crew.connections.control_plane.binding import create_binding
 
-    binding = create_binding(
+    return create_binding(
         service_id="outlook",
         claimed_subject="alice",
         claimed_tenant="acme",
@@ -112,6 +110,21 @@ def _bound() -> Tuple[Binding, DerivedHandle]:
         verifier=_verifier,  # type: ignore[arg-type]
         slug="outlook",
     )
+
+
+#: Minted ONCE by the real constructor so real_vault seeds the credential under
+#: its OWN per-binding scoped secret_ref name (never a slug name).
+_DEFAULT_BINDING: Binding = _make_default_binding()
+
+
+def _bound() -> Tuple[Binding, DerivedHandle]:
+    """A binding and a handle derived from it (the binding is needed to fence).
+
+    Uses the shared ``_DEFAULT_BINDING`` so the real_vault fixture seeds the
+    credential under its OWN per-binding scoped name -- the per-binding path.
+    """
+
+    binding = dict(_DEFAULT_BINDING)  # type: ignore[assignment]
     handle = derive_handle(
         binding,
         granted_scopes=_GRANTED,
@@ -164,10 +177,8 @@ def _kw(**over: Any) -> Dict[str, Any]:
 def real_vault(tmp_path: Path) -> SecretVault:
     """A REAL, isolated, AES-256-GCM vault on disk holding the binding secret."""
 
-    from kiro_crew.connections.control_plane.binding import binding_secret_ref
-
     vault = SecretVault(tmp_path / "crewhome")
-    vault.set_sync(binding_secret_ref("outlook")["name"], "outlook-live-token")
+    vault.set_sync(_DEFAULT_BINDING["secret_ref"]["name"], "outlook-live-token")
     assert (tmp_path / "crewhome" / ".vault" / "secrets.enc").is_file()
     return vault
 
@@ -492,3 +503,43 @@ def test_a_transport_that_says_nothing_still_gives_a_caller_an_empty_mapping() -
     assert dict(ExecutionOutcome().metadata) == {}
     assert ExecutionOutcome().metadata.get("retry-after") is None
     assert TransportResponse(http_status=204).metadata is EMPTY_RESPONSE_METADATA
+
+
+def test_an_allowlisted_header_whose_value_echoes_the_bearer_is_dropped() -> None:
+    """The allowlist gates the NAME; a VALUE that echoes the outbound bearer drops.
+
+    A provider that reflects the request's credential into an allowlisted header
+    (here `etag`, whose name is allowed) would otherwise hand the token back to
+    the caller through `.metadata`. When the outbound `sent_credential` is known,
+    such a value is dropped; an unrelated allowlisted value on the same reply is
+    kept, so the strip is by-value, not by-name.
+    """
+
+    bearer = "s3cr3t-token-value"
+    metadata = response_metadata(
+        {
+            "ETag": bearer,  # provider echoed the token into an allowlisted header
+            "Retry-After": "30",  # a genuine, unrelated allowlisted value
+            "X-RateLimit-Remaining": f"tok={bearer}",  # embedded, not equal
+        },
+        sent_credential=bearer,
+    )
+    # The echoed value and the embedded-echo value are both gone.
+    assert "etag" not in metadata
+    assert "x-ratelimit-remaining" not in metadata
+    # The unrelated allowlisted value survives.
+    assert metadata["retry-after"] == "30"
+    # And the token appears in no metadata value.
+    assert all(bearer not in v for v in metadata.values())
+
+
+def test_without_a_sent_credential_the_projection_is_unchanged() -> None:
+    """The value-strip is a no-op when no outbound credential is supplied.
+
+    Callers that do not know the credential (there are none on this path, but the
+    parameter is optional) get the pure name-allowlist behaviour.
+    """
+
+    metadata = response_metadata({"ETag": "abc123", "Retry-After": "30"})
+    assert metadata["etag"] == "abc123"
+    assert metadata["retry-after"] == "30"

@@ -26,6 +26,7 @@ another delivered ``Bearer <token>`` to the second server.
 from __future__ import annotations
 
 import datetime
+import http.client
 import http.server
 import socket
 import ssl
@@ -134,6 +135,12 @@ def _handle(binding: Binding, *, requested: Tuple[str, ...] = ("mail.read",)) ->
     )
 
 
+#: The default binding, minted ONCE by the real constructor so the real_vault
+#: fixture can seed the credential under its OWN per-binding scoped secret_ref
+#: name (read off the constructor's record), never a slug name.
+_DEFAULT_BINDING: Binding = _binding()
+
+
 def _gate_for(binding: Binding, handle: DerivedHandle) -> BindingCustodyGate:
     """The custody gate a transport is composed with FOR ``handle``'s binding."""
 
@@ -162,9 +169,14 @@ def _live_store(root: Path, *bindings: Binding) -> BindingStore:
 def _bound(**kw: Any) -> Tuple[Binding, DerivedHandle]:
     """A binding plus a handle derived from it (the binding is what gets fenced)."""
 
-    binding = _binding(**{k: v for k, v in kw.items() if k in ("subject", "tenant", "slug")})
+    identity_kw = {k: v for k, v in kw.items() if k in ("subject", "tenant", "slug")}
+    # The default (no identity override) binding is the shared _DEFAULT_BINDING the
+    # real_vault fixture seeds under its OWN per-binding scoped name -- so the
+    # per-binding path is exercised, not a slug path. A test that overrides the
+    # identity mints its own binding and seeds its own name.
+    binding = dict(_DEFAULT_BINDING) if not identity_kw else _binding(**identity_kw)  # type: ignore[assignment]
     requested = kw.get("requested", ("mail.read",))
-    return binding, _handle(binding, requested=requested)
+    return binding, _handle(binding, requested=requested)  # type: ignore[arg-type]
 
 
 def _descriptor(effect: Effect = "read") -> OperationDescriptor:
@@ -224,10 +236,14 @@ class RecordingVault(SecretVault):
 
 @pytest.fixture
 def real_vault(tmp_path: Path) -> RecordingVault:
-    """A real, isolated, encrypted vault holding the outlook binding secret."""
+    """A real, isolated, encrypted vault holding the outlook binding secret.
+
+    Seeded under the shared default binding's OWN per-binding scoped secret_ref
+    name, so the fenced ``select_secret`` read resolves the per-binding entry.
+    """
 
     vault = RecordingVault(tmp_path / "crewhome")
-    vault.set_sync(binding_secret_ref("outlook")["name"], "outlook-live-token")
+    vault.set_sync(_DEFAULT_BINDING["secret_ref"]["name"], "outlook-live-token")
     vault.asked.clear()
     return vault
 
@@ -245,7 +261,7 @@ def test_the_real_vault_under_test_is_an_encrypted_store_on_disk(
     assert b"outlook-live-token" not in raw
     assert isinstance(real_vault, SecretVault)
     # And it round-trips through the real crypto.
-    value = real_vault.get(binding_secret_ref("outlook")["name"])
+    value = real_vault.get(_DEFAULT_BINDING["secret_ref"]["name"])
     assert value is not None and value.reveal() == "outlook-live-token"
 
 
@@ -354,6 +370,7 @@ def _handler_for(
 def _https_server(handler_cls: Any, certfile: Path, keyfile: Path) -> Iterator[int]:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(certfile), str(keyfile))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -423,6 +440,49 @@ def test_a_cross_origin_redirect_is_refused_by_default_and_the_target_sees_nothi
     # Hop 2 was never even contacted: no request, so nothing to leak.
     assert target_rec.hits == 0
     assert "follows no redirects" in str(caught.value)
+
+
+def test_a_malformed_redirect_target_is_refused_not_crashed(
+    trust_loopback: Tuple[Path, Path],
+) -> None:
+    """F2: a redirect whose URL cannot be parsed is a typed refusal, not a crash.
+
+    A provider answering ``Location: https://host:notaport/`` makes
+    ``urlsplit(...).port`` raise ``ValueError``. Pre-fix that escaped the transport
+    uncaught (a crashed dispatch); post-fix it becomes a ``RedirectRefusedError``
+    -- the class every other unfollowable redirect yields -- so the caller sees a
+    typed refusal and hop 2 is never contacted.
+    """
+
+    certfile, keyfile = trust_loopback
+    origin_rec = _Recorder()
+    with _https_server(
+        _handler_for(
+            origin_rec,
+            reply=lambda: (302, {"Location": "https://host:notaport/next"}, b""),
+        ),
+        certfile,
+        keyfile,
+    ) as origin_port:
+        with pytest.raises(RedirectRefusedError) as caught:
+            urllib_http_send(
+                HttpRequest(
+                    method="GET",
+                    url=f"https://localhost:{origin_port}/start",
+                    headers={"Authorization": "Bearer LEAK-CANARY"},
+                ),
+                timeout_seconds=10.0,
+                # An allowlist is injected so the send gets PAST the follow-nothing
+                # gate to the per-hop parse -- which is where the malformed target
+                # makes urlsplit(...).port raise. (The malformed host would never be
+                # in a real allowlist; what is under test is that the PARSE failure
+                # is a typed refusal, reached before the allowlist membership check.)
+                allowed_redirect_hosts=frozenset({f"localhost:{origin_port}", "host:notaport"}),
+            )
+    # A typed refusal that names the parse failure, not a raw ValueError.
+    assert "could not be parsed" in str(caught.value)
+    # Hop 1 saw the credential (its authorized origin); nothing leaked past it.
+    assert origin_rec.authorization_seen() == ["Bearer LEAK-CANARY"]
 
 
 def test_an_allowlisted_cross_origin_hop_travels_with_the_credential_stripped(
@@ -586,7 +646,7 @@ def test_a_refused_redirect_reaches_the_executor_as_a_typed_error(
     assert target_rec.hits == 0
     # The real vault WAS read (the credential is needed for hop 1) and the token
     # reached only the origin.
-    assert real_vault.asked == ["CONNECTIONS_OUTLOOK_BINDING_SECRET"]
+    assert real_vault.asked == [_DEFAULT_BINDING["secret_ref"]["name"]]
     assert origin_rec.authorization_seen() == ["Bearer outlook-live-token"]
     # A read has no effect to be uncertain about.
     assert outcome.write_outcome is None
@@ -612,8 +672,10 @@ def test_the_real_vault_resolves_this_bindings_secret_for_a_matching_call(
         outcome = execute(_descriptor(), handle, transport, **_kw())
 
     assert outcome.error is None
-    # Resolved by NAME out of the real encrypted store, and it reached the wire.
-    assert real_vault.asked == ["CONNECTIONS_OUTLOOK_BINDING_SECRET"]
+    # Resolved by the per-binding NAME out of the real encrypted store (the scoped
+    # name the constructor recorded, NOT the slug), and it reached the wire.
+    assert real_vault.asked == [_DEFAULT_BINDING["secret_ref"]["name"]]
+    assert binding_secret_ref("outlook")["name"] not in real_vault.asked
     assert rec.authorization_seen() == ["Bearer outlook-live-token"]
 
 
@@ -624,9 +686,9 @@ def test_a_transport_refuses_a_call_from_another_binding_and_never_reads_the_vau
     """The counterexample: composed for X, called for Y -> refuse, resolve nothing.
 
     Both bindings are the SAME service and the SAME credential mode -- the two
-    axes the executor used to pass -- and differ only in the verified
-    subject/tenant behind them. That is precisely the pair the old composition
-    could not tell apart.
+    axes the executor passes -- and differ only in the verified
+    subject/tenant behind them. That is precisely the pair a slug-keyed composition
+    cannot tell apart.
     """
 
     binding_x = _binding(subject="alice", tenant="acme")
@@ -748,10 +810,11 @@ def test_the_send_path_takes_the_entry_name_from_the_store_never_from_the_slug(
 ) -> None:
     """The closed gap, pinned: per-binding separation is REAL on the send path now.
 
-    This used to be a NAMED GAP -- the transport derived the vault entry name with
+    This closes a NAMED GAP -- a transport that derived the vault entry name with
     :func:`~kiro_crew.connections.control_plane.binding.binding_secret_ref` from the
-    provider SLUG alone, so two bindings of the SAME provider (different subjects,
-    different tenants) resolved the SAME vault entry. Per-binding custody was
+    provider SLUG alone would resolve the SAME vault entry for two bindings of the
+    SAME provider (different subjects,
+    different tenants). Per-binding custody would be
     apparent, not real.
 
     It is closed by resolving through L04's live store: the name comes from the
@@ -762,23 +825,21 @@ def test_the_send_path_takes_the_entry_name_from_the_store_never_from_the_slug(
 
     binding_a = _binding(subject="alice", tenant="acme")
     binding_b = _binding(subject="bob", tenant="globex")
-    # Per-binding entry names -- the axis the slug cannot express.
-    binding_a["secret_ref"] = dict(binding_a["secret_ref"])  # type: ignore[typeddict-item]
-    binding_a["secret_ref"]["name"] = "CONNECTIONS_OUTLOOK_BINDING_SECRET__A"
-    binding_b["secret_ref"] = dict(binding_b["secret_ref"])  # type: ignore[typeddict-item]
-    binding_b["secret_ref"]["name"] = "CONNECTIONS_OUTLOOK_BINDING_SECRET__B"
+    # Per-binding entry names come from the CONSTRUCTOR's own record, not stamped
+    # by the test: two bindings under one provider get two DIFFERENT scoped names,
+    # the axis the slug cannot express. Read them off the records to prove it.
+    name_a = binding_a["secret_ref"]["name"]
+    name_b = binding_b["secret_ref"]["name"]
+    assert name_a != name_b
 
     # The SLUG-derived name is ONE name for both -- the defect, kept as the
     # counter-example, and it is not what either send resolves.
     slug_name = binding_secret_ref("outlook")["name"]
-    assert slug_name not in (
-        binding_a["secret_ref"]["name"],
-        binding_b["secret_ref"]["name"],
-    )
+    assert slug_name not in (name_a, name_b)
 
     vault = RecordingVault(tmp_path / "crewhome")
-    vault.set_sync(binding_a["secret_ref"]["name"], "token-for-alice")
-    vault.set_sync(binding_b["secret_ref"]["name"], "token-for-bob")
+    vault.set_sync(name_a, "token-for-alice")
+    vault.set_sync(name_b, "token-for-bob")
     vault.set_sync(slug_name, "the-collapsed-slug-token")
     vault.asked.clear()
 
@@ -801,26 +862,25 @@ def test_the_send_path_takes_the_entry_name_from_the_store_never_from_the_slug(
         )
         assert execute(_descriptor(), handle, transport, **_kw()).error is None
 
-    # TWO DIFFERENT credentials reached the wire, per binding.
+    # TWO DIFFERENT credentials reached the wire, per binding -- B could not read
+    # A's token and vice versa, because each resolves ITS OWN per-binding name.
     assert [r.headers["Authorization"] for r in sent] == [
         "Bearer token-for-alice",
         "Bearer token-for-bob",
     ]
     # And the vault was asked ONLY for the store's per-binding names -- the
     # slug-derived name was never looked up, on either call.
-    assert vault.asked == [
-        binding_a["secret_ref"]["name"],
-        binding_b["secret_ref"]["name"],
-    ]
+    assert vault.asked == [name_a, name_b]
     assert slug_name not in vault.asked
 
 
 def test_l04_generation_fencing_is_judged_on_the_send_path(tmp_path: Path) -> None:
     """The other closed gap: the send path now judges ``generation``, via the store.
 
-    This used to say "the selector matches a BINDING, not a generation" -- a
-    handle from generation N still resolved after the binding moved to N+1,
-    because nothing on this path compared generations. The live-store fence
+    Without this fence a "selector matches a BINDING, not a generation" design --
+    a handle from generation N still resolving after the binding moves to N+1,
+    because nothing on the path compares generations -- would leak a stale
+    credential. The live-store fence
     (``assert_live`` inside ``select_secret``) compares them EXACTLY, so a stale
     generation is refused with nothing emitted and no vault read.
     """
@@ -1123,6 +1183,67 @@ def test_feeding_that_unknown_into_l07_refuses_a_blind_replay(
             descriptor, misrecorded, request_args=args, request_idempotency_key="idem-7"
         )["verdict"]
         == REPLAY_ALLOW
+    )
+
+
+def test_a_server_committed_then_disconnect_records_unknown_and_l07_refuses_replay(
+    tmp_path: Path,
+    real_vault: RecordingVault,
+) -> None:
+    """A raw ``http.client.RemoteDisconnected`` on a write -> ``unknown``, replay refused.
+
+    Guards the escape a narrow ``except (URLError, TimeoutError, ...)``
+    tuple leaves open. ``RemoteDisconnected`` is a ``ConnectionResetError``
+    (-> ``ConnectionError``) AND an ``http.client.BadStatusLine``
+    (-> ``HTTPException``), but is NOT a ``URLError``, so a server that COMMITTED
+    the write and then dropped the reply would propagate the exception past a
+    ``URLError``-only
+    branch -- no ``write_outcome=unknown``, so no L07 replay-gate protection, so a
+    blind retry would double-send. The fix names ``ConnectionError`` and
+    ``http.client.HTTPException`` in the tuple; this pins the outcome as ``unknown``
+    (NOT ``failed_not_applied``) and asserts L07 refuses the replay.
+    """
+
+    def _committed_then_dropped(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+    descriptor = _write_descriptor()
+    binding, handle = _bound(requested=("mail.send",))
+    transport = build_production_transport(
+        gate=_gate_for(binding, handle),
+        store=_live_store(tmp_path, binding),
+        vault=real_vault,
+        locator=_locator_to(
+            "https://graph.example.invalid/v1/me/sendMail", method="POST", body=b"{}"
+        ),
+        http_send=_committed_then_dropped,
+    )
+    args = {"to": "someone@example.invalid"}
+    outcome = execute(
+        descriptor,
+        handle,
+        transport,
+        request_args=args,
+        request_idempotency_key="idem-disc-1",
+        **_kw(governance_item="messages.send"),
+    )
+    # The exception does not escape: a structured ambiguous outcome instead.
+    assert outcome.error is not None
+    assert outcome.write_outcome == ATTEMPT_UNKNOWN
+    assert outcome.write_outcome != ATTEMPT_FAILED_NOT_APPLIED
+
+    # And L07 refuses to replay the non-idempotent write on that `unknown`.
+    record = record_attempt(
+        operation_id=descriptor["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="idem-disc-1",
+        outcome="unknown",
+    )
+    assert (
+        replay_decision(
+            descriptor, record, request_args=args, request_idempotency_key="idem-disc-1"
+        )["verdict"]
+        == REPLAY_REFUSE
     )
 
 

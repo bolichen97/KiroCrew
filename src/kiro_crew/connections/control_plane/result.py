@@ -8,10 +8,10 @@ and a runtime dispatch read one vocabulary for "did it fully succeed, partly
 succeed, or is there more to fetch" -- and one vocabulary for "here is what came
 back" -- instead of each inventing its own.
 
-The envelope used to describe the outcome and NOTHING ELSE, which made the
-success path functionally empty: a caller that got ``{"status": "ok",
-"next_cursor": None}`` held no items, no object and no bytes, so every operation
-in the plane succeeded at returning nothing. :data:`OperationPayload` closes
+The envelope describes the outcome; a shape that carried NOTHING ELSE would make
+the success path functionally empty: a caller that got ``{"status": "ok",
+"next_cursor": None}`` would hold no items, no object and no bytes, so every operation
+in the plane would succeed at returning nothing. :data:`OperationPayload` closes
 that. It is ONE neutral channel with exactly three preserved shapes -- a
 COLLECTION (:class:`CollectionPayload`), a SINGLE OBJECT
 (:class:`ObjectPayload`), and RAW BYTES (:class:`BytesPayload`, which is how an
@@ -174,10 +174,10 @@ class BytesPayload:
     * **Never coerced.** Nothing on this path calls ``.decode()``. An ``xlsx`` is
       a ZIP container: it is not valid UTF-8, so a decode either raises or (with
       ``errors="replace"``) silently substitutes replacement characters and
-      produces a file that no longer opens. ``data`` is the provider's bytes,
+      produces a file that fails to open. ``data`` is the provider's bytes,
       byte for byte.
-    * **Never dropped.** The body used to be discarded on the way to the envelope,
-      which turned a downloaded workbook into a bare ``status``.
+    * **Never dropped.** Discarding the body on the way to the envelope would
+      turn a downloaded workbook into a bare ``status``.
 
     ``data`` -- the exact bytes. ``media_type`` -- what the provider DECLARED the
     bytes are (the ``Content-Type`` value, parameters included, verbatim), or
@@ -231,7 +231,7 @@ def result_with_payload(
     """Build an envelope carrying ``payload`` and, for a collection, its cursor.
 
     ``next_cursor`` is an EXPLICIT argument and lands in exactly one place: the
-    envelope. It used to be derived from ``CollectionPayload.next_cursor``, which
+    envelope. Deriving it from a ``CollectionPayload.next_cursor`` would
     read as safe -- one constructor wrote both copies -- but only for envelopes
     that went through this function. An :class:`OperationResult` is a
     ``TypedDict``; a producer can build one literally and a middle layer can

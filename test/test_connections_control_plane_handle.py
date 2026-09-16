@@ -29,10 +29,12 @@ from kiro_crew.connections.control_plane import (
     create_binding,
     derive_handle,
     ensure_usable,
+)
+from kiro_crew.connections.control_plane import handle as handle_mod
+from kiro_crew.connections.control_plane import (
     is_expired,
     next_generation,
 )
-from kiro_crew.connections.control_plane import handle as handle_mod
 from kiro_crew.connections.control_plane.errors import ERROR_INPUT, ERROR_SCOPE
 from kiro_crew.connections.control_plane.handle import _binding_fingerprint
 
@@ -297,7 +299,7 @@ def test_a_usable_handle_returns_a_trusted_view() -> None:
 def test_a_handle_from_before_restart_is_refused() -> None:
     # The issuance registry is process-local and in-memory; a restart starts it
     # empty. Simulate a restart by clearing the registry AFTER minting: the
-    # handle's id no longer resolves, so ensure_usable fails closed with a typed
+    # handle's id does not resolve, so ensure_usable fails closed with a typed
     # auth refusal (NOT silently accepted, NOT treated as valid).
     handle = _make_handle(now=_T0, ttl_seconds=10_000.0)
     ensure_usable(handle, now=_T0 + 1.0)  # usable before the "restart"

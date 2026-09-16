@@ -121,6 +121,11 @@ def _handle(
     )
 
 
+#: Minted ONCE by the real constructor; the production-transport tests seed the
+#: vault under its OWN per-binding scoped secret_ref name (never a slug name).
+_DEFAULT_BINDING: Binding = _binding()
+
+
 def _descriptor(effect="read", modes=("oauth_user",), service="outlook") -> OperationDescriptor:
     return {
         "operation_id": "outlook.messages.list",
@@ -820,9 +825,14 @@ def _live_store(root: Path, *bindings: Binding) -> BindingStore:
 
 
 def _bound(**kw) -> tuple[Binding, DerivedHandle]:
-    """A binding plus a handle derived from it (the binding is what gets fenced)."""
+    """A binding plus a handle derived from it (the binding is what gets fenced).
 
-    binding = kw.pop("binding", None) or _binding()
+    Uses the shared ``_DEFAULT_BINDING`` unless a `binding` is passed, so its
+    per-binding scoped secret_ref (the constructor's own record) is what the tests
+    seed -- the per-binding path, not a slug path.
+    """
+
+    binding = kw.pop("binding", None) or dict(_DEFAULT_BINDING)
     return binding, _handle(binding=binding, **kw)
 
 
@@ -837,7 +847,7 @@ def test_the_module_no_longer_claims_it_performs_no_network() -> None:
 
 
 def test_production_transport_resolves_the_secret_through_the_vault(tmp_path: Path) -> None:
-    secret_ref = binding_secret_ref("outlook")
+    secret_ref = _DEFAULT_BINDING["secret_ref"]
     vault = StubVault({secret_ref["name"]: "tok-live"})
     sent: list[HttpRequest] = []
 
@@ -855,9 +865,9 @@ def test_production_transport_resolves_the_secret_through_the_vault(tmp_path: Pa
     )
     outcome = execute(_descriptor(), handle, transport, **_kw())
     assert outcome.ok
-    # The vault was asked for the BINDING's recorded entry name -- the existing
-    # CONNECTIONS_<SLUG>_BINDING_SECRET family, not a new naming scheme.
-    assert vault.asked == ["CONNECTIONS_OUTLOOK_BINDING_SECRET"]
+    # The vault was asked for the BINDING's recorded PER-BINDING entry name (the
+    # scoped name the constructor produced), not a slug name.
+    assert vault.asked == [_DEFAULT_BINDING["secret_ref"]["name"]]
     # The resolved secret reached the wire as a bearer credential, and the
     # vendor locator never had to see it.
     assert sent[0].headers["Authorization"] == "Bearer tok-live"
@@ -906,7 +916,7 @@ def test_resolve_binding_secret_refuses_a_foreign_backend() -> None:
 
 
 def test_production_transport_maps_a_412_to_the_preconditions_it_asserted(tmp_path: Path) -> None:
-    secret_ref = binding_secret_ref("outlook")
+    secret_ref = _DEFAULT_BINDING["secret_ref"]
     vault = StubVault({secret_ref["name"]: "tok"})
 
     def _if_match_locator(**kwargs) -> HttpRequest:
@@ -939,7 +949,7 @@ def test_production_transport_maps_a_412_to_the_preconditions_it_asserted(tmp_pa
 def test_production_transport_412_without_an_asserted_precondition_is_unknown(
     tmp_path: Path,
 ) -> None:
-    secret_ref = binding_secret_ref("outlook")
+    secret_ref = _DEFAULT_BINDING["secret_ref"]
     vault = StubVault({secret_ref["name"]: "tok"})
 
     def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
@@ -960,7 +970,7 @@ def test_production_transport_412_without_an_asserted_precondition_is_unknown(
 
 
 def test_production_transport_refuses_a_non_https_url_without_sending(tmp_path: Path) -> None:
-    secret_ref = binding_secret_ref("outlook")
+    secret_ref = _DEFAULT_BINDING["secret_ref"]
     vault = StubVault({secret_ref["name"]: "tok"})
 
     def _plain_http_locator(**kwargs) -> HttpRequest:
@@ -1012,3 +1022,45 @@ def test_production_symbols_are_reachable_on_control_plane_only() -> None:
         assert hasattr(cp, name), name
         assert name in cp.__all__, name
         assert name not in connections.__all__, f"{name} leaked into connections.__all__"
+
+
+def test_every_authorization_decision_emits_one_sel_event(monkeypatch) -> None:
+    """F1: allow and deny each leave exactly one SEL audit event.
+
+    ``execute`` reaches one final authorization decision per call. Before this
+    fix neither allow nor deny recorded anything, so an authorization left no
+    audit trail. Capture ``sel().log`` and assert: a denied gate emits ONE deny
+    event (carrying the redacted error_class, no secret), and a permitted call
+    emits ONE allow event -- both under the connections authorization event type.
+    """
+
+    import kiro_crew.sel as sel_mod
+
+    logged: list = []
+
+    class _CapturingSel:
+        def log(self, event) -> None:
+            logged.append(event)
+
+    monkeypatch.setattr(sel_mod, "sel", lambda: _CapturingSel())
+
+    # Deny: offered mode not permitted -> one deny event, zero transport calls.
+    transport = FakeTransport(_ok_response())
+    denied = execute(
+        _descriptor(), _handle(), transport, **_kw(permitted=declare_permitted_modes(()))
+    )
+    assert denied.error is not None
+    assert len(transport.calls) == 0
+    deny_events = [e for e in logged if e.event_type == "connections.operation.authorization"]
+    assert len(deny_events) == 1
+    assert deny_events[0].outcome == "deny"
+    # The redacted error_class rides the deny; the secret value never does.
+    assert "error_class=auth" in deny_events[0].resources
+
+    # Allow: a permitted call dispatches -> one allow event.
+    logged.clear()
+    allowed = execute(_descriptor(), _handle(), FakeTransport(_ok_response()), **_kw())
+    assert allowed.error is None
+    allow_events = [e for e in logged if e.event_type == "connections.operation.authorization"]
+    assert len(allow_events) == 1
+    assert allow_events[0].outcome == "allow"

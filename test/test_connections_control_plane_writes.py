@@ -263,7 +263,7 @@ def test_writes_symbols_live_on_the_canonical_subpackage_only() -> None:
         ), f"{name} must not be attribute-reachable at top level"
 
 
-# --- round 14 counterexamples: three real defects --------------------------
+# --- counterexamples: three real defects -----------------------------------
 
 
 def test_effect_delete_alone_is_not_treated_as_idempotent() -> None:
@@ -353,7 +353,7 @@ def test_succeeded_without_a_recorded_result_is_refused_not_empty_reuse() -> Non
 
 
 def test_args_attribution_cannot_be_silently_skipped() -> None:
-    # RESIDUAL DEFECT (round 15): with the same operation_id but a DIFFERENT
+    # With the same operation_id but a DIFFERENT
     # args fingerprint, a caller that does not opt into the args check must NOT
     # be able to get allow/reuse. The gate must compare the request's args
     # unconditionally -- there is no way to call it without supplying them.

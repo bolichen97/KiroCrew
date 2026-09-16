@@ -36,16 +36,37 @@ Four load-bearing properties, each a distinct defence:
    only. It does not implement refresh or revoke** (that is L04), and nothing
    here decides what a bumped generation invalidates.
 
-4. **The secret is a REFERENCE and metadata, never a value.** A binding records
-   a :class:`SecretRef` -- the vault entry NAME plus enough metadata (backend,
-   the moment it was bound) to find and reason about the secret -- and it is a
-   *hard invariant of the type* that no plaintext lives on it. The name follows
-   the same ``CONNECTIONS_<SLUG>_...`` shape ``oauth_clients.client_secret_name``
-   already uses for the Secrets panel, via :func:`binding_secret_ref`, so a
-   binding's secret and a pre-registered client's secret read as the same family
-   of vault entry rather than two naming schemes. Resolving that name to a
+4. **The secret is a REFERENCE and metadata, never a value -- and the reference
+   is PER-BINDING, not per-provider.** A binding records a :class:`SecretRef` --
+   the vault entry NAME plus enough metadata (backend, the moment it was bound)
+   to find and reason about the secret -- and it is a *hard invariant of the
+   type* that no plaintext lives on it. Crucially the name is scoped to THIS
+   binding's own verified identity (its ``binding_id`` and verified
+   subject/tenant) via :func:`binding_scoped_secret_ref`, NOT merely to the
+   provider slug: two bindings for two different subjects/tenants under one
+   provider therefore point at two DIFFERENT vault entries, so a credential is
+   bound to the identity it serves and one binding can never resolve to
+   another's secret. The name still follows the ``CONNECTIONS_<SLUG>_...`` family
+   ``oauth_clients.client_secret_name`` uses for the Secrets panel, with a
+   per-binding scope segment appended. The legacy slug-level
+   :func:`binding_secret_ref` is retained for compatibility but is explicitly
+   NOT an identity-bound reference (see its docstring). Resolving that name to a
    :class:`~kiro_crew.secrets.SecretVault` / :class:`~kiro_crew.secrets.SecretValue`
    is a later leaf's job; this module only writes down WHERE the secret is.
+
+Resolving a principal to its binding, on the verified identity alone
+--------------------------------------------------------------------
+:func:`resolve_binding_for_principal` answers "which binding does THIS principal
+own" -- and it keys the lookup on a VERIFIED identity, never on what the caller
+claimed. It runs the same :class:`SubjectTenantVerifier` contract
+:func:`create_binding` uses, then matches a binding by the verifier's returned
+``subject_ref``/``tenant_ref`` (plus ``service_id``). A claim that does not
+verify raises :class:`BindingVerificationError`; a verified principal with no
+matching binding (or, fail-closed, more than one) raises
+:class:`BindingResolutionError`. Because both the lookup key and each binding's
+``secret_ref`` are per-identity, principal B can never resolve to principal A's
+binding or A's secret reference.
+
 
 The old-custody invariant, restated because it is the sharpest edge
 -------------------------------------------------------------------
@@ -60,9 +81,10 @@ kiro-cli's token store.
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import time
-from typing import Protocol, TypedDict
+from typing import Iterable, Protocol, TypedDict
 
 from kiro_crew.connections.control_plane.operation import CredentialMode, ServiceId
 
@@ -87,6 +109,19 @@ INITIAL_GENERATION = 1
 _SECRET_NAME_PREFIX = "CONNECTIONS_"
 _SECRET_NAME_SUFFIX = "_BINDING_SECRET"
 
+#: Infix marking the per-binding scope segment inside a scoped secret name,
+#: e.g. ``CONNECTIONS_GITHUB_BINDING_<scope>_SECRET``. Lets a reader tell a
+#: per-binding (identity-scoped) name apart from the legacy slug-level one at a
+#: glance, and keeps the scope hash in its own delimited field.
+_SECRET_SCOPE_INFIX = "_BINDING_"
+
+#: Hex chars of the per-binding scope segment. Derived from a SHA-256 over the
+#: binding's identity (id + verified subject/tenant); 16 hex chars = 64 bits is
+#: ample to keep two distinct identities from colliding on one vault name while
+#: keeping the entry name readable. The scope is an OPAQUE disambiguator, not a
+#: secret and not something to parse back into an identity.
+_SECRET_SCOPE_HEX = 16
+
 #: The vault backend a ``SecretRef`` names, matching ``SecretVault._BACKEND``.
 #: A binding records WHICH backend holds the secret so a later resolver does not
 #: have to assume; today there is one, and pinning it keeps the record honest if
@@ -105,19 +140,72 @@ def _slug_token(slug: str) -> str:
 
 
 def binding_secret_ref(slug: str, *, backend: str = SECRET_BACKEND_VAULT) -> "SecretRef":
-    """Build the :class:`SecretRef` for ``slug``'s per-binding grant secret.
+    """LEGACY slug-level secret name -- NOT an identity-bound reference.
 
-    The vault entry NAME follows the ``CONNECTIONS_<SLUG>_BINDING_SECRET`` family
-    (``oauth_clients.client_secret_name`` uses ``_CLIENT_SECRET`` for the
-    operator's application credential; a binding's own grant secret takes the
-    distinct ``_BINDING_SECRET`` suffix so the two never collide in the vault).
-    ``bound_at`` is stamped at call time so the record carries when the reference
-    was established. This returns only a NAME and metadata -- never a value; the
-    secret itself is written to and read from the vault by a different leaf.
+    Returns a vault name derived ONLY from the provider ``slug``
+    (``CONNECTIONS_<SLUG>_BINDING_SECRET``), so EVERY binding under one provider
+    gets the SAME name. That is exactly why it must NOT be used as the secret
+    reference a binding stores: two bindings for two different subjects/tenants
+    would then share one credential, and "the credential is bound to the identity
+    it serves" would not hold. This function is retained only for backward
+    compatibility with call sites that still key a secret by slug alone (e.g. a
+    single operator-level application credential per provider); a per-binding
+    grant secret MUST use :func:`binding_scoped_secret_ref` instead, and
+    :func:`create_binding` does.
+
+    ``bound_at`` is stamped at call time. This returns only a NAME and metadata,
+    never a value.
     """
 
     return {
         "name": f"{_SECRET_NAME_PREFIX}{_slug_token(slug)}{_SECRET_NAME_SUFFIX}",
+        "backend": backend,
+        "bound_at": time.time(),
+    }
+
+
+def _secret_scope(binding_id: str, subject_ref: str, tenant_ref: str) -> str:
+    """Opaque per-binding scope segment from the binding's own identity.
+
+    A SHA-256 over the binding id and its VERIFIED subject/tenant, truncated to
+    :data:`_SECRET_SCOPE_HEX` hex chars. Two different identities yield different
+    scopes, so their secret names differ; the same identity yields a stable
+    scope. NUL-delimited so distinct field boundaries cannot be forged by a value
+    that contains the delimiter. The result is an OPAQUE disambiguator, never
+    reversed back into an identity and never itself a secret.
+    """
+
+    material = f"{binding_id}\x00{subject_ref}\x00{tenant_ref}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:_SECRET_SCOPE_HEX]
+
+
+def binding_scoped_secret_ref(
+    slug: str,
+    *,
+    binding_id: str,
+    subject_ref: str,
+    tenant_ref: str,
+    backend: str = SECRET_BACKEND_VAULT,
+) -> "SecretRef":
+    """Build the PER-BINDING :class:`SecretRef` a binding stores.
+
+    Unlike the legacy :func:`binding_secret_ref`, the vault name here is scoped
+    to THIS binding's own verified identity: ``binding_id`` plus the verified
+    ``subject_ref`` / ``tenant_ref`` are hashed into an opaque scope segment
+    (:func:`_secret_scope`) placed inside the ``CONNECTIONS_<SLUG>_BINDING_...``
+    family -- ``CONNECTIONS_<SLUG>_BINDING_<scope>_SECRET``. Two bindings for two
+    different subjects/tenants under one provider therefore get two DIFFERENT
+    names, so a credential is bound to the identity it serves and one binding can
+    never point at another's secret.
+
+    ``bound_at`` is stamped at call time. This returns only a NAME and metadata,
+    never a value; the secret itself lives in and is read from the vault by a
+    later leaf, under this per-binding name.
+    """
+
+    scope = _secret_scope(binding_id, subject_ref, tenant_ref)
+    return {
+        "name": f"{_SECRET_NAME_PREFIX}{_slug_token(slug)}{_SECRET_SCOPE_INFIX}{scope}_SECRET",
         "backend": backend,
         "bound_at": time.time(),
     }
@@ -128,9 +216,12 @@ class SecretRef(TypedDict):
 
     Every field present, matching the sibling descriptors' shape.
 
-    ``name`` -- the vault entry name (``CONNECTIONS_<SLUG>_BINDING_SECRET``),
-    resolved to a :class:`~kiro_crew.secrets.SecretValue` by a later leaf, never
-    here. ``backend`` -- which store holds it (see :data:`SECRET_BACKEND_VAULT`).
+    ``name`` -- the vault entry name. For a binding's own grant secret this is
+    the PER-BINDING name ``CONNECTIONS_<SLUG>_BINDING_<scope>_SECRET`` from
+    :func:`binding_scoped_secret_ref` (the scope segment is derived from the
+    binding's identity, so two identities never share a name); resolved to a
+    :class:`~kiro_crew.secrets.SecretValue` by a later leaf, never here.
+    ``backend`` -- which store holds it (see :data:`SECRET_BACKEND_VAULT`).
     ``bound_at`` -- absolute POSIX-seconds UTC when the reference was recorded.
 
     It is a hard invariant that NO plaintext secret is ever placed on this type:
@@ -214,16 +305,15 @@ class BindingVerificationError(Exception):
 
 
 class BindingResolutionError(Exception):
-    """Raised when a VERIFIED principal resolves to no single live binding.
+    """Raised when a VERIFIED principal resolves to no single binding.
 
-    The typed refusal of a binding LOOKUP, as distinct from
+    The typed refusal of :func:`resolve_binding_for_principal`: the principal
+    verified, but the binding store holds either zero matches (nothing to
+    resolve) or -- fail-closed -- more than one (an ambiguous store must never
+    be silently narrowed to a guess). Distinct from
     :class:`BindingVerificationError`, which fires earlier when the CLAIM itself
-    does not verify. In this branch the raiser is L04's trusted store
-    (:mod:`~kiro_crew.connections.control_plane.lifecycle`): zero matches
-    (nothing to resolve), more than one match (fail-closed -- an ambiguous store
-    must never be silently narrowed to a guess), an unknown ``binding_id`` on
-    rotate/revoke, or a ``secret_ref`` name the reader does not hold. The message
-    names neither a secret value nor which other principals exist.
+    does not verify. The message names neither a secret value nor which other
+    principals exist.
     """
 
 
@@ -249,8 +339,10 @@ def create_binding(
     2. Mints a random, unguessable ``binding_id`` from :func:`secrets.token_hex`
        -- independent of slug/tenant/subject, so it cannot be reconstructed from
        public inputs.
-    3. Records a :class:`SecretRef` (name + metadata via
-       :func:`binding_secret_ref`) -- the secret's LOCATION, never its value.
+    3. Records a PER-BINDING :class:`SecretRef` (name + metadata via
+       :func:`binding_scoped_secret_ref`) scoped to this binding's own id and
+       verified subject/tenant -- the secret's LOCATION, never its value, and
+       distinct from every other binding's under the same provider.
     4. Stamps ``generation`` at :data:`INITIAL_GENERATION`; raising it later is
        :func:`next_generation` / L04, not this call.
 
@@ -268,17 +360,87 @@ def create_binding(
         service_id=service_id,
     )
 
+    binding_id = secrets.token_hex(_BINDING_ID_BYTES)
     return {
-        "binding_id": secrets.token_hex(_BINDING_ID_BYTES),
+        "binding_id": binding_id,
         "service_id": service_id,
         # Store ONLY the verified identity -- never the claimed_* inputs.
         "subject_ref": verified["subject_ref"],
         "tenant_ref": verified["tenant_ref"],
         "credential_mode": credential_mode,
         "generation": INITIAL_GENERATION,
-        "secret_ref": binding_secret_ref(slug, backend=secret_backend),
+        # Per-binding: scoped to THIS binding's id + verified identity, so two
+        # bindings under one provider never share a secret reference.
+        "secret_ref": binding_scoped_secret_ref(
+            slug,
+            binding_id=binding_id,
+            subject_ref=verified["subject_ref"],
+            tenant_ref=verified["tenant_ref"],
+            backend=secret_backend,
+        ),
         "created_at": time.time(),
     }
+
+
+def resolve_binding_for_principal(
+    bindings: Iterable[Binding],
+    *,
+    service_id: ServiceId,
+    claimed_subject: str,
+    claimed_tenant: str,
+    verifier: SubjectTenantVerifier,
+) -> Binding:
+    """Resolve the binding a VERIFIED principal owns -- on identity, not a claim.
+
+    This is the trusted ``principal -> provider/account binding`` lookup. It does
+    NOT trust the caller's asserted principal: it runs the SAME
+    :class:`SubjectTenantVerifier` contract :func:`create_binding` uses over the
+    ``claimed_*`` inputs, and then matches a binding by the verifier's returned
+    :class:`VerifiedIdentity` (``subject_ref`` / ``tenant_ref``) together with
+    ``service_id``. The claimed values are used ONLY to verify; the match key is
+    the verified identity, so a caller cannot resolve to a binding by naming a
+    subject/tenant it has not proven.
+
+    Pure and IO-free: ``bindings`` is the candidate set the caller already holds
+    (a later leaf owns where it is persisted and read from). Returns the single
+    matching :class:`Binding`.
+
+    Raises :class:`BindingVerificationError` if the claim does not verify (from
+    the verifier). Raises :class:`BindingResolutionError`, fail-closed, if the
+    verified principal matches no binding, or -- deliberately -- more than one:
+    an ambiguous store is never silently narrowed to one guess.
+
+    Because a binding's ``secret_ref`` is per-binding (see
+    :func:`binding_scoped_secret_ref`), resolving principal B yields B's binding
+    and thus B's own secret reference; it can never surface principal A's binding
+    or A's secret.
+    """
+
+    verified = verifier(
+        claimed_subject=claimed_subject,
+        claimed_tenant=claimed_tenant,
+        service_id=service_id,
+    )
+    subject_ref = verified["subject_ref"]
+    tenant_ref = verified["tenant_ref"]
+
+    matches = [
+        b
+        for b in bindings
+        if b["service_id"] == service_id
+        and b["subject_ref"] == subject_ref
+        and b["tenant_ref"] == tenant_ref
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise BindingResolutionError(
+            f"no binding for the verified principal on service {service_id!r}"
+        )
+    raise BindingResolutionError(
+        f"ambiguous: {len(matches)} bindings match the verified principal on "
+        f"service {service_id!r}"
+    )
 
 
 def next_generation(binding: Binding) -> Binding:

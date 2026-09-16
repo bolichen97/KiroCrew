@@ -254,7 +254,7 @@ def replay_decision(
       record for another argument set. This is the residual hole the earlier
       optional-parameter shape left open: honoring a different argument set's
       recorded result is exactly the mis-attribution the gate exists to prevent,
-      and it can no longer be silently skipped.
+      and it cannot be silently skipped.
     - ``record["idempotency_key"]`` != ``request_idempotency_key`` -- a record
       for another key. The key is a REQUIRED argument (not optional): a caller
       that uses no key passes ``""`` explicitly, and the comparison still runs

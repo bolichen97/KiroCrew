@@ -164,7 +164,7 @@ def _is_mode_permitted(permitted: PermittedModes, offered: CredentialMode) -> bo
     """Policy-only membership check -- **NOT an authorization decision.**
 
     A pure predicate over a policy set alone. It does NOT consult the operation
-    descriptor's declared ``credential_modes``, so it must NOT be used to decide
+    descriptor's declared ``credential_modes``, so it must NOT decide
     whether a call is authorized: an operation's outer bound is the descriptor,
     and authorization is :func:`permit_operation`. This helper exists only as an
     internal building block; it is deliberately private (underscore) and absent

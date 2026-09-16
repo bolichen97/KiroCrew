@@ -168,8 +168,8 @@ from kiro_crew.connections.control_plane.writes import (
 #: required ``payload`` (see :data:`~kiro_crew.connections.control_plane.result.RESULT_SCHEMA_VERSION`
 #: ``2``) and :class:`ExecutionOutcome` exposes it as :attr:`ExecutionOutcome.payload`.
 #: An old pin would decode this wrong in the way that matters most: it would read
-#: a success as carrying status + cursor and nothing else, which is exactly what
-#: the whole success path used to be -- so a consumer written against ``2`` drops
+#: a success as carrying status + cursor and nothing else -- so a consumer written
+#: against ``2`` drops
 #: every item, object and byte the operation returned rather than failing loudly.
 #:
 #: ``4`` is two more outer-shape changes:
@@ -611,6 +611,67 @@ def _authorize(
     return view, None, replay
 
 
+def _audit_authorization(
+    *,
+    descriptor: OperationDescriptor,
+    view: Optional[TrustedHandleView],
+    outcome: str,
+    error: Optional[OperationError],
+) -> None:
+    """Emit ONE SEL security event for a final authorization decision.
+
+    Anchor: ``backend-security-controls``. Every ``execute`` call reaches exactly
+    one of ``allow`` (about to dispatch) or ``deny`` (refused before any emit),
+    and each records a SEL event so the authorization decision leaves an audit
+    trail. The identity is the view's ``binding_fingerprint`` -- a one-way keyed
+    digest, never a secret and never invertible into a binding -- plus the trusted
+    routing axes; a denied call whose handle never resolved has no view, and the
+    event says so rather than inventing one. The redacted ``error_class`` (never
+    the detail) rides a deny.
+
+    Soft-fail like the other SEL emitters in the tree: the security log being down
+    must not turn a decided call into an exception. It is a local import so the
+    control plane stays import-time pure (nothing here runs at module load, and
+    the fresh-install/no-deps import path is unaffected).
+    """
+
+    try:
+        import os
+        from datetime import datetime, timezone
+
+        from kiro_crew.sel import SecurityEvent, sel
+
+        resources = f"operation={descriptor.get('operation_id', '?')}"
+        if view is not None:
+            resources += (
+                f" service={view.service_id} mode={view.credential_mode}"
+                f" binding_fp={view.binding_fingerprint}"
+            )
+        else:
+            resources += " binding=unresolved"
+        if outcome == "deny" and error is not None:
+            resources += f" error_class={error.get('error_class', '?')}"
+        sel().log(
+            SecurityEvent(
+                event_id=os.urandom(8).hex(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event_type="connections.operation.authorization",
+                caller_identity=(view.binding_fingerprint if view is not None else "unresolved"),
+                agent="kirocrew",
+                source="connections.control_plane",
+                operation=str(descriptor.get("operation_id", "?")),
+                outcome=outcome,
+                resources=resources,
+            )
+        )
+    except Exception as exc:  # SEL down must not fail a decided call.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "SEL audit for connections authorization failed: %s", exc
+        )
+
+
 def execute(
     descriptor: OperationDescriptor,
     handle: DerivedHandle,
@@ -668,10 +729,12 @@ def execute(
         request_idempotency_key=request_idempotency_key,
     )
     if error is not None:
+        _audit_authorization(descriptor=descriptor, view=view, outcome="deny", error=error)
         return ExecutionOutcome(error=error, view=view)
 
     # Authorized. A recorded success is reused WITHOUT emitting (no duplicate).
     if replay is not None and replay["verdict"] == REPLAY_REUSE:
+        _audit_authorization(descriptor=descriptor, view=view, outcome="allow", error=None)
         return ExecutionOutcome(result=replay["reuse_result"], view=view)
 
     # Emit exactly one call, routed on the TRUSTED axes. The view goes along too:
@@ -679,6 +742,7 @@ def execute(
     # identity this call was authorized for, and the two routing axes alone do
     # not identify a binding (two bindings can share both).
     assert view is not None  # invariant: no error means the view resolved
+    _audit_authorization(descriptor=descriptor, view=view, outcome="allow", error=None)
     response = transport(
         service_id=view.service_id,
         credential_mode=view.credential_mode,
@@ -799,7 +863,7 @@ class PageWalk:
     ``{**base_args, "cursor": cursor}``. Sending the cursor alone would silently
     drop the filter set from page 2 onward -- a different query than page 1 --
     and would change the request's ``args_fingerprint``, so L07's attribution
-    would no longer recognize a retry of a page as the same logical request.
+    would fail to recognize a retry of a page as the same logical request.
 
     ``done`` is True once the last page returned no ``next_cursor`` (or a gate
     denied / a transport error stopped the walk). ``pages`` counts the pages

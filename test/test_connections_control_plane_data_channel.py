@@ -100,12 +100,18 @@ def _verifier(*, claimed_subject: str, claimed_tenant: str, service_id: str) -> 
     }
 
 
-def _bound(*, requested: Tuple[str, ...] = ("mail.read",)) -> Tuple[Binding, DerivedHandle]:
-    """A binding and a handle derived from it (the binding is what gets fenced)."""
+def _make_default_binding() -> Binding:
+    """The default binding, minted by the real constructor -- scoped secret_ref kept.
+
+    Built ONCE at module load so the ``real_vault`` fixture can seed the credential
+    under the binding's OWN per-binding name (read off the record the constructor
+    produced), never a slug name. The two share this object, so the vault holds
+    exactly the name ``select_secret`` will fence-read.
+    """
 
     from kiro_crew.connections.control_plane.binding import create_binding
 
-    binding = create_binding(
+    return create_binding(
         service_id="outlook",
         claimed_subject="alice",
         claimed_tenant="acme",
@@ -113,14 +119,28 @@ def _bound(*, requested: Tuple[str, ...] = ("mail.read",)) -> Tuple[Binding, Der
         verifier=_verifier,  # type: ignore[arg-type]
         slug="outlook",
     )
+
+
+_DEFAULT_BINDING: Binding = _make_default_binding()
+
+
+def _bound(*, requested: Tuple[str, ...] = ("mail.read",)) -> Tuple[Binding, DerivedHandle]:
+    """A binding and a handle derived from it (the binding is what gets fenced).
+
+    Uses the shared ``_DEFAULT_BINDING`` so its per-binding scoped secret_ref (the
+    one the constructor produced) is what the ``real_vault`` fixture seeds -- the
+    per-binding path is exercised, not a slug path.
+    """
+
+    binding = dict(_DEFAULT_BINDING)  # type: ignore[assignment]
     handle = derive_handle(
-        binding,
+        binding,  # type: ignore[arg-type]
         granted_scopes=_GRANTED,
         requested_scopes=requested,
         now=_T0,
         ttl_seconds=300.0,
     )
-    return binding, handle
+    return binding, handle  # type: ignore[return-value]
 
 
 def _gate_for(binding: Binding, handle: DerivedHandle) -> BindingCustodyGate:
@@ -163,12 +183,15 @@ def _kw(**over: Any) -> Dict[str, Any]:
 
 @pytest.fixture
 def real_vault(tmp_path: Path) -> SecretVault:
-    """A REAL, isolated, AES-256-GCM vault on disk holding the binding secret."""
+    """A REAL, isolated, AES-256-GCM vault on disk holding the binding secret.
 
-    from kiro_crew.connections.control_plane.binding import binding_secret_ref
+    Seeded under the shared default binding's OWN per-binding secret_ref name (read
+    off the record ``create_binding`` produced), so the fenced ``select_secret``
+    read resolves the per-binding entry -- not a slug name.
+    """
 
     vault = SecretVault(tmp_path / "crewhome")
-    vault.set_sync(binding_secret_ref("outlook")["name"], "outlook-live-token")
+    vault.set_sync(_DEFAULT_BINDING["secret_ref"]["name"], "outlook-live-token")
     # Guard for the guard: a stub here would make every assertion below vacuous.
     assert (tmp_path / "crewhome" / ".vault" / "secrets.enc").is_file()
     assert (
@@ -325,8 +348,9 @@ def test_a_consumer_receives_the_items_and_the_cursor_of_every_page(
 def test_the_cursor_lives_on_the_envelope_and_nowhere_else() -> None:
     """ITEM 1's pin: there is exactly ONE cursor, and it is the envelope's.
 
-    ``CollectionPayload`` used to carry a second copy, defended as "deliberate
-    duplication written by one constructor". That defence only covered envelopes
+    A ``CollectionPayload`` carrying a second copy would invite the defence of
+    "deliberate
+    duplication written by one constructor". That defence only covers envelopes
     built through that constructor: an ``OperationResult`` is a ``TypedDict``, so a
     producer can build one literally and a middle layer can reassign
     ``next_cursor`` on the mapping it was handed. When the two disagree a walk
@@ -675,3 +699,88 @@ def test_the_payload_types_are_reachable_on_the_control_plane_only() -> None:
     # ``connections/__init__.py`` is untouched by this change: the control plane
     # stays the canonical export face, exactly as it was before the payload landed.
     assert len(cp.__all__) == len(set(cp.__all__))
+
+
+def test_two_bindings_of_one_provider_get_distinct_names_and_cannot_read_each_others_token(
+    tmp_path: Path,
+) -> None:
+    """F1's real requirement: per-binding isolation from the CONSTRUCTOR's records.
+
+    Two bindings of the SAME provider (different verified subject/tenant) get two
+    DIFFERENT ``secret_ref`` names straight from ``create_binding`` -- no name is
+    stamped by the test. Each transport resolves ITS OWN per-binding entry from the
+    live store, so binding B reaches B's token and never A's, and vice versa. A
+    slug-keyed scheme (one name for both) could not express this.
+    """
+
+    from kiro_crew.connections.control_plane.binding import binding_secret_ref, create_binding
+
+    binding_a = create_binding(
+        service_id="outlook",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_verifier,
+        slug="outlook",  # type: ignore[arg-type]
+    )
+    binding_b = create_binding(
+        service_id="outlook",
+        claimed_subject="bob",
+        claimed_tenant="globex",
+        credential_mode="oauth_user",
+        verifier=_verifier,
+        slug="outlook",  # type: ignore[arg-type]
+    )
+    name_a = binding_a["secret_ref"]["name"]
+    name_b = binding_b["secret_ref"]["name"]
+    slug_name = binding_secret_ref("outlook")["name"]
+    # Distinct per-binding names, neither equal to the shared slug name.
+    assert name_a != name_b
+    assert slug_name not in (name_a, name_b)
+
+    vault = SecretVault(tmp_path / "crewhome")
+    vault.set_sync(name_a, "token-alice")
+    vault.set_sync(name_b, "token-bob")
+    vault.set_sync(slug_name, "token-collapsed-by-slug")
+
+    store = BindingStore(tmp_path / "connections" / "control_plane_bindings.json")
+    store.insert(binding_a, deployment_id="deployment://t/a", kiro_principal="kiro://t/owner")
+    store.insert(binding_b, deployment_id="deployment://t/b", kiro_principal="kiro://t/owner")
+
+    handle_a = derive_handle(
+        binding_a,
+        granted_scopes=_GRANTED,
+        requested_scopes=("mail.read",),
+        now=_T0,
+        ttl_seconds=300.0,
+    )
+    handle_b = derive_handle(
+        binding_b,
+        granted_scopes=_GRANTED,
+        requested_scopes=("mail.read",),
+        now=_T0,
+        ttl_seconds=300.0,
+    )
+
+    seen: List[str] = []
+
+    def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        seen.append(request.headers["Authorization"])
+        return HttpReply(
+            status=200, headers={"Content-Type": "application/json"}, body=b'{"id":"x"}'
+        )
+
+    for binding, handle in ((binding_a, handle_a), (binding_b, handle_b)):
+        t = build_production_transport(
+            gate=_gate_for(binding, handle),
+            store=store,
+            vault=vault,
+            locator=_cursor_locator("https://graph.example.invalid/v1/me"),
+            http_send=_send,
+            decode=_single_object_decode,
+        )
+        assert execute(_descriptor(), handle, t, **_kw()).error is None
+
+    # Each binding reached ITS OWN token; neither read the other's, nor the slug's.
+    assert seen == ["Bearer token-alice", "Bearer token-bob"]
+    assert "Bearer token-collapsed-by-slug" not in seen

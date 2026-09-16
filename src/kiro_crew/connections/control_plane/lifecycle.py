@@ -80,7 +80,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Callable, Protocol, TypedDict
+from typing import Callable, NotRequired, Protocol, TypedDict
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
@@ -158,6 +158,13 @@ class StoredBinding(TypedDict):
     live_generation: int
     revoked: bool
     updated_at: float
+    # The VENDOR-side account this binding is for (a GitHub org/login, a Graph
+    # tenant id / driveId, a Salesforce org id, a Slack workspace id) -- the ACL's
+    # ``account`` axis. Recorded so a trusted, store-backed account -> deployment
+    # mapping is possible (see StoreBackedAccountToDeployment in the ACL adapter).
+    # NotRequired so an older record without it is still well-formed; a record
+    # missing it simply does not participate in account->deployment resolution.
+    account: NotRequired[str]
 
 
 class BindingStoreCorruptError(Exception):
@@ -324,12 +331,19 @@ class BindingStore:
         "corrupt store treated as empty" defect:
 
         * a file that does not exist -> ``{}`` (a genuinely empty store);
+        * a zero-length / whitespace-only file -> :class:`BindingStoreCorruptError`
+          (``atomic_write`` never produces a valid zero-length store, so an empty
+          file is a torn write or tampering, NOT "no bindings");
         * a file that exists but is not valid JSON, or whose top level is not the
           expected ``{"bindings": {...}}`` shape -> :class:`BindingStoreCorruptError`
           (fail-closed: never silently empty);
-        * a file that parses but carries individual malformed RECORDS -> those
-          records are dropped fail-closed, the well-formed ones are kept (one bad
-          row must not poison the rest, but it must not be trusted either).
+        * a file that parses but carries even ONE malformed RECORD ->
+          :class:`BindingStoreCorruptError` for the WHOLE store. A malformed row
+          is NOT silently dropped: because ``_read`` feeds ``insert`` / ``rotate``
+          / ``revoke``, which republish the whole map, a dropped record would be
+          PERMANENTLY lost -- exactly the corruption outcome this fence exists to
+          prevent -- so the whole store fails closed rather than serve/republish a
+          silently-truncated view.
 
         A point-in-time snapshot. Callers that WRITE re-read this INSIDE the lock
         so the merge is against the current file, not a stale copy.
@@ -345,9 +359,18 @@ class BindingStore:
                 f"binding store at {self._path} is unreadable: {exc}"
             ) from exc
         if raw.strip() == "":
-            # A zero-byte file is a torn/absent write, not a populated store; treat
-            # as empty (atomic_write never leaves a valid store zero-length).
-            return {}
+            # A zero-byte / whitespace-only file is NOT an empty store: publishing
+            # goes through ``atomic_write`` (write-temp + fsync + rename), which
+            # can never leave a VALID store zero-length -- a populated store always
+            # serialises to ``{"schema_version": N, "bindings": {...}}``. So an
+            # empty file is a torn write or external tampering, not "no bindings".
+            # Treating it as ``{}`` would let the next mutation republish an empty
+            # store over real records; fail closed instead.
+            raise BindingStoreCorruptError(
+                f"binding store at {self._path} is empty/zero-length, which "
+                "atomic_write never produces for a populated store -- treating as "
+                "tampered/torn rather than an empty store"
+            )
         try:
             doc = json.loads(raw)
         except (ValueError, TypeError) as exc:
@@ -361,8 +384,21 @@ class BindingStore:
         records = doc["bindings"]
         out: dict[str, StoredBinding] = {}
         for bid, rec in records.items():
-            if _well_formed(rec):
-                out[str(bid)] = rec  # type: ignore[assignment]
+            if not _well_formed(rec):
+                # A single malformed RECORD inside otherwise-valid JSON must NOT be
+                # silently dropped: _read feeds insert/rotate/revoke, which
+                # republish the WHOLE map, so a dropped record is PERMANENTLY lost
+                # (the very outcome the corrupt-store fence exists to prevent). A
+                # bad row means the file is not trustworthy as a whole, so fail
+                # closed on the entire store rather than serve/republish a
+                # silently-truncated view.
+                raise BindingStoreCorruptError(
+                    f"binding store at {self._path} carries a malformed record for "
+                    f"{str(bid)!r}; refusing the whole store fail-closed rather "
+                    "than dropping it (a dropped record is republished away and "
+                    "permanently lost)"
+                )
+            out[str(bid)] = rec  # type: ignore[assignment]
         return out
 
     def _publish(self, records: dict[str, StoredBinding]) -> None:
@@ -411,7 +447,7 @@ class BindingStore:
         This is the ``resolve(principal, provider, account)`` seam the downstream
         ACL calls, re-founded on a trusted source: the candidate set is the
         PERSISTED store's own records, never an ``Iterable`` the caller passed in,
-        so a caller can no longer smuggle a binding it does not own into the
+        so a caller cannot smuggle a binding it does not own into the
         candidate set.
 
         It enforces, in order:
@@ -473,9 +509,106 @@ class BindingStore:
         # handle, never a pre-revoke one.
         return _binding_at_generation(stored["binding"], stored["live_generation"])
 
+    def resolve_for_acl(
+        self, *, kiro_principal: str, deployment_id: str, service_id: ServiceId
+    ) -> Binding | None:
+        """Resolve the live binding a principal holds on ONE (deployment, service).
+
+        This is the store-side lookup the ACL :class:`BindingResolver` adapter
+        drives (see :mod:`kiro_crew.connections.control_plane.acl_binding_resolver`).
+        It differs from :meth:`resolve` in ONE deliberate way: it takes NO
+        caller-claimed subject/tenant and runs NO verifier, because the ACL
+        contract hands only ``(principal, provider, account)`` -- there is no
+        claimed identity to verify. The subject/tenant it returns are the ones
+        the store ALREADY holds for this binding, which the verifier produced at
+        insert time (:func:`create_binding` / :meth:`insert` store ONLY a
+        verifier's :class:`VerifiedIdentity`). So the tenant a caller ultimately
+        sees is a VERIFIED provider tenant read from the trusted store, never a
+        value the caller asserted -- the "trusted tenant" discipline.
+
+        The candidate set is the trusted PERSISTENT store, never a caller
+        ``Iterable``; the match is keyed on the uniqueness domain's
+        principal-facing axes ``(kiro_principal, deployment_id, service_id)``.
+
+        Returns the matched binding stamped with the store's CURRENT live
+        generation, or ``None`` -- FAIL-CLOSED -- when the principal holds no
+        binding for this (deployment, service) or the sole match is revoked. It
+        never falls back to another principal's or another deployment's binding.
+        Raises :class:`BindingStoreCorruptError` if the store is unreadable (a
+        corrupt store is NOT read as "no binding": failing closed to ``None`` on
+        corruption would silently deny every candidate AND could later be papered
+        over by a write, so corruption is surfaced, not swallowed).
+        """
+
+        matches = [
+            s
+            for s in self._read().values()
+            if s["deployment_id"] == deployment_id
+            and s["kiro_principal"] == kiro_principal
+            and s["binding"]["service_id"] == service_id
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # Insert enforces the full uniqueness domain, so a live store cannot
+            # hold two records matching these three axes for one principal; if it
+            # ever does, deny fail-closed rather than pick one.
+            return None
+        stored = matches[0]
+        if stored["revoked"]:
+            return None
+        return _binding_at_generation(stored["binding"], stored["live_generation"])
+
+    def resolve_deployment_for_account(self, *, service_id: ServiceId, account: str) -> str | None:
+        """Map an ACL ``(service_id, account)`` to the ``deployment_id`` hosting it.
+
+        This is the TRUSTED, STORE-BACKED account -> deployment mapping the ACL
+        adapter's production default uses. The source of truth is the persisted
+        binding store itself: a binding was inserted with the vendor ``account``
+        it is for AND the ``deployment_id`` that hosts it, so the store already
+        records the pairing -- no separate registry, no caller-supplied map, no
+        fixture lambda.
+
+        It matches stored records on ``(service_id, account)`` and returns the
+        DISTINCT ``deployment_id`` they share. Fail-closed to ``None`` when:
+
+        * no stored binding names this ``(service_id, account)`` -- unknown
+          account, deny;
+        * records exist under ``(service_id, account)`` on MORE THAN ONE
+          ``deployment_id`` -- the SAME account NAME hosted on two different
+          provider deployments. ``(provider, account)`` alone CANNOT disambiguate
+          these, so this resolver refuses rather than guess. Disambiguating them
+          needs an endpoint/host discriminator the ACL's
+          ``resolve(principal, provider, account)`` does not carry today -- a
+          NAMED interface gap (see the ACL adapter module docstring), not a thing
+          to paper over by picking one.
+
+        Records inserted WITHOUT an ``account`` (older envelopes) do not
+        participate -- they cannot answer an account query, so they are skipped.
+        Raises :class:`BindingStoreCorruptError` if the store is unreadable.
+        """
+
+        deployments = {
+            s["deployment_id"]
+            for s in self._read().values()
+            if s.get("account") == account and s["binding"]["service_id"] == service_id
+        }
+        if len(deployments) != 1:
+            # 0 = unknown account (deny); >1 = same account name on multiple
+            # deployments, unresolvable from (provider, account) alone (deny).
+            return None
+        return next(iter(deployments))
+
     # --- writes (reload-merge-publish under the lock) ---------------------
 
-    def insert(self, binding: Binding, *, deployment_id: str, kiro_principal: str) -> StoredBinding:
+    def insert(
+        self,
+        binding: Binding,
+        *,
+        deployment_id: str,
+        kiro_principal: str,
+        account: str | None = None,
+    ) -> StoredBinding:
         """Admit ``binding`` into the trusted store, or REFUSE.
 
         Enforces the ``(deployment, account)`` uniqueness domain ON THE DOMAIN,
@@ -519,6 +652,8 @@ class BindingStore:
             "revoked": False,
             "updated_at": time.time(),
         }
+        if account is not None:
+            candidate["account"] = account
         want = _uniqueness_key(candidate)
         bid = binding["binding_id"]
         with self._cross_process_lock():
@@ -588,7 +723,7 @@ class BindingStore:
         refresh both pass the same observed generation. The lock serializes them;
         the winner rotates, calls ``refresh`` once, advances ``live_generation``,
         and returns ``(record, True)``; the LOSER, on acquiring the lock, re-reads,
-        finds ``live_generation`` no longer equals its ``observed_generation``, and
+        finds ``live_generation`` differs from its ``observed_generation``, and
         returns ``(winner_record, False)`` WITHOUT calling ``refresh`` or rotating.
 
         Raises :class:`BindingResolutionError` if the id is unknown,
