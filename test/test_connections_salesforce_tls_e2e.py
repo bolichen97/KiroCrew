@@ -45,8 +45,9 @@ from kiro_crew.connections.control_plane import production as production_module
 from kiro_crew.connections.control_plane.auth_modes import declare_permitted_modes
 from kiro_crew.connections.control_plane.binding import binding_secret_ref, create_binding
 from kiro_crew.connections.control_plane.handle import derive_handle, ensure_usable
+from kiro_crew.connections.control_plane.lifecycle import BindingStore
 from kiro_crew.connections.control_plane.production import (
-    BindingSecretSelector,
+    BindingCustodyGate,
     urllib_http_send,
 )
 from kiro_crew.connections.vendors.salesforce.runner import (
@@ -266,7 +267,10 @@ def _handle():
         verifier=_verifier,
         slug="salesforce",
     )  # type: ignore[arg-type]
-    return derive_binding_handle(binding)
+    # Return the binding alongside the handle: the new W01 custody gate fences
+    # for a specific BINDING (not a slug-derived selector), so the runner needs
+    # both the binding (for the gate + the live store) and the handle.
+    return binding, derive_binding_handle(binding)
 
 
 def derive_binding_handle(binding):
@@ -285,15 +289,20 @@ def derive_binding_handle(binding):
     )
 
 
-def _runner(handle, vault, port: int) -> SalesforceProductionRunner:
+def _runner(binding, handle, vault, port: int, store_root: Path) -> SalesforceProductionRunner:
     import time as _time
 
+    # Custody gate for THIS binding, keyed on the trusted view fingerprint the
+    # handle presents (the new W01 per-binding custody model). No selector.
     view = ensure_usable(handle, now=_time.time())
-    selector = BindingSecretSelector(
-        slug="salesforce",
-        binding_fingerprint=view.binding_fingerprint,
-        service_id=view.service_id,
-        credential_mode=view.credential_mode,
+    gate = BindingCustodyGate(binding=binding, binding_fingerprint=view.binding_fingerprint)
+    # A REAL on-disk L04 BindingStore holding the binding -- select_secret reads
+    # the secret_ref off the store's OWN record and fences the live generation.
+    store = BindingStore(store_root / "connections" / "control_plane_bindings.json")
+    store.insert(
+        binding,
+        deployment_id="deployment://test/salesforce/0",
+        kiro_principal="kiro://test/owner",
     )
     auth = SalesforceAuthContext(
         handle=handle,
@@ -304,7 +313,7 @@ def _runner(handle, vault, port: int) -> SalesforceProductionRunner:
     # Pin the real sender: this is the whole claim of the file.
     assert urllib_http_send is production_module.urllib_http_send
     return SalesforceProductionRunner(
-        selector=selector, vault=vault, auth=auth, http_send=urllib_http_send
+        gate=gate, store=store, vault=vault, auth=auth, http_send=urllib_http_send
     )
 
 
@@ -319,7 +328,7 @@ def _serve(script, certfile, keyfile) -> Tuple[http.server.ThreadingHTTPServer, 
 
 
 class TestTwoPathTlsFactoryToFetch:
-    def test_soql_object_path_walks_two_real_tls_pages(self, trust_loopback, real_vault):
+    def test_soql_object_path_walks_two_real_tls_pages(self, trust_loopback, real_vault, tmp_path):
         certfile, keyfile = trust_loopback
         script = {
             "/services/data/v60.0/sobjects/Account/describe": _b(_DESCRIBE_BODY),
@@ -328,8 +337,8 @@ class TestTwoPathTlsFactoryToFetch:
         }
         server, served, port = _serve(script, certfile, keyfile)
         try:
-            handle = _handle()
-            runner = _runner(handle, real_vault, port)
+            binding, handle = _handle()
+            runner = _runner(binding, handle, real_vault, port, tmp_path)
             conn = SalesforceStructuredConnector(call_runner=runner)
             source = {
                 "id": "src-acct",
@@ -359,15 +368,15 @@ class TestTwoPathTlsFactoryToFetch:
         assert len(meta["rows"]) == 2
         assert meta["rows"][0]["resource_ref"]["locator"]["sobjectType"] == "Account"
 
-    def test_report_path_crosses_real_tls(self, trust_loopback, real_vault):
+    def test_report_path_crosses_real_tls(self, trust_loopback, real_vault, tmp_path):
         certfile, keyfile = trust_loopback
         script = {
             "/services/data/v60.0/analytics/reports/00O000000000001": _b(_REPORT_BODY),
         }
         server, served, port = _serve(script, certfile, keyfile)
         try:
-            handle = _handle()
-            runner = _runner(handle, real_vault, port)
+            binding, handle = _handle()
+            runner = _runner(binding, handle, real_vault, port, tmp_path)
             conn = SalesforceStructuredConnector(call_runner=runner)
             source = {
                 "id": "src-rep",
@@ -428,8 +437,8 @@ class TestSyncSchedulerRealIngest:
         server, served, port = _serve(script, certfile, keyfile)
         store = KnowledgeStore(str(tmp_path / "sf.db"))
         try:
-            handle = _handle()
-            runner = _runner(handle, real_vault, port)
+            binding, handle = _handle()
+            runner = _runner(binding, handle, real_vault, port, tmp_path)
             conn = SalesforceStructuredConnector(call_runner=runner)
             assert conn.supports_rows() is True
             src = store.add_source(
@@ -493,8 +502,8 @@ class TestSyncSchedulerRealIngest:
         server, served, port = _serve(script, certfile, keyfile)
         store = KnowledgeStore(str(tmp_path / "sfrep.db"))
         try:
-            handle = _handle()
-            runner = _runner(handle, real_vault, port)
+            binding, handle = _handle()
+            runner = _runner(binding, handle, real_vault, port, tmp_path)
             conn = SalesforceStructuredConnector(call_runner=runner)
             src = store.add_source(
                 "SF Report",
@@ -561,8 +570,8 @@ class TestSyncSchedulerRealIngest:
             embedder=None,
         )
         try:
-            handle = _handle()
-            runner = _runner(handle, real_vault, port)
+            binding, handle = _handle()
+            runner = _runner(binding, handle, real_vault, port, tmp_path)
             conn = SalesforceStructuredConnector(call_runner=runner)
             src = store.add_source(
                 "SF Account partial",
@@ -593,3 +602,128 @@ class TestSyncSchedulerRealIngest:
             assert len(state) == 1
         finally:
             store.close()
+
+
+def _binding_named(*, subject: str, tenant: str, secret_name: str):
+    """A Salesforce binding for a DISTINCT identity with its OWN vault entry name.
+
+    Two sources in two tenants must resolve two DIFFERENT credentials; the store
+    reads secret_ref off the binding's own record, so a per-binding secret_ref
+    name is exactly the axis that keeps them apart.
+    """
+    b = create_binding(
+        service_id="salesforce",
+        claimed_subject=subject,
+        claimed_tenant=tenant,
+        credential_mode="oauth_user",
+        verifier=_verifier,
+        slug="salesforce",
+    )  # type: ignore[arg-type]
+    b["secret_ref"] = dict(b["secret_ref"])  # type: ignore[index]
+    b["secret_ref"]["name"] = secret_name  # type: ignore[index]
+    return b
+
+
+class TestMultiSourceIdentity:
+    """Different sources resolve their OWN per-source binding/auth, no cross-talk.
+
+    New-API (BindingCustodyGate) coverage: each source's runner is composed for
+    ITS binding, and the live store hands back THAT binding's secret_ref -- so the
+    wire request for source A carries A's token and B's carries B's. And a runner
+    whose gate is composed for binding A, driven with a handle for binding B, is
+    FENCED (BindingIdentityMismatchError -> typed refusal) with ZERO bytes sent:
+    no credential of A ever reaches a call routed for B.
+    """
+
+    def test_two_sources_use_their_own_credentials_and_gate_fences_cross_binding(
+        self, trust_loopback, real_vault, tmp_path
+    ):
+        import time as _time
+
+        certfile, keyfile = trust_loopback
+        script = {
+            "/services/data/v60.0/analytics/reports/00O000000000001": _b(_REPORT_BODY),
+        }
+        server, served, port = _serve(script, certfile, keyfile)
+
+        # Two DISTINCT bindings, each with its OWN vault entry + token.
+        bind_a = _binding_named(subject="alice", tenant="acme", secret_name="SF_TOKEN_A")
+        bind_b = _binding_named(subject="bob", tenant="globex", secret_name="SF_TOKEN_B")
+        real_vault.set_sync("SF_TOKEN_A", "token-for-acme-alice")
+        real_vault.set_sync("SF_TOKEN_B", "token-for-globex-bob")
+
+        # ONE live store holding BOTH bindings (the shared L04 store).
+        store = BindingStore(tmp_path / "connections" / "control_plane_bindings.json")
+        store.insert(bind_a, deployment_id="dep://a", kiro_principal="kiro://owner/a")
+        store.insert(bind_b, deployment_id="dep://b", kiro_principal="kiro://owner/b")
+
+        def _mk_runner(binding):
+            handle = derive_binding_handle(binding)
+            view = ensure_usable(handle, now=_time.time())
+            gate = BindingCustodyGate(binding=binding, binding_fingerprint=view.binding_fingerprint)
+            auth = SalesforceAuthContext(
+                handle=handle,
+                offered_mode="oauth_user",
+                permitted=declare_permitted_modes(("oauth_user",)),
+                governance_item="salesforce.read",
+            )
+            return handle, SalesforceProductionRunner(
+                gate=gate, store=store, vault=real_vault, auth=auth, http_send=urllib_http_send
+            )
+
+        try:
+            _ha, runner_a = _mk_runner(bind_a)
+            _hb, runner_b = _mk_runner(bind_b)
+
+            conn_a = SalesforceStructuredConnector(call_runner=runner_a)
+            conn_b = SalesforceStructuredConnector(call_runner=runner_b)
+            src_a = {
+                "id": "src-a",
+                "uri": "salesforce://report/00O000000000001",
+                "instance_url": f"https://localhost:{port}",
+                "org_id": ORG,
+                "report_id": "00O000000000001",
+            }
+            src_b = dict(src_a, id="src-b")
+
+            rows_a, _snap_a, _cp_a = asyncio.run(conn_a.fetch_rows(src_a))
+            n_after_a = len(served.authorization)
+            rows_b, _snap_b, _cp_b = asyncio.run(conn_b.fetch_rows(src_b))
+
+            # Each source really read (rows came back over the wire).
+            assert rows_a and rows_b
+            # Source A's request(s) carried A's token; B's carried B's -- no
+            # cross-contamination. served.authorization is ordered by arrival.
+            auth_a = served.authorization[:n_after_a]
+            auth_b = served.authorization[n_after_a:]
+            assert auth_a and all(h == "Bearer token-for-acme-alice" for h in auth_a)
+            assert auth_b and all(h == "Bearer token-for-globex-bob" for h in auth_b)
+
+            # Cross-binding: a runner whose GATE is for A, driven with B's handle,
+            # is fenced -- no A credential leaks to a B-routed call, ZERO bytes.
+            hb = derive_binding_handle(bind_b)
+            view_a = ensure_usable(_ha, now=_time.time())
+            gate_a = BindingCustodyGate(
+                binding=bind_a, binding_fingerprint=view_a.binding_fingerprint
+            )
+            mismatched_auth = SalesforceAuthContext(
+                handle=hb,  # a handle for B
+                offered_mode="oauth_user",
+                permitted=declare_permitted_modes(("oauth_user",)),
+                governance_item="salesforce.read",
+            )
+            crossed = SalesforceProductionRunner(
+                gate=gate_a,  # gate composed for A
+                store=store,
+                vault=real_vault,
+                auth=mismatched_auth,
+                http_send=urllib_http_send,
+            )
+            before = len(served.authorization)
+            conn_x = SalesforceStructuredConnector(call_runner=crossed)
+            with pytest.raises(Exception):
+                asyncio.run(conn_x.fetch_rows(dict(src_a)))
+            # The fence refused before any byte crossed the wire.
+            assert len(served.authorization) == before
+        finally:
+            server.shutdown()

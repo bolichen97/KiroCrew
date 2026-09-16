@@ -11,8 +11,9 @@ the REAL W01 executor
 :class:`~kiro_crew.connections.control_plane.executor.PageWalk`) -- never a local
 short-circuit. Every read therefore passes the full gate chain (trusted handle
 view -> credential-mode permit -> governance intersection -> write-replay) before
-any byte crosses the wire, and the credential is resolved per call from the real
-vault by the real :class:`BindingSecretSelector`.
+any byte crosses the wire, and the credential is resolved per call from the LIVE
+:class:`BindingStore` (``store.select_secret``), fenced by the per-binding
+:class:`BindingCustodyGate` -- never off a provider slug.
 
 It builds ONE transport per operation-class, because
 ``build_production_transport`` takes ONE ``decode`` and the three Salesforce read
@@ -23,8 +24,9 @@ operations decode differently:
 * Analytics report -> :func:`salesforce_report_decode` (a bounded snapshot);
 * sObject describe -> :func:`salesforce_describe_decode` (a single object).
 
-All three share ONE locator (:func:`salesforce_request_locator`), ONE selector
-and ONE vault -- no second auth, vault, pagination or transport. This is not a
+All three share ONE locator (:func:`salesforce_request_locator`), ONE custody
+``gate`` + live ``store`` and ONE vault -- no second auth, vault, pagination or
+transport. This is not a
 bypass hook: it is the real assembly, and the final production registration
 (wiring this runner into the knowledge connector factory) is a separate,
 root-coordinated step; this module only provides the runner it will register.
@@ -46,10 +48,11 @@ from kiro_crew.connections.control_plane.executor import (
     execute,
 )
 from kiro_crew.connections.control_plane.handle import DerivedHandle
+from kiro_crew.connections.control_plane.lifecycle import BindingStore
 from kiro_crew.connections.control_plane.operation import CredentialMode, OperationDescriptor
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
-    BindingSecretSelector,
+    BindingCustodyGate,
     SecretStore,
     Transport,
     build_production_transport,
@@ -100,23 +103,26 @@ class SalesforceAuthContext:
 class SalesforceProductionRunner:
     """Concrete :class:`SalesforceCallRunner` over the real W01 executor.
 
-    Constructed by the factory with the real ``selector`` (bound to the call's
-    trusted binding identity), the real ``vault``, and the per-source
-    :class:`SalesforceAuthContext`. It composes one production transport per
-    operation-class and drives ``execute`` / ``PageWalk`` -- the same real
+    Constructed by the factory with the real custody ``gate`` (bound to the
+    call's trusted binding identity), the real live ``store`` (L04 ``BindingStore``
+    that fences+resolves the credential per call), the real ``vault``, and the
+    per-source :class:`SalesforceAuthContext`. It composes one production transport
+    per operation-class and drives ``execute`` / ``PageWalk`` -- the same real
     executor path W01's own end-to-end TLS tests exercise.
     """
 
     def __init__(
         self,
         *,
-        selector: BindingSecretSelector,
+        gate: BindingCustodyGate,
+        store: BindingStore,
         vault: SecretStore,
         auth: SalesforceAuthContext,
         http_send: Any = urllib_http_send,
         timeout_seconds: Optional[float] = None,
     ) -> None:
-        self._selector = selector
+        self._gate = gate
+        self._store = store
         self._vault = vault
         self._auth = auth
         self._http_send = http_send
@@ -131,7 +137,8 @@ class SalesforceProductionRunner:
         if cached is not None:
             return cached
         kwargs: dict[str, Any] = {
-            "selector": self._selector,
+            "gate": self._gate,
+            "store": self._store,
             "vault": self._vault,
             "locator": salesforce_request_locator,
             "http_send": self._http_send,
