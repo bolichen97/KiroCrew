@@ -223,13 +223,18 @@ class SalesforceSourceIdentity:
 class SalesforceSourceResolver(Protocol):
     """Application seam: map ONE source to its trusted per-source W01 identity.
 
-    Implemented by the host/W01 layer (the same layer that owns
-    ``app['knowledge_binding_resolver']`` and constructs gate/store/vault). Given
-    a source's config (``instance_url`` / ``org_id`` / api version + the source's
-    already-resolved binding), it returns the :class:`SalesforceSourceIdentity`
-    for that source, or ``None`` when the source holds NO usable binding -- in
-    which case the factory refuses (fail-closed), it does NOT fall back to
-    another source's identity or a fabricated one.
+    Installed by the host/W01 layer on ``app['salesforce_source_resolver']`` --
+    the INGEST-side seam, distinct from the query-side
+    ``app['knowledge_binding_resolver']`` (:class:`kiro_crew.knowledge.acl.BindingResolver`,
+    a 3-arg ``resolve(principal, provider, account) -> AccessContext``): this one
+    is 1-arg ``resolve(source) -> SalesforceSourceIdentity`` and answers a
+    different question (which credential to READ this source WITH, not which
+    query principal may SEE a candidate). Given a source's config (``instance_url``
+    / ``org_id`` / api version + the source's already-resolved binding), it
+    returns the :class:`SalesforceSourceIdentity` for that source, or ``None``
+    when the source holds NO usable binding -- in which case the factory refuses
+    (fail-closed), it does NOT fall back to another source's identity or a
+    fabricated one.
     """
 
     def resolve(self, source: Mapping[str, Any]) -> Optional[SalesforceSourceIdentity]: ...
@@ -276,8 +281,8 @@ class SalesforceProductionRunnerFactory:
     def __call__(self, source: Mapping[str, Any]) -> SalesforceProductionRunner:
         if self._resolver is None:
             raise SalesforceRunnerUnavailable(
-                "no Salesforce binding resolver is wired "
-                "(app['knowledge_binding_resolver'] is unset); refusing rather "
+                "no Salesforce source resolver is wired "
+                "(app['salesforce_source_resolver'] is unset); refusing rather "
                 "than reading with a fabricated identity"
             )
         identity = self._resolver.resolve(source)
