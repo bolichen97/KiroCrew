@@ -4383,54 +4383,28 @@ class TestLocalScopeStaysInProject:
         A project that keeps its config under another directory of its OWN and
         links ``.kiro`` at it resolves inside the project root, so the root gate
         must keep listing it: the same tolerance the write verbs already grant.
-        The listing half is platform-neutral because the whole decision is this
-        PR's own gates; whether a mention can then READ it is not, and is split
-        into the two tests below.
+        The listing half is decided by this API's own gates; whether a mention
+        can then READ it also passes through ``hooks.validate_file_path``, which
+        is pinned by the test below.
         """
         proj = self._linked_kiro_project(tmp_path)
         assert [e["name"] for e in _list_aim_prompts(proj) if e["source"] == "local"] == ["ok"]
 
     @requires_symlinks
-    @pytest.mark.skipif(not IS_POSIX, reason="Windows refuses a linked ancestor; see below")
-    def test_a_kiro_link_that_stays_in_the_project_still_resolves_on_posix(
-        self, tmp_path, mock_sel
-    ):
-        """...and on POSIX the mention resolves it, so listed and serveable agree."""
-        proj = self._linked_kiro_project(tmp_path)
-        msg, status = _expand_prompt_mention("@ok", _State(), _Slot(project=proj))
-        assert status == "ok" and "BODY" in msg
+    def test_a_kiro_link_that_stays_in_the_project_still_resolves(self, tmp_path, mock_sel):
+        """...and the mention resolves it on every platform, so listed and serveable agree.
 
-    @requires_symlinks
-    @pytest.mark.skipif(IS_POSIX, reason="the linked-ancestor screen is Windows-only by design")
-    def test_a_kiro_link_is_refused_by_the_windows_ancestor_screen(self, tmp_path, mock_sel):
-        """On Windows the mention is REFUSED, and not by anything on this surface.
-
-        ``hooks.validate_file_path`` walks the ancestors on Windows only and
-        refuses any path with a linked one — deliberately, because a junction
-        whose target is a UNC share turns the ``realpath`` below it into the
-        outbound SMB probe its lexical UNC gates exist to prevent, and Windows has
-        no ``O_NOFOLLOW`` to fall back on. POSIX takes the opposite trade: an
-        unconditional ancestor walk there would refuse a symlinked ``/home``.
-
-        So the tolerance above is POSIX-only, and this is the platform-honest
-        statement of it rather than an untested asymmetry: the outcome is the
-        ``blocked`` that gate produces, the listing still offers the name (the
-        test above), and the disagreement is between one platform's read gate and
-        the library — not between two surfaces of this API, which is what this
-        PR is about. Pinning it means a later round cannot quietly relax that
-        screen, and cannot mistake this refusal for a root-gate regression.
+        On Windows ``hooks.validate_file_path`` screens each linked ancestor
+        instead of refusing it: a link whose target is another local directory is
+        rewritten to that target and the read proceeds, while a link aimed at a
+        UNC share still refuses before ``realpath`` can probe it (pinned in
+        ``test_hooks_coverage.py``). POSIX never walked the ancestors. Both
+        platforms therefore serve this in-project link, which is what makes the
+        listing above honest.
         """
         proj = self._linked_kiro_project(tmp_path)
         msg, status = _expand_prompt_mention("@ok", _State(), _Slot(project=proj))
-        assert status == "blocked" and "BODY" not in msg
-        # Attributed: the refusal is the ancestor screen's, on the path as
-        # addressed, and it is reached before anything this surface owns.
-        from kiro_crew import hooks as _hooks
-        from kiro_crew import platform_compat as _pc
-
-        addressed = proj / ".kiro" / "prompts" / "ok.md"
-        assert _pc.first_linked_ancestor(str(addressed)) is not None
-        assert _hooks.validate_file_path(str(addressed)) is None
+        assert status == "ok" and "BODY" in msg
 
 
 class TestAncestorSymlinkLoopCostsOneLibraryNotTheRequest:
@@ -4673,20 +4647,13 @@ class TestARootSwappedAfterValidationPublishesNothing:
         resp = asyncio.run(api_prompt_detail(_api_request("creds", project=proj)))
         # The property, on every platform: the swapped root's file is not served.
         assert b"OUTSIDE-ROOT-HEADING" not in resp.body
-        if IS_POSIX:
-            # Refused by the read root: `_prompt_read_within_root` re-runs the
-            # scope's gate, sees the linked root, and answers None.
-            assert resp.status == 500
-            assert mock_sel.log_tool_invocation.call_args[1]["outcome"] == "error"
-        else:
-            # Windows refuses one gate EARLIER, and not one this surface owns:
-            # `hooks.validate_file_path` walks the ancestors there and refuses a
-            # linked one outright, so the swapped root is caught before the read
-            # root is ever derived. Asserted rather than skipped, because "the
-            # bytes are not served" holds on both platforms and only the stage
-            # that refuses differs.
-            assert resp.status == 403
-            assert mock_sel.log_tool_invocation.call_args[1]["outcome"] == "blocked"
+        # Refused by the read root: `_prompt_read_within_root` re-runs the
+        # scope's gate, sees the linked root, and answers None. Windows reaches
+        # the same stage: `hooks.validate_file_path` rewrites a local linked
+        # ancestor to its target instead of refusing it, so the swapped root is
+        # caught by this surface's own gate rather than one stage earlier.
+        assert resp.status == 500
+        assert mock_sel.log_tool_invocation.call_args[1]["outcome"] == "error"
 
 
 class TestFallbackDeleteRace:

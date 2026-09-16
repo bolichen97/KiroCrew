@@ -334,16 +334,20 @@ def test_two_concurrent_writers_never_claim_the_same_seq():
 
 def test_the_entry_envelope_is_exactly_the_documented_shape():
     crew = _crew()
-    anchor = crew.append("item/opened", {"item": "pr-4127"}, src="gateway")
+    anchor = crew.append(
+        "crew/dispatch",
+        {"item": "pr-4127", "target": {"kind": "crew", "name": "qa"}},
+        src="gateway",
+    )
     entry = crew.append(
-        "crew:qa/report",
+        "crew/report",
         {"item": "pr-4127", "status": "done"},
         src="crew:qa",
         thread=anchor.seq,
         ref=Ref("session", SESSION, 40, 96),
     )
     assert entry.to_dict() == {
-        "type": "crew:qa/report",
+        "type": "crew/report",
         "seq": 2,
         "time": entry.time,
         "src": "crew:qa",
@@ -529,12 +533,13 @@ def test_a_type_that_is_not_domain_slash_action_is_refused(bad):
     assert _code(exc) == lg.CODE_BAD_TYPE
 
 
-@pytest.mark.parametrize("src", ["gateway", "acp", "dashboard", "patrol", "session:slack:1712.5"])
-def test_the_fixed_and_session_emitters_are_accepted(src):
-    assert _crew().append("activity/tick", {}, src=src).src == src
+@pytest.mark.parametrize("src", ["gateway", "dashboard", "patrol", "crew:qa", "app:radar"])
+def test_a_crew_ledger_accepts_its_own_emitters(src):
+    entry_type = "app:radar/scan" if src == "app:radar" else "activity/tick"
+    assert _crew().append(entry_type, {}, src=src).src == src
 
 
-@pytest.mark.parametrize("bad", ["", "Gate way", "session:", "crew:", "app:bad/name", "unknown"])
+@pytest.mark.parametrize("bad", ["", "Gate way", "session:s-1", "crew:", "app:bad/name", "unknown"])
 def test_an_unrecognized_src_is_refused(bad):
     crew = _crew()
     with _raises(lg.CODE_BAD_SRC) as exc:
@@ -542,43 +547,55 @@ def test_an_unrecognized_src_is_refused(bad):
     assert _code(exc) == lg.CODE_BAD_SRC
 
 
-# --- rule 2: guest namespaces ---------------------------------------------
+# --- rule 2: authorization on src -----------------------------------------
+#
+# The full per-kind matrix lives in test_ledger_kinds.py; these pin the codes.
 
 
-def test_a_guest_writes_under_its_own_prefix_on_a_crew_ledger():
+def test_a_crew_guest_writes_the_crew_kinds_own_domains():
+    # Its name in src is the signature, so the type carries the fact alone.
     crew = _crew()
-    assert crew.append("crew:qa/report", {}, src="crew:qa").type == "crew:qa/report"
+    assert crew.append("crew/finding", {}, src="crew:qa").src == "crew:qa"
+    assert crew.append("item/phase", {}, src="crew:qa").src == "crew:qa"
+
+
+def test_an_app_guest_writes_only_its_own_type_namespace():
+    crew = _crew()
     assert crew.append("app:radar/scan", {}, src="app:radar").type == "app:radar/scan"
+    with _raises(lg.CODE_NAMESPACE_VIOLATION) as exc:
+        crew.append("member/joined", {}, src="app:radar")
+    assert _code(exc) == lg.CODE_NAMESPACE_VIOLATION
+    assert exc.value.field == "src"
 
 
-def test_a_session_ledger_refuses_a_guest_type_outright():
+def test_a_session_ledger_refuses_the_app_type_namespace_outright():
     session = _session()
     with _raises(lg.CODE_NAMESPACE_VIOLATION) as exc:
-        session.append("crew:qa/report", {}, src="crew:qa")
+        session.append("app:radar/scan", {}, src="gateway")
     assert _code(exc) == lg.CODE_NAMESPACE_VIOLATION
 
 
 def test_a_guest_may_not_write_another_guests_namespace():
     crew = _crew()
     with _raises(lg.CODE_NAMESPACE_VIOLATION) as exc:
-        crew.append("crew:other/report", {}, src="crew:qa")
+        crew.append("app:other/scan", {}, src="app:radar")
     assert _code(exc) == lg.CODE_NAMESPACE_VIOLATION
-
-
-def test_a_guest_may_not_write_an_owned_domain_either():
-    # Its own name is its whole permission; the registry is not also open to it.
-    crew = _crew()
-    with _raises(lg.CODE_NAMESPACE_VIOLATION) as exc:
-        crew.append("member/joined", {}, src="crew:qa")
-    assert _code(exc) == lg.CODE_NAMESPACE_VIOLATION
-    assert exc.value.field == "src"
 
 
 def test_a_non_guest_emitter_may_not_borrow_a_guest_namespace():
     crew = _crew()
     with _raises(lg.CODE_NAMESPACE_VIOLATION) as exc:
-        crew.append("crew:qa/report", {}, src="gateway")
+        crew.append("app:radar/scan", {}, src="gateway")
     assert _code(exc) == lg.CODE_NAMESPACE_VIOLATION
+
+
+def test_a_type_carrying_a_writers_identity_is_not_a_type():
+    # A crew's facts are built-in domains; the writer is named by src. So the
+    # only guest type namespace is app:, and crew:<name>/<action> is malformed.
+    crew = _crew()
+    with _raises(lg.CODE_BAD_TYPE) as exc:
+        crew.append("crew:qa/report", {}, src="crew:qa")
+    assert _code(exc) == lg.CODE_BAD_TYPE
 
 
 # --- rule 3: thread, ref, size --------------------------------------------

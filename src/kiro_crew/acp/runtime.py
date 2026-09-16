@@ -79,6 +79,7 @@ from kiro_crew.acp.session_handle import (
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_MCP_SERVER_INIT_FAILURE,
     METHOD_MCP_SERVER_INITIALIZED,
@@ -90,6 +91,7 @@ from kiro_crew.acp.types import (
     JsonRpcRequest,
     backends_retired_by_host_logout,
 )
+from kiro_crew.agent import markdown_spec_for_agent
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config import live
 from kiro_crew.config.paths import kiro_agents_dir
@@ -3306,13 +3308,46 @@ class AcpRuntime:
             raise AcpRuntimeError(
                 f"Agent {spawn_agent!r} was spawned with --agent but is not the "
                 f"agent this session is running (current mode: "
-                f"{current or '(none reported)'}; advertised: {ids or 'none'}). Its "
-                f"~/.kiro/agents/{spawn_agent}.json is missing, or the backend "
-                f"refused to load it. Refusing to run the backend's own default "
-                f"agent in its place, which would silently drop every Kiro Crew "
-                f"tool the agent's prompt relies on. Run `kirocrew setup "
-                f"--agent-only` to rewrite the agent config."
+                f"{current or '(none reported)'}; advertised: {ids or 'none'}). "
+                + await self._spawn_agent_not_loaded_reason(spawn_agent)
             )
+
+    async def _spawn_agent_not_loaded_reason(self, spawn_agent: str) -> str:
+        """Why the ``--agent`` spec did not load, and the remedy, for Guard (B).
+
+        Crew's roster lists an agent defined as one markdown file (``<name>.md``,
+        the v3 / Kiro IDE form) for every backend, but a host that answers False
+        to ``reads_markdown_agent_specs`` discovers ``*.json`` alone, so such an
+        agent reaches this guard exactly like a missing JSON spec does -- and the
+        generic advice ("run setup to rewrite the agent config") would send the
+        operator to repair a file that is not the problem. The markdown check is
+        asked only once the failure has ALREADY happened, on the refusal branch,
+        so the spawn path itself gains no gate and no failure mode
+        (harness-parity H13): the host answers from
+        ``ACP_BACKENDS_MARKDOWN_AGENT_SPECS``, never "is kiro", and a host added
+        later that reads markdown is handed the generic text unchanged.
+        """
+        if not self._harness.reads_markdown_agent_specs:
+            markdown_spec = await asyncio.to_thread(
+                markdown_spec_for_agent, spawn_agent, self._work_dir
+            )
+            if markdown_spec is not None:
+                capable = ", ".join(repr(b) for b in sorted(ACP_BACKENDS_MARKDOWN_AGENT_SPECS))
+                return (
+                    f"{spawn_agent!r} is defined in markdown ({markdown_spec.name}); the "
+                    f"{self._harness.backend or 'kiro'!r} backend loads JSON agent specs "
+                    f"only, so it ran its own default agent instead, which would "
+                    f"silently drop every Kiro Crew tool the agent's prompt relies on. "
+                    f"Switch agent.acp_backend to {capable} or add a JSON spec for this "
+                    f"agent."
+                )
+        return (
+            f"Its ~/.kiro/agents/{spawn_agent}.json is missing, or the backend "
+            f"refused to load it. Refusing to run the backend's own default "
+            f"agent in its place, which would silently drop every Kiro Crew "
+            f"tool the agent's prompt relies on. Run `kirocrew setup "
+            f"--agent-only` to rewrite the agent config."
+        )
 
     async def _activate_mode_bracketed(
         self,

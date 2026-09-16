@@ -49,30 +49,109 @@ Session ledgers do **not** live under the flat `sessions/<key>.jsonl` transcript
 
 The `ledgers` root is established EAGERLY, and that is what makes the mask non-vacuous. Both fences are stated per PATH, and the Linux bind-mask loop skips a leaf that does not exist -- so a root created lazily on the first write is unmasked in every sandbox spawned before it, one of which can then create the directory itself and fill it with entries a reader would take as the gateway's. Two mechanisms close that: `ensure_data_home()` creates it `0700` at startup, and `chmod`s it too, since `mkdir`'s mode is umask-masked on creation and a no-op on a directory that already exists; and `sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES` materialises it empty before every namespace spawn so the bind always has a name to cover. macOS needs neither: a Seatbelt deny is a path rule that holds for a name that does not exist yet.
 
-## 4. Format
+## 4. Envelope
 
-Line 1 is the header; every later line is an entry.
+Line 1 is the header; every later line is an entry. This section is the part that is the same for both kinds -- the fields, the bounds, and what `ref` and `thread` mean. What belongs to one kind alone is in 4a and 4b.
 
 ```json
 {"type":"crew","version":1,"id":"qa","createdAt":1789000000000}
-{"type":"crew:qa/report","seq":388,"time":1789000000000,"src":"crew:qa","thread":120,
+{"type":"crew/report","seq":388,"time":1789000000000,"src":"crew:qa","thread":120,
  "ref":{"unit":"session","id":"s-7f3a","from":40,"to":96},"data":{"item":"pr-4127","status":"done"}}
 ```
 
 | Field | Meaning |
 |---|---|
-| `type` | `domain/action`, or a guest-namespaced `crew:<name>/<action>` / `app:<name>/<action>`. |
+| `type` | `domain/action`, or the one guest form `app:<name>/<action>`. A type carries the FACT; who wrote it is `src`. |
 | `seq` | Contiguous from 1 after the header. Writer-assigned. |
 | `time` | Epoch milliseconds. Writer-assigned. |
-| `src` | `gateway`, `acp`, `dashboard`, `patrol`, `session:<id>`, `crew:<name>` or `app:<name>`. |
+| `src` | The emitter. Which names a kind accepts is per kind: 4a and 4b. |
 | `thread` | Optional. The seq of an earlier entry in this same file -- a grouping key, like a chat thread id. |
 | `ref` | Optional. `{unit, id, from, to?}`, a pointer to a segment of another (or the same) ledger. `to` absent means one line. |
 | `ignorable` | Optional, `true` only. The writer's promise that a reader which does not know this `type` may skip the line. Absent on every entry that does not set it. |
 | `data` | A JSON object. |
 
-A crew header carries nothing else. A crew's display name and template belong to the members store, which owns them and can change them; an append-only line cannot, so duplicating them here would make this file the system of record for values it has no way to update, and the first rename would leave a permanent lie on line 1.
+A serialized entry is capped at `MAX_ENTRY_BYTES` (64 KiB) and a `ref` at `MAX_REF_SPAN` (500) lines. Both refuse rather than truncate; section 6 states why.
 
-A session header additionally carries `owner`, `agent`, and the optional `task`, `pack`, `slot`, `thread` (`{crew, seq}`), `cwd` and `remote` -- the facts fixed for the session's whole life, which a reader needs before reading any entry.
+`thread` and `ref` answer different questions and the difference is the file boundary. `thread` groups entries INSIDE one ledger, so it is an int -- a seq this same writer assigned, which is why the anchor can be proved to exist before the append lands. `ref` points ACROSS files, so it must name a unit as well as a seq range, and it is resolved at read time with four outcomes rather than dereferenced at write time: the cited file can be pruned or damaged between the citation and the read, and the citing entry is not rewritten when it is.
+
+`ref` is deliberately kind-independent: it is the envelope's, so a crew ledger may cite a session's segment and a session ledger may cite a crew's. Section 4b names the one bridge a writer takes today.
+
+Two overlaps between the kinds are intentional and are not collisions. The `message` domain exists in BOTH kinds with different `data` -- a crew forwards messages, a session records its own bodies -- because ownership answers "does this kind have such events", and both do. And `ref` crossing kinds is the mechanism the two records are joined by, rather than one kind copying the other's bytes.
+
+### 4a. Session ledger
+
+One session's own history: the ACP turn lifecycle, what was put in front of the model, and what the model did.
+
+`src` is `gateway` or `acp`, and nothing else. Those are the two writers a session's entries come from -- the gateway around each turn, the ACP runtime for the measured path -- and a list wider than that is an authorization hole rather than a convenience, because `src` is what a reader attributes an entry to. A `patrol` or a guest crew has nothing to say inside one session's turn history. Adding a name is ADDITIVE: no reader validates `src`, so the list names the emitters that exist. `session:<id>` is spelled by no kind, because no emitter writes it.
+
+`thread` stays unset. A session entry's grouping key is its turn, which it carries in `data.turn` (and `data.step` where a step exists) and which is known at emit time, so threading would be a second spelling of a fact the entry already states.
+
+The type tables are section 5, which lists every session type, its `data` and whether an emitter writes it today.
+
+A session header carries `owner`, `agent`, and the optional `task`, `pack`, `slot`, `thread` (`{crew, seq}`), `cwd` and `remote` -- the facts fixed for the session's whole life, which a reader needs before reading any entry. `owner` never changes. Among them, `thread {crew, seq}` is where a session's place in a crew's work lives: it points back at the crew entry that caused the session to exist, on line 1 rather than in an entry, because it is settled before the first turn.
+
+### 4b. Crew ledger
+
+A crew's activity record: its members, its work items, the messages it forwarded, and the sentences a conductor reads. A crew entry is often a sentence plus a `ref` -- "I opened PR-4127" and where to read the work.
+
+A crew header carries the unit's id and its creation time and nothing else. A crew's display name and template belong to the members store, which owns them and can change them; an append-only line cannot, so duplicating them here would make this file the system of record for values it has no way to update, and the first rename would leave a permanent lie on line 1.
+
+`src` is `gateway`, `dashboard`, `patrol`, or one of the two guest forms `crew:<name>` and `app:<name>`. A guest is an emitter that names an INSTANCE rather than a subsystem, and a crew ledger is the one kind that accepts one, because it is the record several units contribute to: a child crew reports into its parent's ledger, a conductor signs its own dispatches, and an app records a fact no built-in domain covers. Section 6 states what each guest may write.
+
+The families, from the RFC:
+
+| family | types | pointer |
+|---|---|---|
+| shipped | `member/*`, `activity/record`, `slot/*`, `patrol/*` | `slot/*` -> the session |
+| messages | `message/received`, `message/sent` | redacted body in the ledger |
+| tree | `crew/child-attached`, `crew/parent-attached`, `*-detached` | -- |
+| dispatch | `crew/dispatch`, `crew/report` | report -> the child's segment |
+| topics | `crew/topic-*`, `crew/forwarded`, `crew/run-state` | topic -> its work session |
+| items | `item/phase {from,to,reason}`, `item/next`, `item/probe`, `item/verdict`, `crew/round-*` | probe, verdict -> evidence |
+| knowledge | `crew/finding`, `crew/summary`, `crew/note-*`, `crew/link` | the segment covered |
+| memory | `memory/bound\|copied\|forgotten\|restored` | -- |
+
+Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. Until that module exists these two contracts are held by review against this section. TODO: declare them in the ledger type registry module, `kiro_crew.ledger.types`, when it lands.
+
+**`crew/dispatch`** -- a parent asking for an item to be worked.
+
+```json
+{"type":"crew/dispatch","seq":120,"time":1789000000000,"src":"crew:conductor",
+ "data":{"item":"pr-4127","target":{"kind":"session","slot":"dashboard:3"},"brief":"drive it green"}}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `data.item` | yes | The item this dispatch is about. |
+| `data.target` | yes | `{kind: "session", slot}` or `{kind: "crew", name}`. |
+| `data.brief` | no | What the target is being asked to do. |
+
+`target` is required because a dispatch with no target names nobody. It is not a hint a reader can fill in later: the `board` projection folds dispatches into who owes what, so an entry naming no one is a row the fold cannot place, in a file nothing rewrites.
+
+**`crew/report`** -- the answer to a dispatch.
+
+```json
+{"type":"crew/report","seq":388,"time":1789000000000,"src":"crew:qa","thread":120,
+ "ref":{"unit":"session","id":"s-7f3a","from":40,"to":96},
+ "data":{"item":"pr-4127","status":"done","credits":0.21,"summary":"merged"}}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `data.item` | yes | The item being reported on. |
+| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`. |
+| `data.credits` | no | Credits the child spent. Absent is not zero. |
+| `data.summary` | no | One sentence. |
+| `ref` | yes | A segment of the child's ledger: the evidence. |
+| `thread` | when replying | The dispatch's `seq`. |
+
+`ref` is required for the same reason `target` is. A report is a CLAIM about work that happened somewhere else, and `board` and `budget` fold status and credits straight off it without opening the child's ledger; the `ref` is what makes that fold checkable rather than trusted. A report with no `ref` is an unfalsifiable claim, permanently, since nothing later can attach the evidence to a line that is already written.
+
+`thread` is the dispatch's `seq` when the report answers one, which is what makes a dispatch and its replies one conversation inside the parent's file. A report volunteered with no dispatch behind it carries no `thread`.
+
+Both of these are one type each, not one per writer. The child's identity is `src`, so two children reporting on one item write the same `type` into one file and are told apart by who signed them.
+
+`ref` on a report is **the one cross-kind bridge a writer takes**: from a crew ledger into a session's segment, one level down, in the direction a conductor reads. The pair is symmetric with `subagent/spawned` (section 5): the child's header `thread` points up at the entry that caused it, and that entry's `ref` points down into the child's record.
 
 ## 5. The frozen session-log format
 
@@ -189,9 +268,16 @@ same pair as a crew dispatch, one level down.
 
 Every refusal is a `LedgerError` carrying a stable `code`; the codes are API surface and are additive-only.
 
-**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `summary` `plan` `remote` `message` `request` `context` `skill` `background` `subagent` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change. `message` appears in both registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
+**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `summary` `plan` `remote` `message` `request` `context` `skill` `background` `subagent` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in both registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
 
-**Namespacing** answers whether an emitter may write it. A `crew:<name>` or `app:<name>` emitter is a guest: it may write only under its own prefix, and only into a crew ledger, else `namespace_violation`. A guest type is judged by this rule *instead of* ownership, which is why the registry needs no guest entries -- a guest's own name is its permission.
+**Namespacing** answers whether an emitter may write it, and it is a rule about `src`. Two halves:
+
+- **Which emitters a kind takes at all.** `schema.KIND_FIXED_SOURCES` and `schema.KIND_SOURCE_PREFIXES` are the lists, spelled out in 4a and 4b; anything else is `bad_src`. The lists are per kind rather than shared because the writers are: a shared list accepts `patrol` inside one session's own turn history, and `src` is what a reader attributes an entry to, so that is an authorization hole rather than a convenience. `require_src` therefore takes `kind` as a required keyword argument -- it selects the rule, so a caller that omits it fails loudly instead of having its `src` measured against some default kind's list.
+- **What a guest may write.** A `crew:<name>` emitter writes the crew kind's own built-in domains: its name in `src` is the signature, so `crew/report` is one type every child writes and the entries are told apart by who signed them. An `app:<name>` emitter writes only under its own `app:<name>/` type prefix, else `namespace_violation`. That prefix is the ONE guest type namespace, kept for a fact no built-in domain covers, and it is judged by this rule *instead of* ownership -- which is why the registry needs no app entries.
+
+A type never carries the writer's identity. `crew:<name>/<action>` is not a type at all but a malformed one (`bad_type`): identity belongs in `src`, where authorization reads it, and a type that repeats it would make the same fact a different type per writer -- so a fold would need to parse the type to group two children's reports on one item, and the registry would grow an entry per crew.
+
+What this layer does NOT check is any relationship between the guest and the ledger. It has no crew tree to consult, so it cannot ask whether `crew:qa` is really a child of the crew whose file it is writing into -- and a check with nothing behind it only looks like a boundary, the same reason `resolve` has no `forbidden` status yet. Authorization here is that the emitter is a form this kind accepts and that a guest stays inside its own namespace; who is whose child arrives with the grants, at the layer that has the tree.
 
 The remaining bounds: `thread` must name an existing, parseable, earlier seq (`bad_thread`); `ref` must be well-formed and span at most `MAX_REF_SPAN` lines (`bad_ref`); a serialized entry must be at most `MAX_ENTRY_BYTES` (`entry_too_large`). Caps refuse rather than truncate, leaving the file byte-identical -- a clipped record the caller believes landed intact is a loss the caller cannot detect.
 
@@ -290,6 +376,6 @@ format change to land.
 
 ## 9. Scope
 
-The first consumer is the session-ledger emitter (`docs/system-specs/modules/session-ledger-emitter.md`), which writes the ACP turn lifecycle behind the `KIROCREW_SESSION_LEDGER` flag. No crew writer exists yet, so the crew half of the ownership registry has no emitter; the guest namespace is why that is safe to leave open, since a guest crew or app needs no entry in it.
+The first consumer is the session-ledger emitter (`docs/system-specs/modules/session-ledger-emitter.md`), which writes the ACP turn lifecycle behind the `KIROCREW_SESSION_LEDGER` flag. No crew writer exists yet, so the crew half of the ownership registry has no emitter. That is safe to leave open because the crew half is a registry of the kind's own domains rather than a list of writers: a guest crew writes those domains under its own `src`, and an app needs no entry at all, since its `app:<name>/` prefix is its permission.
 
 Read and write paths ship together deliberately: the guarantees this format makes -- contiguous seq under a lock, torn-tail repair, refusal before any byte is written -- are each a claim about what a reader sees after a writer acted, so neither half demonstrates them alone. `test/test_ledger_core.py` exercises them against real files rather than against a mock.

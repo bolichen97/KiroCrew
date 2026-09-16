@@ -1060,7 +1060,8 @@ async def _refresh_channels_modal(view_id: str) -> None:
     ]
     from kiro_crew.slack.events import _get_agent_names
 
-    modal = channels_modal(channels, agent_names=_get_agent_names())
+    agent_names = await asyncio.to_thread(_get_agent_names)
+    modal = channels_modal(channels, agent_names=agent_names)
     try:
         await _orch.slack.views_update(view_id=view_id, view=modal)
     except Exception:
@@ -2264,7 +2265,9 @@ async def _handle_agent_select(
             return
         label = "🔄 Reset to default agent."
     else:
-        resolved = _resolve_agent_name(agent_name)
+        # The resolver lists the agents directory and reads the matching spec:
+        # filesystem work, off the loop like the other async callers of it.
+        resolved = await asyncio.to_thread(_resolve_agent_name, agent_name)
         if not resolved:
             return
         try:

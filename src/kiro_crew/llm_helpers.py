@@ -48,10 +48,11 @@ from kiro_crew.security import (
     MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
     is_sensitive_bash_command,
-    is_sensitive_path,
     is_sensitive_write_path,
+    is_unverifiable_path_refusal,
     redact_credentials,
     redact_exfiltration_urls,
+    sensitive_path_refusal,
 )
 from kiro_crew.sel import sel as _sel
 
@@ -1047,7 +1048,12 @@ def _title_denial(
     place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
     ``"regex"``; the reasons are the exact strings the on-loop checks produced.
     """
-    if is_sensitive_path(title):
+    path_refusal = sensitive_path_refusal(title)
+    if path_refusal:
+        # A stall is passed through as worded (recognised by its fixed prefix, which
+        # the deny guidance classifies by); a match keeps this producer's wording.
+        if is_unverifiable_path_refusal(path_refusal):
+            return ("path", path_refusal)
         return ("path", f"Blocked: sensitive path: {title}")
     bash_reason = is_sensitive_bash_command(title)
     if bash_reason:
@@ -1162,7 +1168,10 @@ def _first_tool_input_denial(
                 ),
                 s[:64],
             )
-        if is_sensitive_path(s):
+        path_refusal = sensitive_path_refusal(s)
+        if path_refusal:
+            if is_unverifiable_path_refusal(path_refusal):
+                return ("path", path_refusal, s)
             return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
         _input_bash = is_sensitive_bash_command(s)
         if _input_bash:

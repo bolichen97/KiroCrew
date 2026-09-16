@@ -28,13 +28,14 @@ from kiro_crew.acp.kas_transport import (
     build_kas_argv,
 )
 from kiro_crew.acp.types import ACP_BACKEND_KAS
-from kiro_crew.agent import AGENT_FILENAME
+from kiro_crew.agent import AGENT_FILENAME, agent_spec_path
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
     project_agent_files,
     project_agent_name,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import is_agent_spec_name
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_perf import _read_gateway_pid
@@ -255,8 +256,20 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
 
     bound_model = ""
     bound_spec: Path | None = None
+    bound_spec_missing = False
     if bound != "kirocrew":
-        bound_spec = agents_dir / f"{bound}.json"
+        # Display only, through the same resolver the writers use, so the path
+        # shown is the file that holds the agent -- whichever form (``.json``
+        # or ``.md``) and whichever filename declares the name -- rather than a
+        # ``.json`` join that names a file a markdown agent does not have.
+        try:
+            bound_spec = agent_spec_path(bound, agents_dir=agents_dir)
+        except ValueError:
+            # Two safe specs declare the name, so no single file IS the bound
+            # spec; the model resolver below refuses for the same reason and
+            # its tier shows as deferring.
+            bound_spec = None
+        bound_spec_missing = bound_spec is None
         # Read through the resolver's own accessor: it matches on the spec's
         # ``name`` field as well as the filename, which a bare path join misses.
         try:
@@ -292,6 +305,10 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
     print(f"  spec file:   {_safe_display(str(default_spec))}")
     if bound_spec is not None:
         print(f"  bound spec:  {_safe_display(str(bound_spec))}")
+    elif bound_spec_missing:
+        print(
+            f"  bound spec:  ⚠️  no spec for {_safe_display(bound)} under {_safe_display(str(agents_dir))}"
+        )
 
     # Self-check: the marked tier must be what the resolver actually returned.
     if decided_value != effective:
@@ -434,7 +451,7 @@ def _strict_agent_json_specs(directory: Path) -> list[Path]:
                 (
                     Path(entry.path)
                     for entry in entries
-                    if entry.name.endswith(".json") and not entry.name.startswith("._")
+                    if is_agent_spec_name(entry.name) and not entry.name.startswith("._")
                 ),
                 key=lambda path: path.stem,
             )

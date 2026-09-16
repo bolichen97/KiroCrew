@@ -370,10 +370,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::_git",
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::setUp",
         # Diagnostics support-bundle version probe: fixed argv
-        # ``["kiro-cli", "--version"]`` with a 5s timeout, no shell, no cwd, and
+        # ``[<kiro-cli>, "--version"]`` with a 5s timeout, no shell, no cwd, and
         # no agent-influenced args — it only stamps the collected kiro-cli
-        # version into versions.txt. The binary name is a module constant; a
-        # resource ceiling / sandbox adds nothing to a `--version` call.
+        # version into versions.txt. The binary is the absolute path
+        # ``kiro_cli.pin_kiro_cli`` returns from the known install directories
+        # with the inherited PATH excluded (no pin, no spawn), so nothing an
+        # agent can write to names the executable; a resource ceiling / sandbox
+        # adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",

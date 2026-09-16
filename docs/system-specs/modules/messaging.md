@@ -1892,11 +1892,13 @@ answer is not permission: a raised evaluation and a `Decision` without
   primitive rather than a usability question (`task run ~/.ssh/id_rsa`). Both
   grammars route through `hooks.validate_file_path`, which applies the Windows UNC
   trusted-root check before resolving (a `realpath` on a UNC path is itself the
-  outbound SMB probe) to the raw and anchored forms, refuses a path with a
-  linked ancestor on Windows (the walk or the resolve would itself be the
-  probe), screens a Windows leaf link's own target (readlink, a local
-  metadata read) so a link aimed at an untrusted UNC share is refused while
-  benign leaf symlinks still resolve, canonicalizes through every symlink on
+  outbound SMB probe) to the raw and anchored forms, screens every Windows
+  link's own target -- a linked ancestor as well as a leaf link -- with
+  `readlink` (a local metadata read, never a traversal): a link aimed at an
+  untrusted UNC share, a device namespace, a drive-relative target or a
+  `..`-climbing suffix is refused before `realpath` can probe it, while a
+  link whose target is another local directory is rewritten to that target
+  so benign junctions still resolve; canonicalizes through every symlink on
   POSIX, and refuses a resolved
   target under a sensitive root, so an innocent-looking path that resolves into a
   blocked root is refused through the link. The **canonical** path is what reaches

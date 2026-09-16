@@ -190,7 +190,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
-from kiro_crew.kiro_cli import resolve_kiro_cli
+from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -1557,21 +1557,6 @@ def _channel_transport_permitted(member: str) -> bool:
 _KIRO_CLI_RESOLVE_TIMEOUT_SECS = 5.0
 
 
-def _kiro_cli_pin_probe() -> tuple[str | None, bool]:
-    """``(pinned path, an unpinned install exists)`` — the sync half of the pin.
-
-    The second element separates the two ways the pin can come back empty, which
-    a caller must report differently: kiro-cli is not installed at all (nothing
-    to say — the backend is optional), or it IS installed somewhere the pin does
-    not accept, which is a state an operator needs told about.
-    """
-
-    pinned = resolve_kiro_cli(include_inherited_path=False)
-    if pinned is not None:
-        return pinned, False
-    return None, resolve_kiro_cli() is not None
-
-
 async def _pinned_kiro_cli(purpose: str) -> str | None:
     """kiro-cli's absolute path for an unattended spawn, or ``None`` to refuse.
 
@@ -1590,12 +1575,15 @@ async def _pinned_kiro_cli(purpose: str) -> str | None:
     override, and hence its condition — an install the pin declined is worth a
     line, a backend that simply is not installed is not.
 
-    Off the loop and bounded: see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
+    The sync half is :func:`kiro_crew.kiro_cli.pin_kiro_cli`, shared with the
+    CLI's update command and the diagnostics bundle; this wrapper adds only
+    what an unattended path on the event loop needs. Off the loop and bounded:
+    see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
     """
 
     try:
         pinned, unpinned_exists = await asyncio.wait_for(
-            asyncio.to_thread(_kiro_cli_pin_probe),
+            asyncio.to_thread(pin_kiro_cli),
             timeout=_KIRO_CLI_RESOLVE_TIMEOUT_SECS,
         )
     except (TimeoutError, asyncio.TimeoutError):
@@ -1606,12 +1594,7 @@ async def _pinned_kiro_cli(purpose: str) -> str | None:
         )
         return None
     if pinned is None and unpinned_exists:
-        logger.warning(
-            "kiro-cli resolves only through PATH, which an unattended spawn does "
-            "not trust, so %s is skipped. Point KIROCREW_KIRO_BIN at the binary "
-            "to have it used here.",
-            purpose,
-        )
+        logger.warning("%s is skipped: %s.", purpose, PATH_ONLY_INSTALL_NOTE)
     return pinned
 
 

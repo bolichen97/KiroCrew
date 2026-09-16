@@ -141,6 +141,65 @@ def test_every_gate_fails_closed_on_a_stall(monkeypatch) -> None:
         stalled.release.set()
 
 
+def test_a_stall_is_refused_as_unverifiable_not_as_a_match(monkeypatch) -> None:
+    # Same decision as the boolean gate above (refused), different WORDS: the
+    # refusal says the path could not be verified and is NOT a match, so an agent
+    # reading it retries instead of hunting for a credential in a project file.
+    stalled = _StalledResolver()
+    monkeypatch.setattr(security, "_resolved_spellings", stalled)
+    try:
+        token = "/home/someone/ws/README.md"
+        reason = security.sensitive_path_refusal(token)
+    finally:
+        stalled.release.set()
+    assert reason is not None
+    assert security.is_unverifiable_path_refusal(reason)
+    assert "NOT a match" in reason
+    assert repr(token) in reason
+    assert "access to sensitive path" not in reason
+    # The boolean gate is the producer's ``is not None``: it cannot say otherwise.
+    assert security.is_sensitive_path(token) is True
+
+
+def test_a_match_and_a_benign_path_keep_their_answers(tmp_path) -> None:
+    benign = tmp_path / "notes.md"
+    benign.write_text("x")
+    assert security.sensitive_path_refusal(str(benign)) is None
+    assert security.is_sensitive_path(str(benign)) is False
+    assert security.sensitive_path_refusal("~/.aws/credentials") == (
+        "Blocked: access to sensitive path: ~/.aws/credentials"
+    )
+    assert security.is_sensitive_path("~/.aws/credentials") is True
+    assert security.sensitive_path_refusal("") is None
+
+
+def test_a_stalled_publish_artifact_check_is_also_worded_as_unverifiable(monkeypatch) -> None:
+    # The producer's second matcher raises through it too: a stall while judging
+    # the keystone-temp rule must not fall back to the match wording.
+    def stalled(*args, **kwargs):
+        raise security.PathResolutionStalled("/home/someone/ws/x.tmp", "/home/someone")
+
+    monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: False)
+    monkeypatch.setattr(security.paths, "_is_keystone_publish_artifact", stalled)
+    reason = security.sensitive_path_refusal("/home/someone/ws/x.tmp")
+    assert reason is not None and security.is_unverifiable_path_refusal(reason)
+
+
+def test_a_matched_path_spelled_like_the_stall_wording_is_still_a_match(monkeypatch) -> None:
+    # Both refusals embed the caller-chosen path, so the stall is recognised by a
+    # fixed PREFIX the path cannot reach, never by searching the text. A path
+    # carrying the whole stall opening keeps the match wording and is not a stall.
+    forged = f"/home/someone/{security.UNVERIFIABLE_PATH_PREFIX}/x"
+    monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+    reason = security.sensitive_path_refusal(forged)
+    assert reason == f"Blocked: access to sensitive path: {forged}"
+    assert security.is_unverifiable_path_refusal(reason) is False
+    # And the genuine stall wording quotes the path LAST, behind the fixed prefix.
+    assert security.is_unverifiable_path_refusal(
+        f"{security.UNVERIFIABLE_PATH_PREFIX} (...). Path: {forged!r}"
+    )
+
+
 def test_the_cooldown_is_scoped_to_the_stalled_prefix(monkeypatch, tmp_path) -> None:
     # One bash command can carry many path tokens against the SAME wedged mount:
     # paying the full timeout per token would put the loop straight back past

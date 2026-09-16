@@ -522,15 +522,22 @@ of the entry-population round that will actually populate real
 `snapshot_ref` values and therefore actually needs one — would be the same
 premature "spec amended reactively" mistake the paragraph above already
 declines to make for the artifact-storage decision. The class of
-`snapshot_ref` that has no publicly resolvable path today is precisely the
-real (non-placeholder) citation pointing into the private evidence catalog,
-and its owner is the entry-population round: that round MUST name a
-public/in-repo resolution story for `source.snapshot_ref` before it ships a
-single real (non-placeholder) entry, updating this paragraph in the same
-commit, per the same owning-spec rule. (Placeholder `snapshot_ref` values
-on `not_yet_sourced` entries, and the `user_stated` kind that points at an
-in-repo statement, are already publicly resolvable and are not part of this
-open class.)
+`snapshot_ref` that has no publicly resolvable path today is precisely any
+real (non-placeholder) citation that points at an artifact prepared outside
+this repository — the campaign's private evidence catalog, or a private
+brief section or decision record that a `user_stated` entry cites (see the
+`user_stated` row above: its `snapshot_ref` "points at the statement
+itself", and that statement is only publicly resolvable when the statement
+actually lives in this repo). Its owner is the entry-population round: that
+round MUST name a public/in-repo resolution story for `source.snapshot_ref`
+before it ships a single real (non-placeholder) entry, updating this
+paragraph in the same commit, per the same owning-spec rule. (Only two
+classes are already publicly resolvable and therefore outside this open
+class: placeholder `snapshot_ref` values on `not_yet_sourced` entries, and a
+`user_stated` citation whose referenced statement is itself in this repo. A
+`user_stated` entry that cites a statement living only in a private brief is
+NOT excluded — it falls in the open class above, because a reader with only
+this repo cannot follow it either.)
 
 ## The work-stream DAG
 

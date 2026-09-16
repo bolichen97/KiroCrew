@@ -2895,10 +2895,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // place that mapping is spelled — a Trust affordance on this path would claim
   // a standing grant the backend never records (#5400, #5434).
   const dismissApproval = useCallback((aid: string, decision?: string) => {
-    dispatch(resolveByApprovalId({ id: aid, decision }))
+    dispatch(resolveByApprovalId({ id: aid, slot: activeSlot || undefined, decision }))
     const n = store.getState().notifications.items.find(x => x.approval_id === aid)
     if (n) dispatch(removeNotificationByTs(n.ts))
-  }, [dispatch])
+  }, [activeSlot, dispatch])
   const switchAgent = useCallback(async (agentName: string) => {
     if (!activeSlot) {
       setPendingAgent(agentName)

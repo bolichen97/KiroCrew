@@ -23,6 +23,7 @@ from kiro_crew import model_registry
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
@@ -1894,13 +1895,13 @@ def _reply_style_rules(level: str) -> str:
             "1. Shape check. Does the answer have a shape — steps, "
             "before/after, cases and verdicts, sizes? Then draw it. A "
             "picture is payload, not prose: it replaces the words, never "
-            "repeats them. Use the richest form this surface renders: an "
-            "inline widget, an HTML artifact or a mermaid fence ONLY when "
-            "your instructions carry an Inline Widgets section; on any other "
-            "surface (a chat channel, a CLI) a plain table — widget, HTML or "
-            "mermaid markup lands there as raw text. A picture holds labels "
-            "of one to three words and numbers, never a sentence. If a "
-            "sentence is needed, it goes under the picture, once.\n"
+            "repeats them. When your instructions carry an Inline Widgets "
+            "section, the picture IS an inline widget (an HTML artifact when "
+            "it is large) — never a plain table of sentences. On any other "
+            "surface (a chat channel, a CLI) a plain table — widget or HTML "
+            "markup lands there as raw text. A picture holds labels of one "
+            "to three words and numbers, never a sentence. If a sentence is "
+            "needed, it goes under the picture, once.\n"
             "2. Word check. Each sentence: at most 12 words. Each word: one "
             "the user has used, or one a child knows. A word that fails "
             "both is replaced, or defined in three words.\n"
@@ -2232,7 +2233,7 @@ def _read_include_crew_context(agent: str) -> bool:
     directory error all default to injecting, reproducing the pre-opt-out behavior.
     """
     try:
-        candidates = kiro_agents_dir().glob("*.json")
+        candidates = iter_agent_spec_files(kiro_agents_dir(), ordered=False)
     except OSError:
         return True
     for f in candidates:
@@ -2249,7 +2250,7 @@ def _read_include_crew_context(agent: str) -> bool:
             # re-resolves, refuses a sensitive target, and opens O_NOFOLLOW —
             # closing the TOCTOU where the final path component is swapped to a
             # symlink into ~/.aws etc. AFTER the is_sensitive_path check above.
-            data = json.loads(safe_read_file(str(f)))
+            data = parse_agent_spec_text(safe_read_file(str(f)), f)
             if not isinstance(data, dict):
                 continue
             if data.get("name") == agent or f.stem == agent:

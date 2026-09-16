@@ -492,7 +492,7 @@ def run_verifier(
 #: composite. A check the tree does not carry is coverage lost, and the probe
 #: reports it as unavailable rather than skipping it.
 TIERS: tuple[tuple[str, str], ...] = (
-    ("sensitive-path", "is_sensitive_path"),
+    ("sensitive-path", "sensitive_path_refusal"),
     ("sensitive-bash", "is_sensitive_bash_command"),
     ("exfil", "audit_bash_exfiltration"),
     ("deny-rules", "is_denied"),

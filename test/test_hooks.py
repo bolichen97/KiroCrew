@@ -2739,3 +2739,90 @@ class TestUnrecoverableShellIsRefusedUnconditionally:
         # so the assertion above pins the refusal and not a broken fixture.
         ok = HookManager(cfg).on_tool_call("Running: ls", is_shell=True, command="ls")
         assert ok.action == TOOL_AUTO_APPROVE
+
+
+class TestPathTierUnderAResolverStall:
+    """What the gate SAYS when the resolver cannot answer in time.
+
+    The decision is the same either way -- unverifiable is refused, fail-closed --
+    but a refusal reading ``access to sensitive path: <ordinary file>`` sends an
+    agent hunting for a credential in a project file, or concluding the session
+    has been locked down. The gate applies ONE path-tier check,
+    ``security.sensitive_path_refusal``; the verdict it is built on is stubbed on
+    the owning module, which is the global the real function reads.
+    """
+
+    def test_a_stalled_file_read_is_refused_as_unverifiable_not_as_sensitive(
+        self, monkeypatch, tmp_path
+    ):
+        from kiro_crew import security
+
+        target = tmp_path / "ws" / "README.md"
+        target.parent.mkdir()
+        target.write_text("x")
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled(str(target), "/x")
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        result = HookManager().on_tool_call(
+            f"Reading {target}", tool_kind="read", raw_params={"path": str(target)}
+        )
+        assert result.action == TOOL_DENY
+        assert result.security_deny is True, "still a hard refusal, not policy state"
+        assert "access to sensitive path" not in result.reason
+        assert security.is_unverifiable_path_refusal(result.reason)
+        assert "NOT a match" in result.reason
+        assert repr(str(target)) in result.reason  # quoted: the unverifiable wording uses the repr
+
+    def test_a_sensitive_read_still_says_sensitive(self, monkeypatch):
+        from kiro_crew import security
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        result = HookManager().on_tool_call("~/.aws/credentials", tool_kind="read")
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.aws/credentials"
+
+    def test_safe_read_file_keeps_the_repr_quoted_match_wording(self, monkeypatch, tmp_path):
+        from kiro_crew import hooks, security
+
+        target = tmp_path / "plain.txt"
+        target.write_text("x")
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(str(target))
+        assert str(info.value) == f"Blocked: access to sensitive path: {str(target)!r}"
+
+    def test_safe_read_file_passes_the_unverifiable_wording_through(self, monkeypatch, tmp_path):
+        from kiro_crew import hooks, security
+
+        target = tmp_path / "plain.txt"
+        target.write_text("x")
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled(str(target), "/x")
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(str(target))
+        assert security.is_unverifiable_path_refusal(str(info.value))
+        assert "access to sensitive path" not in str(info.value)
+
+    def test_safe_read_file_escapes_a_matched_path_spelled_like_the_stall_wording(
+        self, monkeypatch, tmp_path
+    ):
+        """The stall is recognised by a fixed prefix the path cannot reach, so a
+        matched path that carries the stall wording -- and a forged newline -- is
+        still re-spelled with the repr (the log-forgery guard)."""
+        import os
+
+        from kiro_crew import hooks, security
+
+        forged = str(tmp_path / f"{security.UNVERIFIABLE_PATH_PREFIX}\nWARNING forged")
+        resolved = os.path.realpath(forged)
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(forged)
+        message = str(info.value)
+        assert message == f"Blocked: access to sensitive path: {resolved!r}"
+        assert "\n" not in message
