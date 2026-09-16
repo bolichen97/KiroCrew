@@ -465,20 +465,224 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(bad_msg)
 
 
-# ── connector fail-closed when no transport is wired ───────────────────────
+# ── connector fail-closed when no runner is wired ──────────────────────────
 class TestConnectorFailClosed(unittest.TestCase):
     def test_source_type(self):
         self.assertEqual(SalesforceStructuredConnector().source_type(), SOURCE_TYPE)
 
-    def test_fetch_refuses_without_transport(self):
+    def test_fetch_refuses_without_runner(self):
         conn = SalesforceStructuredConnector()
         with self.assertRaises(NotImplementedError):
-            asyncio.run(conn.fetch({"uri": "salesforce://object/Account"}))
+            asyncio.run(
+                conn.fetch(
+                    {
+                        "id": "s1",
+                        "uri": "salesforce://object/Account",
+                        "instance_url": INSTANCE,
+                        "org_id": ORG,
+                    }
+                )
+            )
 
-    def test_detect_changes_refuses_without_transport(self):
+    def test_detect_changes_refuses_without_runner(self):
         conn = SalesforceStructuredConnector()
         with self.assertRaises(NotImplementedError):
-            asyncio.run(conn.detect_changes({"uri": "salesforce://object/Account"}))
+            asyncio.run(
+                conn.detect_changes(
+                    {"uri": "salesforce://object/Account", "instance_url": INSTANCE, "org_id": ORG}
+                )
+            )
+
+
+# ── real fetch/detect_changes driven through a fake control-plane runner ───
+from kiro_crew.connections.control_plane.executor import ExecutionOutcome  # noqa: E402
+from kiro_crew.connections.control_plane.result import (  # noqa: E402
+    CollectionPayload,
+    ObjectPayload,
+    result_with_payload,
+)
+from kiro_crew.connections.vendors.salesforce.transport import (  # noqa: E402
+    OP_DESCRIBE,
+    OP_REPORT_RUN,
+    OP_SOQL_QUERY,
+)
+
+
+def _collection_outcome(items, cursor=None):
+    return ExecutionOutcome(
+        result=result_with_payload(CollectionPayload(items=tuple(items), next_cursor=cursor))
+    )
+
+
+def _object_outcome(obj):
+    return ExecutionOutcome(result=result_with_payload(ObjectPayload(object=obj)))
+
+
+class _FakePageWalk:
+    """A duck-typed PageWalk: hands out canned pages, sets done on the last."""
+
+    def __init__(self, pages):
+        self._pages = list(pages)
+        self.done = False
+
+    def next(self):
+        page_items, cursor = self._pages.pop(0)
+        if not self._pages:
+            self.done = True
+        return _collection_outcome(page_items, cursor)
+
+
+class _FakeRunner:
+    """In-memory SalesforceCallRunner: no network, drives the real conversion."""
+
+    def __init__(self, *, describe_body=None, soql_pages=None, report_body=None):
+        self._describe_body = describe_body
+        self._soql_pages = soql_pages or []
+        self._report_body = report_body
+        self.calls = []
+
+    async def run(self, descriptor, request_args):
+        op = descriptor["operation_id"]
+        self.calls.append((op, dict(request_args)))
+        if op == OP_DESCRIBE:
+            return _object_outcome(self._describe_body)
+        if op == OP_REPORT_RUN:
+            return _collection_outcome([self._report_body])
+        if op == OP_SOQL_QUERY:
+            # detect_changes probe path: return first page's items (or empty)
+            items = self._soql_pages[0][0] if self._soql_pages else []
+            return _collection_outcome(items)
+        raise AssertionError(f"unexpected op {op}")
+
+    def walk(self, descriptor, base_args):
+        self.calls.append(("walk:" + descriptor["operation_id"], dict(base_args)))
+        return _FakePageWalk(self._soql_pages)
+
+
+def _account_describe_body():
+    from kiro_crew.connections.vendors.salesforce.fixtures import account_describe
+
+    b = dict(account_describe())
+    # add SystemModstamp so the watermark can advance
+    b["fields"] = list(b["fields"]) + [
+        {
+            "name": "SystemModstamp",
+            "type": "datetime",
+            "soapType": "xsd:dateTime",
+            "nillable": False,
+            "createable": False,
+            "updateable": False,
+            "accessible": True,
+        }
+    ]
+    return b
+
+
+class TestConnectorRealFetch(unittest.TestCase):
+    def _object_source(self):
+        return {
+            "id": "src-acct",
+            "uri": "salesforce://object/Account",
+            "instance_url": INSTANCE,
+            "org_id": ORG,
+        }
+
+    def test_soql_fetch_paginates_and_converts(self):
+        runner = _FakeRunner(
+            describe_body=_account_describe_body(),
+            soql_pages=[
+                (
+                    [
+                        {
+                            "attributes": {"type": "Account"},
+                            "Id": "001A00000000001",
+                            "Name": "Acme",
+                            "SystemModstamp": "2026-02-01T00:00:00Z",
+                        }
+                    ],
+                    "/services/data/v60.0/query/01g-200",
+                ),
+                (
+                    [
+                        {
+                            "attributes": {"type": "Account"},
+                            "Id": "001B00000000002",
+                            "Name": "Globex",
+                            "SystemModstamp": "2026-03-01T00:00:00Z",
+                        }
+                    ],
+                    None,
+                ),
+            ],
+        )
+        conn = SalesforceStructuredConnector(call_runner=runner)
+        text, meta = asyncio.run(conn.fetch(self._object_source()))
+        self.assertEqual(meta["row_count"], 2)
+        self.assertEqual(meta["path"], PATH_SOQL_OBJECT)
+        # both records converted, keyed by real Id
+        self.assertIn("001A00000000001", text)
+        self.assertIn("001B00000000002", text)
+        # every row carries a ProviderResourceRef
+        self.assertEqual(len(meta["rows"]), 2)
+        self.assertEqual(meta["rows"][0]["resource_ref"]["provider"], SOURCE_TYPE)
+        self.assertEqual(meta["rows"][0]["resource_ref"]["locator"]["sobjectType"], "Account")
+        # watermark advanced to the max modstamp seen
+        cp = meta["salesforce_structured_checkpoint"]
+        self.assertEqual(cp["since"], "2026-03-01T00:00:00Z")
+        # a describe + a paged walk were issued
+        ops = [c[0] for c in runner.calls]
+        self.assertIn(OP_DESCRIBE, ops)
+        self.assertIn("walk:" + OP_SOQL_QUERY, ops)
+
+    def test_report_fetch_full_snapshot(self):
+        report_body = {
+            "allData": True,
+            "reportMetadata": {"detailColumns": ["ACCOUNT.ID", "ACCOUNT.NAME"]},
+            "factMap": {
+                "T!T": {
+                    "rows": [
+                        {
+                            "dataCells": [
+                                {"value": "001A00000000001", "label": "001A00000000001"},
+                                {"label": "Acme"},
+                            ]
+                        },
+                    ]
+                }
+            },
+        }
+        runner = _FakeRunner(report_body=report_body)
+        conn = SalesforceStructuredConnector(call_runner=runner)
+        source = {
+            "id": "src-rep",
+            "uri": "salesforce://report/00O000000000001",
+            "instance_url": INSTANCE,
+            "org_id": ORG,
+        }
+        text, meta = asyncio.run(conn.fetch(source))
+        self.assertEqual(meta["path"], PATH_ANALYTICS_REPORT)
+        self.assertEqual(meta["row_count"], 1)
+        self.assertIn("001A00000000001", text)
+        # report path carries no SOQL watermark
+        self.assertIsNone(meta["salesforce_structured_checkpoint"]["since"])
+        self.assertIn(OP_REPORT_RUN, [c[0] for c in runner.calls])
+
+    def test_detect_changes_first_sync_is_true(self):
+        runner = _FakeRunner(describe_body=_account_describe_body(), soql_pages=[([], None)])
+        conn = SalesforceStructuredConnector(call_runner=runner)
+        # no checkpoint => first sync => changed
+        self.assertTrue(asyncio.run(conn.detect_changes(self._object_source())))
+
+    def test_detect_changes_report_always_true(self):
+        runner = _FakeRunner()
+        conn = SalesforceStructuredConnector(call_runner=runner)
+        source = {
+            "id": "src-rep",
+            "uri": "salesforce://report/00O000000000001",
+            "instance_url": INSTANCE,
+            "org_id": ORG,
+        }
+        self.assertTrue(asyncio.run(conn.detect_changes(source)))
 
 
 if __name__ == "__main__":

@@ -74,15 +74,22 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Tuple, Union
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
+from kiro_crew.connections.control_plane.executor import advance_page
 from kiro_crew.connections.vendors.salesforce.describe import (
     UNKNOWN,
     ObjectDescribe,
+    parse_object_describe,
 )
 from kiro_crew.connections.vendors.salesforce.payload import parse_record
 
 from .base import BaseConnector
+
+if TYPE_CHECKING:
+    from kiro_crew.connections.control_plane.executor import ExecutionOutcome, PageWalk
+    from kiro_crew.connections.control_plane.operation import OperationDescriptor
 
 # ── the knowledge source_type this connector answers to ────────────────────
 SOURCE_TYPE = "salesforce"
@@ -875,31 +882,87 @@ def parse_source_spec(config: Mapping[str, Any]) -> SourceSpec:
     )
 
 
+# ── the control-plane call runner the connector drives ─────────────────────
+class SalesforceCallRunner(Protocol):
+    """Runs ONE authorized Salesforce read through the W01 control-plane executor.
+
+    This is the seam the connector drives, and it is what keeps W01 composition
+    (vault custody, handle issuance, binding resolution, per-operation transport
+    composition with the matching vendor decode) on the FACTORY side where the
+    credentials live -- the connector never touches a secret, composes a
+    transport, or issues a handle. An implementation holds the per-source auth
+    context (handle, permitted modes, layer ceilings, governance scope) and the
+    composed transports, and simply authorizes+emits when asked.
+
+    * :meth:`run` -- authorize and emit ONE call (describe / report), returning
+      the executor's :class:`ExecutionOutcome`.
+    * :meth:`walk` -- open a :class:`PageWalk` over a paged operation (SOQL), so
+      the connector consumes real cursors page by page.
+
+    ``request_args`` carries the source's org coordinates (``instance_url`` /
+    ``api_version``) plus the operation selector (``soql`` / ``report_id`` /
+    ``sobject_type``); the runner adds the W01 authorization inputs.
+    """
+
+    async def run(
+        self, descriptor: "OperationDescriptor", request_args: Mapping[str, Any]
+    ) -> "ExecutionOutcome": ...
+
+    def walk(
+        self, descriptor: "OperationDescriptor", base_args: Mapping[str, Any]
+    ) -> "PageWalk": ...
+
+
+def _outcome_items(outcome: "ExecutionOutcome") -> Tuple[Mapping[str, Any], ...]:
+    """The collection items on a successful outcome, or raise on a non-ok one.
+
+    A denied gate / transport error / 412 all carry no payload; a read that could
+    not be authorized or emitted must NOT be silently treated as an empty result
+    (that would ingest "nothing changed" over a real failure), so this raises.
+    """
+    if not outcome.ok:
+        err = outcome.error
+        detail = getattr(err, "detail", None) or getattr(err, "class_", None) or "denied"
+        raise SalesforceFetchError(f"Salesforce read was not authorized/emitted: {detail}")
+    payload = outcome.payload
+    items = getattr(payload, "items", None)
+    if items is None:
+        obj = getattr(payload, "object", None)
+        return (obj,) if isinstance(obj, Mapping) else ()
+    return tuple(items)
+
+
+class SalesforceFetchError(RuntimeError):
+    """A live Salesforce read failed or was not authorized."""
+
+
 # ── the connector ───────────────────────────────────────────────────────────
 class SalesforceStructuredConnector(BaseConnector):
     """Consume Salesforce sObjects and Analytics reports as one structured source.
 
     Conforms to :class:`BaseConnector` so the existing ``SyncScheduler`` drives
-    it. The typed-row conversion, primary-key diffing, checkpointing, FLS-gated
-    field selection and SOQL building are the module-level pure functions above;
-    this class binds them to the connector contract and owns config validation.
+    it (``detect_changes`` -> ``fetch`` -> ``ingest_text``). The typed-row
+    conversion, primary-key diffing, checkpointing, FLS-gated field selection and
+    SOQL building are the module-level pure functions above; this class binds
+    them to the connector contract and owns config validation.
 
-    The live transport is the W01 control-plane executor, INJECTED at
-    construction (the same dependency-injection seam W01's own production
-    composition uses -- not a bypass hook: the real assembly supplies the real
-    executor, and only a test supplies a fake). When no transport is wired AND
-    the executor is not importable, :meth:`fetch` / :meth:`detect_changes` refuse
-    fail-closed rather than fabricating a live read.
+    The live transport is the W01 control-plane executor, reached through an
+    INJECTED :class:`SalesforceCallRunner` (the factory composes it with real
+    vault custody + HTTP and the per-source authorization context). This is the
+    framework's own dependency-injection seam, NOT a bypass hook: the real
+    production assembly supplies the real runner, a test supplies a fake, and the
+    final production wiring registers the connector with a real runner. When no
+    runner is wired, :meth:`fetch` / :meth:`detect_changes` refuse fail-closed
+    rather than fabricating a live read.
     """
 
-    def __init__(self, transport: Any = None) -> None:
-        # ``transport`` is a control-plane executor Transport (see
-        # kiro_crew.connections.control_plane.executor.Transport). Left None in
-        # the offline/default construction; the real production assembly passes
-        # the vault-custody + HTTP transport composed by
-        # control_plane.production. It is NEVER a second HTTP client of this
-        # module's own.
-        self._transport = transport
+    def __init__(self, call_runner: Optional[SalesforceCallRunner] = None) -> None:
+        # ``call_runner`` authorizes+emits one Salesforce read through the W01
+        # executor. Left None in the offline/default construction; the real
+        # production assembly passes a runner composed over
+        # control_plane.production (vault custody + HTTP) with this vendor's
+        # locator/decode. It is NEVER a second HTTP client or a second auth.
+        self._runner = call_runner
 
     def source_type(self) -> str:
         return SOURCE_TYPE
@@ -911,40 +974,170 @@ class SalesforceStructuredConnector(BaseConnector):
             return False, str(exc)
         return True, ""
 
-    async def detect_changes(self, source: dict) -> bool:
-        # A real detect_changes issues a bounded probe through the control-plane
-        # executor (a COUNT() SOQL past the watermark on the object path; a report
-        # is re-read whole so it always "may have changed"). Until the executor
-        # transport is wired it refuses -- fail-closed, scheduling no ingest --
-        # rather than fabricating a "changed" answer.
-        if self._transport is None:
+    def _require_runner(self) -> SalesforceCallRunner:
+        if self._runner is None:
             raise NotImplementedError(
-                "Salesforce live change-detection needs the W01 control-plane "
-                "executor transport, which is not wired in this construction"
+                "Salesforce live read needs the W01 control-plane executor runner, "
+                "which is not wired in this construction (fail-closed: a mock read "
+                "is not a live read)"
             )
-        raise NotImplementedError(
-            "Salesforce detect_changes transport wiring lands with the executor "
-            "integration; see work item W10/L2"
-        )
+        return self._runner
+
+    def _org_args(self, spec: SourceSpec, source: dict) -> dict:
+        args: dict[str, Any] = {
+            "instance_url": spec.instance_url,
+            "org_id": spec.org_id,
+        }
+        version = source.get("api_version")
+        if isinstance(version, str) and version:
+            args["api_version"] = version
+        batch = source.get("batch_size")
+        if isinstance(batch, int):
+            args["batch_size"] = batch
+        return args
+
+    async def _describe(
+        self, runner: SalesforceCallRunner, spec: SourceSpec, source: dict
+    ) -> ObjectDescribe:
+        from kiro_crew.connections.vendors.salesforce.transport import describe_descriptor
+
+        args = {**self._org_args(spec, source), "sobject_type": spec.sobject_type}
+        outcome = await runner.run(describe_descriptor(), args)
+        items = _outcome_items(outcome)
+        if not items:
+            raise SalesforceFetchError(f"describe of {spec.sobject_type} returned no body")
+        return parse_object_describe(items[0])
+
+    async def detect_changes(self, source: dict) -> bool:
+        """Bounded change probe through the executor -- fail-closed when unwired.
+
+        SOQL object path: a describe + a one-row ``SELECT ... ORDER BY
+        SystemModstamp DESC LIMIT 1`` past the stored watermark; a returned row
+        means something changed since ``since``. When there is no watermark yet
+        (first sync) it always reports changed. Report path: a report is a
+        bounded snapshot re-read whole, so it always "may have changed" and
+        reports True (the fetch's full-replace is the actual reconciliation).
+        A read that cannot be authorized/emitted raises rather than reporting
+        "unchanged" over a real failure.
+        """
+        runner = self._require_runner()
+        spec = parse_source_spec(source)
+        if spec.path == PATH_ANALYTICS_REPORT:
+            return True
+        from kiro_crew.connections.vendors.salesforce.transport import soql_query_descriptor
+
+        describe = await self._describe(runner, spec, source)
+        checkpoint = read_checkpoint(source)
+        if checkpoint.since is None:
+            return True
+        # A minimal existence probe past the watermark; reuse build_soql's
+        # FLS-gated, fail-closed projection but bound it to one row.
+        base = build_soql(describe, since=checkpoint.since, order_by="SystemModstamp DESC")
+        soql = f"{base} LIMIT 1"
+        args = {**self._org_args(spec, source), "soql": soql}
+        outcome = await runner.run(soql_query_descriptor(), args)
+        return len(_outcome_items(outcome)) > 0
 
     async def fetch(self, source: dict) -> tuple[str, dict]:
-        # A real fetch runs the object path (describe -> FLS-gated SOQL -> L1
-        # query-locator PageWalk over the executor) or the report path
-        # (Analytics report read over the executor), converts each vendor record
-        # into a typed row, and renders the rows into the (text, metadata) shape
-        # the ingestion pipeline stores -- carrying the ProviderResourceRef on
-        # each item. Until the executor transport is wired it refuses: a
-        # first-page-only or mocked payload is not a live dataset and must not be
-        # stored as one.
-        if self._transport is None:
-            raise NotImplementedError(
-                "Salesforce live fetch needs the W01 control-plane executor "
-                "transport, which is not wired in this construction"
+        """Live read of one source, rendered into the ingest ``(text, meta)`` shape.
+
+        SOQL object path: describe -> FLS-gated SOQL -> a real
+        :class:`PageWalk` over the L1 query-locator, converting every record to a
+        typed row. Report path: run the Analytics report (bounded <=2000-row
+        snapshot) and convert its fact grid. Every row renders to a stable text
+        projection and metadata carrying the ``ProviderResourceRef``; the rows'
+        combined text is returned for the pipeline to chunk and store, and the
+        per-row metadata (including each row's resource ref) travels in ``meta``
+        under ``rows`` so a downstream ACL hook can persist it per item.
+
+        Fail-closed: an unauthorized/failed read raises; an FLS-unreadable field
+        or unqueryable object is never selected; a report over the row cap or a
+        truncated report is refused by the converter.
+        """
+        runner = self._require_runner()
+        spec = parse_source_spec(source)
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        source_id = str(source.get("id") or source.get("source_id") or "")
+        if not source_id:
+            raise SalesforceFetchError("source has no id; cannot key its rows")
+
+        rows: list[TypedRow] = []
+        if spec.path == PATH_SOQL_OBJECT:
+            from kiro_crew.connections.vendors.salesforce.transport import (
+                soql_query_descriptor,
             )
-        raise NotImplementedError(
-            "Salesforce fetch transport wiring lands with the executor "
-            "integration; see work item W10/L2"
-        )
+
+            describe = await self._describe(runner, spec, source)
+            checkpoint = read_checkpoint(source)
+            soql = build_soql(describe, since=checkpoint.since)
+            walk = runner.walk(
+                soql_query_descriptor(),
+                {**self._org_args(spec, source), "soql": soql},
+            )
+            modstamps: list[str] = []
+            while not walk.done:
+                outcome = advance_page(walk)
+                for rec in _outcome_items(outcome):
+                    row = record_from_payload(
+                        describe,
+                        rec,
+                        source_id=source_id,
+                        instance_url=spec.instance_url,
+                        org_id=spec.org_id,
+                        fetched_at=fetched_at,
+                    )
+                    rows.append(row)
+                    stamp = row.fields.get("SystemModstamp") or row.fields.get("LastModifiedDate")
+                    if isinstance(stamp, str) and stamp:
+                        modstamps.append(stamp)
+            plan = diff_rows(
+                tuple(rows),
+                frozenset(),
+                prior_since=checkpoint.since,
+                modstamps=modstamps or None,
+                full_listing=False,
+            )
+            # Advance the watermark; the report path has none.
+            new_checkpoint = Checkpoint(
+                since=plan.next_since, query_locator=None, in_progress=False
+            )
+        else:
+            from kiro_crew.connections.vendors.salesforce.transport import report_run_descriptor
+
+            outcome = await runner.run(
+                report_run_descriptor(),
+                {**self._org_args(spec, source), "report_id": spec.report_id},
+            )
+            items = _outcome_items(outcome)
+            if not items:
+                raise SalesforceFetchError(f"report {spec.report_id} returned no body")
+            rows.extend(
+                report_rows_from_payload(
+                    spec.report_id,
+                    items[0],
+                    source_id=source_id,
+                    instance_url=spec.instance_url,
+                    org_id=spec.org_id,
+                    fetched_at=fetched_at,
+                )
+            )
+            new_checkpoint = Checkpoint(since=None, query_locator=None, in_progress=False)
+
+        text = "\n\n".join(render_row_text(r) for r in rows)
+        meta = {
+            "source_type": SOURCE_TYPE,
+            "path": spec.path,
+            "instance_url": spec.instance_url,
+            "org_id": spec.org_id,
+            "row_count": len(rows),
+            "fetched_at": fetched_at,
+            # Per-row metadata incl. each row's ProviderResourceRef, for a
+            # downstream ACL hook to persist via store.set_item_acl.
+            "rows": [render_row_metadata(r) for r in rows],
+            # The advanced checkpoint, for the scheduler's per-source state write.
+            _CHECKPOINT_KEY: new_checkpoint.to_dict(),
+        }
+        return text, meta
 
 
 __all__ = [
@@ -961,6 +1154,8 @@ __all__ = [
     "SalesforceLineageError",
     "SalesforceRowLineage",
     "SalesforceStructuredConnector",
+    "SalesforceCallRunner",
+    "SalesforceFetchError",
     "SObjectRecordRow",
     "SourceSpec",
     "build_soql",
