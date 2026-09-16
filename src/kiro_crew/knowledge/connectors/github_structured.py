@@ -36,8 +36,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
 from .base import BaseConnector
+
+if TYPE_CHECKING:  # type-only; the pure PR-2 surface imports with no connections dep
+    from kiro_crew.connections.control_plane.operation import CredentialMode
 
 # ── entity types ───────────────────────────────────────────────────────────
 # One string per GitHub record kind. Stored verbatim on every row's lineage so a
@@ -574,19 +578,149 @@ def render_row_metadata(row: TypedRow) -> dict:
     }
 
 
+# ── PR-3: the live wiring (real invocation + paging through W01's transport) ─
+# PR-2 above owns the domain model and refuses a live read until a real
+# transport exists. This section drives that transport WITHOUT re-doing any of
+# it: it opens W01's PageWalk (through connections.vendors.github.dispatch) and
+# advances it page by page, so the operation is really invoked, authorized per
+# page, and the per-page cursor really followed. The ONLY sender is W01's
+# transport, composed by the caller and handed in.
+#
+# WHAT IS NOT CLOSED, AND WHY (root-confirmed at cd00f1837): the fetched page
+# BODY does not come back. build_production_transport builds
+# `TransportResponse(http_status=..., result=decode(reply))`, and a ResultDecode
+# returns only an OperationResult ({status, next_cursor}); Decoded2xx does
+# capture `body: bytes` but only `.result` propagates, so the rows are dropped
+# before they reach ExecutionOutcome (which has no payload slot either). W01
+# owns the fix (a single neutral payload slot threaded Decoded2xx.body ->
+# TransportResponse -> ExecutionOutcome, with a schema bump). Until that
+# versioned commit lands, the row-extraction step is left as an EXPLICIT,
+# UNVERIFIED seam that FAILS CLOSED (raises) rather than fabricating rows or
+# claiming a dataset. No workaround is used: no out-of-band body capture, no
+# response cache, no local envelope re-declaration, no vendor side channel.
+
+# The GitHub list operation per entity kind (operation_id only, never a URL, so
+# auth/custody/paging all stay W01's). Only the entities with a REPO-SCOPED REST
+# list op carrying {owner}/{repo} path params are wired here:
+#   * pull requests -> gh_list_pull_requests (GET /repos/{owner}/{repo}/pulls),
+#     converted by issue_or_pull_from_payload;
+#   * commits       -> gh_list_commits       (GET /repos/{owner}/{repo}/commits),
+#     converted by commit_from_payload.
+# TWO entities are deliberately NOT wired, as open questions rather than
+# hand-rolled URLs (a naked path is forbidden):
+#   * issues     -- the repo-scoped issues LIST is not in the vendor table; the
+#     only issue-listing ops are gh_search_issues (GET /search/issues, a `q=`
+#     search shape, no {owner}/{repo} path) and gh_list_issues (GraphQL prose,
+#     unshapeable by the REST locator);
+#   * check-runs -- ENTITY_CHECK_RUN has NO list op at all (only a legacy
+#     branch-protection PATCH).
+# Both remain reported as `question` to the conductor.
+_OP_FOR_ENTITY = {
+    ENTITY_PULL_REQUEST: "gh_list_pull_requests",
+    ENTITY_COMMIT: "gh_list_commits",
+}
+
+
+@dataclass(frozen=True)
+class GithubTransport:
+    """Everything one entity's page walk needs, all resolved by W01 / the caller.
+
+    The connector never builds a handle, selector, vault or transport itself --
+    custody, auth and fencing are W01's, so the caller (the scheduler
+    integration, a test) composes a real
+    :func:`~kiro_crew.connections.vendors.github.dispatch.build_github_transport`
+    plus the W01 handle/gate inputs and hands them in through a
+    :class:`GithubTransportProvider`. ``clock`` is optional (a deterministic
+    test injects one; production leaves it ``None`` so the executor reads its own
+    server clock).
+    """
+
+    transport: Any
+    handle: Any
+    offered_mode: "CredentialMode"
+    permitted: Any
+    layers: Any
+    governance_scope: str
+    governance_item: str
+    clock: Optional[Callable[[], float]] = None
+
+
+class GithubTransportProvider(Protocol):
+    """Resolves a source + entity to a :class:`GithubTransport`, or ``None``.
+
+    The seam that keeps custody out of this module: given the source row and the
+    entity kind about to be walked, an implementation returns the W01-composed
+    transport bundle for that binding (per-binding via W01's
+    ``BindingSecretSelector`` -- one binding, one transport), or ``None`` when it
+    cannot. A ``None`` makes the connector fail closed for that entity rather
+    than fabricate a read.
+    """
+
+    def __call__(
+        self, source: dict, entity_type: str
+    ) -> Optional["GithubTransport"]:  # pragma: no cover - Protocol
+        ...
+
+
+class LiveFetchError(RuntimeError):
+    """A live GitHub read could not complete, so nothing is stored.
+
+    Raised when a page walk's gate denied or the transport failed, when no W01
+    transport is available for a source, or -- until W01's payload slot lands --
+    when a walk turned pages but the row payload cannot be read back. It is a
+    fail-closed refusal: a partial, empty, or page-count-only result is never
+    presented as a complete live read. Distinct from :class:`NotImplementedError`,
+    which is the "no transport configured at all" case PR-2's parked tests
+    assert.
+    """
+
+
+def _repo_of(source: dict) -> str:
+    """The ``owner/name`` this source reads, validated.
+
+    Accepts the spellings ``validate_config`` accepts (``uri`` with an optional
+    ``github://`` prefix) plus the ``repo_full_name`` the refresh tests pass.
+    Refuses anything that is not ``owner/name`` -- a malformed repo must never be
+    shaped into a request.
+    """
+
+    repo = (
+        (source.get("repo_full_name") or source.get("uri") or "")
+        .strip()
+        .removeprefix("github://")
+    )
+    if not _REPO_FULL_NAME_RE.match(repo):
+        raise LineageError(f"source repo must be 'owner/name', got {repo!r}")
+    return repo
+
+
 class GithubStructuredConnector(BaseConnector):
     """Consume GitHub issues/PRs/commits/check-runs as one structured source.
 
     Conforms to :class:`BaseConnector` so the existing ``SyncScheduler`` drives
     it. The typed-row conversion, primary-key diffing and checkpointing are the
-    module-level pure functions above; this class binds them to the connector
-    contract and owns config validation.
+    module-level pure functions above (PR-2); the live invocation + paging is
+    wired through W01's executor/production transport (PR-3) via an injected
+    :class:`GithubTransportProvider`.
 
-    The transport is deliberately absent. :meth:`fetch` and :meth:`detect_changes`
-    refuse until the live executor is wired, because a mock read is not a
-    live read; the pure conversion/diff/checkpoint surface is what is verified on
-    ``main`` today.
+    **Fail-closed without a transport.** Built with no ``transport_provider``
+    (the default), :meth:`fetch` and :meth:`detect_changes` REFUSE with
+    :class:`NotImplementedError` exactly as PR-2 shipped -- a mock read is not a
+    live read.
+
+    **Row payload is a pending W01 seam.** Even WITH a provider, the fetched page
+    body does not yet come back through W01's ``ExecutionOutcome`` (root-confirmed
+    at cd00f1837: only ``OperationResult`` = ``{status, next_cursor}`` propagates;
+    ``Decoded2xx.body`` is dropped). W01 owns adding a neutral payload slot. Until
+    that versioned commit lands, the live path drives a REAL page walk (the
+    operation is invoked, authorized per page, and the per-page cursor followed)
+    but then FAILS CLOSED at row extraction rather than fabricating rows or
+    claiming a dataset. It re-implements no auth, custody, retry, fencing, error
+    class or pagination.
     """
+
+    def __init__(self, transport_provider: Optional[GithubTransportProvider] = None) -> None:
+        self._transport_provider = transport_provider
 
     def source_type(self) -> str:
         return SOURCE_TYPE
@@ -602,20 +736,126 @@ class GithubStructuredConnector(BaseConnector):
             return False, f"repo must be 'owner/name', got {repo!r}"
         return True, ""
 
+    def _walk_entity_pages(self, *, entity_type: str, repo: str, bundle: "GithubTransport"):
+        """Drive a REAL W01 page walk for one entity and return its page outcomes.
+
+        Opens a W01 ``PageWalk`` for the entity's operation through the injected
+        transport and pumps it with ``walk_pages`` -- so authorization runs per
+        page and the cursor advances on the provider's OWN continuation, never a
+        local re-implementation. Returns the list of per-page
+        ``ExecutionOutcome``. This is the part that IS closed against cd00f1837:
+        the operation is invoked and the pages turn. Extracting rows from the
+        outcomes is the caller's next step, and that is the pending W01 seam.
+        """
+
+        # Imported lazily so PR-2's pure surface (rows/diff/checkpoint) imports
+        # with no dependency on the connections stack.
+        from kiro_crew.connections.vendors.github.dispatch import (
+            open_page_walk,
+            walk_pages,
+        )
+
+        owner, name = repo.split("/", 1)
+        walk = open_page_walk(
+            operation_id=_OP_FOR_ENTITY[entity_type],
+            handle=bundle.handle,
+            transport=bundle.transport,
+            offered_mode=bundle.offered_mode,
+            permitted=bundle.permitted,
+            layers=bundle.layers,
+            governance_scope=bundle.governance_scope,
+            governance_item=bundle.governance_item,
+            base_args={"owner": owner, "repo": name},
+            clock=bundle.clock,
+        )
+        outcomes = walk_pages(walk)
+        for outcome in outcomes:
+            if not outcome.ok:
+                raise LiveFetchError(
+                    f"github {entity_type} walk stopped: {outcome.error}")
+        return outcomes
+
+    def _rows_from_outcomes(self, outcomes) -> tuple:
+        """Extract typed rows from page outcomes -- the PENDING W01 payload seam.
+
+        UNVERIFIED: the row payload cannot be read here yet. W01's
+        ``ExecutionOutcome`` carries no records (root-confirmed at cd00f1837:
+        ``Decoded2xx.body`` is dropped and only ``OperationResult`` =
+        ``{status, next_cursor}`` propagates), so there is nothing to hand PR-2's
+        ``issue_or_pull_from_payload`` / ``commit_from_payload`` converters. This
+        FAILS CLOSED rather than fabricating rows or presenting the page count as
+        data. When W01 threads its neutral payload slot
+        (Decoded2xx.body -> TransportResponse -> ExecutionOutcome, with a schema
+        bump), this reads the slot, distinguishes a row collection from a single
+        object, runs the converters, and returns the typed rows -- no other line
+        of this connector changes.
+        """
+
+        raise LiveFetchError(
+            "page walk completed but the row payload is not reachable: W01's "
+            "ExecutionOutcome carries no records yet (only status+next_cursor). "
+            "Refusing rather than presenting a page count as a dataset; awaiting "
+            "W01's neutral payload slot.")
+
     async def detect_changes(self, source: dict) -> bool:
-        # UNVERIFIED until the transport lands: a real detect_changes issues a
-        # conditional/`since` probe against GitHub. It raises here — fail-closed,
-        # scheduling no ingest — rather than fabricating a "changed" answer from
-        # a mock.
-        raise NotImplementedError(
-            "GitHub live change-detection needs the connections transport "
-            "executor, not on main yet")
+        """Real change detection through W01's transport, honestly bounded.
+
+        Fail-closed without a transport (:class:`NotImplementedError`) -- a mock
+        cannot answer "changed". With a provider it drives a REAL page walk of the
+        issues stream (the operation is invoked and the pages turn), then defers
+        the "did anything change" judgment to the row payload it cannot yet read,
+        so it FAILS CLOSED (:class:`LiveFetchError`) rather than inferring
+        "changed" from a page count. Wired end to end except the final read,
+        which is W01's pending payload slot.
+        """
+
+        if self._transport_provider is None:
+            raise NotImplementedError(
+                "GitHub live change-detection needs a transport provider that "
+                "composes W01's executor/production; none was configured")
+        repo = _repo_of(source)
+        bundle = self._transport_provider(source, ENTITY_PULL_REQUEST)
+        if bundle is None:
+            raise LiveFetchError(
+                "no W01 transport available for this source; cannot detect changes")
+        outcomes = self._walk_entity_pages(
+            entity_type=ENTITY_PULL_REQUEST, repo=repo, bundle=bundle)
+        # The changed-since judgment needs the rows the window returned, which is
+        # the pending payload seam. Do not fake a boolean from a page count.
+        self._rows_from_outcomes(outcomes)
+        raise LiveFetchError(  # unreachable: _rows_from_outcomes raises first
+            "unreachable")
 
     async def fetch(self, source: dict) -> tuple[str, dict]:
-        # UNVERIFIED until the transport lands and pagination is consumed from
-        # connections.vendors.github. Refusing here is deliberate: a
-        # first-page-only or mocked payload is not a live dataset and must not be
-        # stored as one.
-        raise NotImplementedError(
-            "GitHub live fetch needs the connections transport executor and "
-            "connections.vendors.github.pagination; neither is on main yet")
+        """A live structured fetch through W01's transport, honestly bounded.
+
+        Fail-closed without a transport (:class:`NotImplementedError`) -- a
+        first-page-only or mocked payload is not a live dataset. With a provider
+        it walks each entity kind in :data:`_OP_FOR_ENTITY` through W01's
+        transport (the operation is invoked, authorized per page, and the
+        per-page cursor followed), then hands the outcomes to
+        :meth:`_rows_from_outcomes` -- the pending W01 payload seam, which FAILS
+        CLOSED. Nothing is stored, and no page count is ever presented as data,
+        until W01's payload slot lands; then the converters + ``diff_rows`` +
+        rendering below close the loop with no other change here.
+        """
+
+        if self._transport_provider is None:
+            raise NotImplementedError(
+                "GitHub live fetch needs a transport provider that composes "
+                "W01's executor/production and consumes vendors.github paging; "
+                "none was configured")
+        repo = _repo_of(source)
+        all_outcomes: list = []
+        for entity_type in _OP_FOR_ENTITY:
+            bundle = self._transport_provider(source, entity_type)
+            if bundle is None:
+                continue  # this source does not read this kind
+            all_outcomes.extend(
+                self._walk_entity_pages(
+                    entity_type=entity_type, repo=repo, bundle=bundle))
+        # Rows are the pending W01 payload seam: fail closed rather than store an
+        # empty/partial dataset or claim a page count as data.
+        self._rows_from_outcomes(all_outcomes)
+        raise LiveFetchError(  # unreachable: _rows_from_outcomes raises first
+            "unreachable")

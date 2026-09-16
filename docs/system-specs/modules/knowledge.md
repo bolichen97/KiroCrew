@@ -459,16 +459,37 @@ the scheduler side (today `sync.py` does a single `fetch()` → whole-source
 replace) is the registration/wiring follow-up below, tracked as the conductor's
 decision — not invented here.
 
-**UNVERIFIED, deliberately parked.** `fetch` and `detect_changes` raise
-`NotImplementedError`: a live read needs the connections transport executor,
-which is not on `main` yet, so there is no live path to exercise and none is
-faked. When multi-page extraction is added it consumes the stabilized
-`connections.vendors.github` pagination as a normal dependency rather than
-growing a second copy of paging. Refusing is fail-closed — a first-page-only or
-mocked payload is not a live dataset and is never stored as one. The typed rows,
-keys, conversion, incremental diff, checkpoint, lineage and registration are the
-surface this change verifies (in the pull request that adds it, not yet on
-`main`).
+**Live path wired through W01's transport; row payload is a pending W01 seam.**
+Given a `GithubTransportProvider` (the caller composes a real W01
+`build_github_transport` — per-binding custody via `BindingSecretSelector`, no
+credential seen here — and the executor's handle/gate inputs), `fetch` and
+`detect_changes` drive a REAL W01 `PageWalk` for each repo-scoped entity through
+`connections.vendors.github.dispatch`: the operation is invoked, authorized per
+page, and the per-page cursor followed across `>=2` pages. That much is closed
+against the pinned `cd00f1837` shapes. What is NOT closed — and is left as an
+EXPLICIT, UNVERIFIED seam that fails closed rather than faked — is reading the
+fetched rows back: W01's `ExecutionOutcome` carries no records (only
+`OperationResult` = `{status, next_cursor}` propagates; `Decoded2xx.body` is
+dropped at `TransportResponse(result=decode(reply))`). So `_rows_from_outcomes`
+raises `LiveFetchError` naming the pending W01 payload slot, and nothing is
+stored and no page count is ever presented as data until that lands. W01 owns
+adding the neutral payload slot (`Decoded2xx.body` → `TransportResponse` →
+`ExecutionOutcome`, with a schema bump); when it exists this connector reads the
+slot, runs the PR-2 converters + `diff_rows`, and renders — no other line
+changes. No workaround is used to reach the body early: no out-of-band capture,
+no response cache, no local envelope re-declaration, no vendor side channel.
+
+Two entities are deliberately NOT walked, reported as open questions rather than
+hand-rolled URLs (a naked path is forbidden): the repo-scoped **issues** list is
+not in the vendor descriptor table (only `gh_search_issues`, a `q=` search shape
+with no `{owner}/{repo}` path, and `gh_list_issues`, GraphQL prose the REST
+locator cannot shape), and **check-runs** has no list operation at all. The wired
+kinds are pull requests (`gh_list_pull_requests`) and commits (`gh_list_commits`),
+both repo-scoped REST list operations with real path templates.
+
+Built with **no** transport provider (the default), `fetch` / `detect_changes`
+still refuse with `NotImplementedError` exactly as before — a mock read is not a
+live read.
 
 **Registration.** The core connector map is assembled by hand in
 `dashboard/handlers/knowledge.py`; `connectors["github"] =
@@ -476,9 +497,9 @@ GithubStructuredConnector()` is set alongside `local_folder` / `obsidian_vault`,
 **before** the `platform.interfaces.KnowledgeProvider.extra_connectors` edition
 merge, so an edition can still override `github` (built-ins first, edition on
 top). Mapping the `source_type` does **not** make the source syncable: `fetch` /
-`detect_changes` still refuse without a transport, so a sync attempt is refused,
-never silently faked. The wiring is one import plus one map entry; nothing else
-in that handler changes.
+`detect_changes` refuse without a transport provider, and even with one they fail
+closed at the row seam above, so a sync attempt is refused, never silently faked.
+The wiring is one import plus one map entry; nothing else in that handler changes.
 
 ## 3. LLMPool workers (`llm_pool.py`)
 
