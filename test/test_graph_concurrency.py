@@ -36,10 +36,7 @@ from kiro_crew.connections.control_plane.binding import (
     binding_secret_ref,
     create_binding,
 )
-from kiro_crew.connections.control_plane.executor import (
-    ExecutionOutcome,
-    execute,
-)
+from kiro_crew.connections.control_plane.executor import ExecutionOutcome
 from kiro_crew.connections.control_plane.handle import (
     derive_handle,
     ensure_usable,
@@ -47,11 +44,8 @@ from kiro_crew.connections.control_plane.handle import (
 from kiro_crew.connections.control_plane.operation import Effect, OperationDescriptor
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
-    HttpReply,
-    HttpRequest,
     BindingSecretSelector,
-    build_production_transport,
-    urllib_http_send,
+    HttpReply,
 )
 from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
 from kiro_crew.secrets import SecretValue, SecretVault
@@ -73,10 +67,10 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     WriteIntent,
     accepts_validator,
     baseline_conflict,
+    build_graph_write_dispatch,
     conditional_write_args,
     decode_page,
     extract_version,
-    graph_500_unknown_transport,
     graph_request_locator,
     graph_result_decode,
     has_412_contract,
@@ -399,54 +393,25 @@ def trust_loopback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Tuple[Pat
 
 
 def _make_execute_dispatch(*, host: str, vault, selector, handle, descriptor):
-    """Bind an execute-backed Dispatch composed from the two seats + the D9 wrapper.
+    """Build the dispatch via the PRODUCTION entry build_graph_write_dispatch.
 
-    A capturing http_send wraps W01's real urllib_http_send so the orchestrator
-    can read the reply BODY (the L01 result envelope carries no rows), WITHOUT
-    bypassing anything: the capture only records the reply W01's transport
-    already produced; custody, gates and the sender are all W01's.
+    F3: the tests exercise the SHIPPED entry, not a test-only closure. The entry
+    composes W01's real transport from the two seats + the D9 wrapper + W01's
+    real urllib_http_send and runs one execute per hop.
     """
-    import functools
-
-    captured: Dict[str, Optional[HttpReply]] = {"reply": None}
-
-    def _capturing_send(request: HttpRequest, **kw: Any) -> HttpReply:
-        reply = urllib_http_send(request, **kw)
-        captured["reply"] = reply
-        return reply
-
-    locator = functools.partial(graph_request_locator, endpoint_host=host)
-    inner = build_production_transport(
+    return build_graph_write_dispatch(
+        descriptor=descriptor,
+        handle=handle,
+        endpoint_host=host,
         selector=selector,
         vault=vault,
-        locator=locator,
-        http_send=_capturing_send,
-        decode=graph_result_decode,
+        offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)),
+        layers=LayerCeilings(),
+        governance_scope="tools",
+        governance_item="listitem.update",
+        now=_T0,
     )
-    transport = graph_500_unknown_transport(inner)
-
-    def _dispatch(request_args: Mapping[str, Any]) -> DispatchResult:
-        captured["reply"] = None
-        outcome: ExecutionOutcome = execute(
-            descriptor,
-            handle,
-            transport,
-            now=_T0,
-            offered_mode="oauth_user",
-            permitted=declare_permitted_modes(("oauth_user",)),
-            layers=LayerCeilings(),
-            governance_scope="tools",
-            governance_item="listitem.update",
-            request_args=request_args,
-        )
-        reply = captured["reply"]
-        body = None
-        if reply is not None and 200 <= reply.status < 300:
-            parsed = json.loads(reply.body) if reply.body else None
-            body = parsed if isinstance(parsed, dict) else None
-        return DispatchResult(outcome=outcome, body=body)
-
-    return _dispatch
 
 
 def _compose(tmp_path: Path):
@@ -600,3 +565,149 @@ def test_d9_500_on_write_is_unknown_not_not_applied(
     assert outcome.applied is False
     assert outcome.write_outcome == ATTEMPT_UNKNOWN  # do NOT record 'not applied'
     assert "UNKNOWN" in outcome.reason
+
+
+# =============================================================================
+# F1 -- outcome.error is guarded on read-back AND fresh re-read (not just GET).
+# =============================================================================
+def _err_outcome():
+    from kiro_crew.connections.control_plane.errors import operation_error
+
+    return ExecutionOutcome(error=operation_error("temporary", "boom"))
+
+
+def _ok_outcome():
+    return ExecutionOutcome(result={"status": "ok", "next_cursor": None})
+
+
+def _precond_outcome():
+    from kiro_crew.connections.control_plane.errors import operation_error
+    from kiro_crew.connections.control_plane.executor import PreconditionFailure
+
+    return ExecutionOutcome(
+        precondition=PreconditionFailure(
+            preconditions=("If-Match",),
+            server_etag=_ETAG_V2,
+            error=operation_error("conflict", "precondition failed"),
+        )
+    )
+
+
+class _ScriptedDispatch:
+    """A fake Dispatch returning scripted (outcome, body) pairs per hop, in order."""
+
+    def __init__(self, steps: List[DispatchResult]) -> None:
+        self._steps = list(steps)
+        self.calls: List[Mapping[str, Any]] = []
+
+    def __call__(self, request_args: Mapping[str, Any]) -> DispatchResult:
+        self.calls.append(dict(request_args))
+        return self._steps.pop(0)
+
+
+def test_f1_read_back_error_with_matching_body_is_not_verified():
+    """An ERROR read-back whose body matches the intended fields is NOT verified."""
+    intent = _intent(Quantity=(1, 2, ColumnKind.SCALAR))
+    dispatch = _ScriptedDispatch(
+        [
+            # initial GET ok, baseline holds
+            DispatchResult(_ok_outcome(), {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V1, "Quantity": 1}),
+            # write ok
+            DispatchResult(_ok_outcome(), None),
+            # read-back: ERROR outcome, but body carries the matching value 2
+            DispatchResult(_err_outcome(), {FIELD_ID: _RID, "Quantity": 2}),
+        ]
+    )
+    outcome = run_version_safe_write(
+        mode=ConcurrencyMode.LISTITEM_ETAG, path=_PATH, intent=intent, dispatch=dispatch
+    )
+    assert outcome.applied is True and outcome.verified is False
+    assert "read-back failed" in outcome.reason
+
+
+def test_f1_fresh_reread_error_with_matching_baseline_is_not_a_retry_basis():
+    """An ERROR 412 re-read whose body matches the baseline does NOT license a retry."""
+    intent = _intent(Quantity=(1, 2, ColumnKind.SCALAR))
+    dispatch = _ScriptedDispatch(
+        [
+            DispatchResult(_ok_outcome(), {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V1, "Quantity": 1}),
+            DispatchResult(_precond_outcome(), None),  # write -> 412
+            # fresh re-read: ERROR, but body still shows the baseline (1) at v2
+            DispatchResult(_err_outcome(), {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V2, "Quantity": 1}),
+        ]
+    )
+    outcome = run_version_safe_write(
+        mode=ConcurrencyMode.LISTITEM_ETAG, path=_PATH, intent=intent, dispatch=dispatch
+    )
+    assert outcome.applied is False and outcome.verified is False
+    assert outcome.conflict is not None  # refused to retry on a failed re-read
+    # Exactly 3 hops: GET, PATCH(412), re-read. NO retry PATCH.
+    assert [c.get(ARG_METHOD) for c in dispatch.calls] == ["GET", "PATCH", "GET"]
+
+
+# =============================================================================
+# F2 -- Excel is ZERO-REQUEST: refused BEFORE any dispatch.
+# =============================================================================
+def test_f2_excel_issues_zero_requests():
+    """excel.range.write is refused before step 1: not even a GET is dispatched."""
+    dispatch = _ScriptedDispatch([])  # any dispatch would pop from an empty list
+
+    with pytest.raises(ConcurrencyError, match="zero requests"):
+        run_version_safe_write(
+            mode=ConcurrencyMode.NONE_LAST_WRITE_WINS,
+            path=_PATH,
+            intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            dispatch=dispatch,
+        )
+    # The gate ran before step 1: dispatch was never called.
+    assert dispatch.calls == []
+
+
+# =============================================================================
+# F3 -- the production entry exists and binds to W01's execute (not a closure).
+# =============================================================================
+def test_f3_production_dispatch_entry_is_module_level(
+    trust_loopback: Tuple[Path, Path], tmp_path: Path
+) -> None:
+    """build_graph_write_dispatch is the shipped entry; it drives a real execute."""
+    from kiro_crew.connections.vendors.microsoft.graph import concurrency as mod
+
+    assert callable(mod.build_graph_write_dispatch)  # module-level, not a test closure
+
+    certfile, keyfile = trust_loopback
+    vault, selector, handle = _compose(tmp_path)
+
+    def script(st, method, if_match, body):
+        if method == "GET":
+            return (
+                200,
+                {},
+                json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": st.quantity}).encode(),
+            )
+        st.quantity = json.loads(body.decode())["Quantity"]
+        st.etag = _ETAG_V2
+        return 200, {}, json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag}).encode()
+
+    state = _Scripted(script=script)
+    with _https_server(_handler_for(state), certfile, keyfile) as port:
+        dispatch = build_graph_write_dispatch(
+            descriptor=_descriptor(effect="write"),
+            handle=handle,
+            endpoint_host=f"localhost:{port}",
+            selector=selector,
+            vault=vault,
+            offered_mode="oauth_user",
+            permitted=declare_permitted_modes(("oauth_user",)),
+            layers=LayerCeilings(),
+            governance_scope="tools",
+            governance_item="listitem.update",
+            now=_T0,
+        )
+        outcome = run_version_safe_write(
+            mode=ConcurrencyMode.LISTITEM_ETAG,
+            path=_PATH,
+            intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            dispatch=dispatch,
+        )
+    assert outcome.applied is True and outcome.verified is True
+    assert vault.asked  # the production entry ran W01 custody

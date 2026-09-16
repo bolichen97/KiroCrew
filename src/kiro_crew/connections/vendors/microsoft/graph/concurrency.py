@@ -72,7 +72,7 @@ from kiro_crew.connections.control_plane.executor import (
     TransportResponse,
     is_non_idempotent_effect,
 )
-from kiro_crew.connections.control_plane.operation import OperationDescriptor
+from kiro_crew.connections.control_plane.operation import CredentialMode, OperationDescriptor
 from kiro_crew.connections.control_plane.production import (
     HttpReply,
     HttpRequest,
@@ -300,16 +300,27 @@ def conditional_write_args(
 
 
 # =============================================================================
-# SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult (rows kept).
+# SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult.
 # =============================================================================
+# NOTE ON ROWS (a W01-owned gap, NOT worked around here): W01's OperationResult
+# is a two-member TypedDict -- ``status`` and ``next_cursor`` -- with NO payload
+# slot. The ResultDecode seat is contracted to return that type, so on the real
+# dispatch path a page's ``value`` rows have NOWHERE to go and ARE DROPPED. This
+# module does not invent a side channel to smuggle them out (that would be a
+# claim the type cannot back). :class:`DecodedPage` / :func:`decode_page` exist
+# only as a local reading that retains the rows for THIS module's own use; they
+# are NOT on the seat's return path and do NOT deliver rows to a W01 caller. The
+# missing member is W01's to add to ``result.py``; until it does, rows do not
+# reach a caller through this seat.
 @dataclass(frozen=True)
 class DecodedPage:
-    """A decoded 2xx reply that KEEPS the page's rows.
+    """A local reading of a 2xx reply that retains the page's rows for this module.
 
-    ``result`` -- the L01 ``{status, next_cursor}`` envelope the seat returns.
-    ``rows`` -- the collection's ``value`` items, PRESERVED (empty for a
-    non-collection reply). The L01 primitive has no room for rows, so the seat
-    returns only ``result``; a caller that needs the data calls :func:`decode_page`.
+    ``result`` -- the L01 ``{status, next_cursor}`` envelope. ``rows`` -- the
+    collection's ``value`` items (empty for a non-collection reply). This is NOT
+    what the seat returns: the seat returns only ``result`` (see the module note
+    above), so ``rows`` here is for this module's own decode, not a delivery
+    channel to a W01 caller.
     """
 
     result: OperationResult
@@ -317,12 +328,14 @@ class DecodedPage:
 
 
 def decode_page(reply: HttpReply) -> DecodedPage:
-    """Decode a 2xx Graph reply, keeping rows. Cursor-shaped via A's paging.
+    """Decode a 2xx Graph reply for THIS module's use. Cursor-shaped via A's paging.
 
     A collection body is read through A's :func:`parse_collection`:
-    ``@odata.nextLink`` present -> ``partial`` + the opaque cursor and the page's
-    rows; absent -> ``ok`` + ``None`` and the rows. A non-collection reply defers
-    the envelope to W01's :func:`neutral_decode` and carries no rows.
+    ``@odata.nextLink`` present -> ``partial`` + the opaque cursor; absent ->
+    ``ok`` + ``None``. A non-collection reply defers the envelope to W01's
+    :func:`neutral_decode`. ``rows`` is retained locally, but note (module doc):
+    the seat's contracted type has no payload slot, so this does NOT deliver rows
+    to a W01 caller.
     """
 
     parsed = _json_or_none(reply.body)
@@ -339,9 +352,11 @@ def decode_page(reply: HttpReply) -> DecodedPage:
 def graph_result_decode(reply: HttpReply) -> OperationResult:
     """Fill W01's ResultDecode seat: the L01 envelope for a 2xx reply.
 
-    Delegates to :func:`decode_page` (which keeps the rows) and returns only the
-    ``OperationResult`` the seat is contracted to return; rows reach a caller via
-    :func:`decode_page`. Never guesses a cursor.
+    Returns only the ``OperationResult`` the seat is contracted to return
+    (``{status, next_cursor}``), cursor-shaped via A's paging, never guessing a
+    cursor. The page's rows are NOT returned -- the L01 type has no payload slot
+    (see the module note above); that gap is W01's to close, and this module does
+    not smuggle rows out around it.
     """
 
     return decode_page(reply).result
@@ -548,6 +563,99 @@ class DispatchResult:
     body: Optional[Mapping[str, Any]]
 
 
+def build_graph_write_dispatch(
+    *,
+    descriptor: OperationDescriptor,
+    handle: "Any",
+    endpoint_host: str,
+    selector: "Any",
+    vault: "Any",
+    offered_mode: CredentialMode,
+    permitted: "Any",
+    layers: "Any",
+    governance_scope: str,
+    governance_item: str,
+    now: Optional[float] = None,
+) -> Dispatch:
+    """PRODUCTION dispatch entry: bind this operation to W01's ``execute``.
+
+    This is the shipped path -- a module-level entry, not a test closure. It
+    composes W01's real transport from the two vendor seats
+    (:func:`graph_request_locator`, :func:`graph_result_decode`) plus the D9
+    :func:`graph_500_unknown_transport` wrapper and W01's real
+    :func:`~kiro_crew.connections.control_plane.production.urllib_http_send`, then
+    returns a :class:`Dispatch` that runs ONE ``execute`` per call. Every hop
+    therefore passes W01's custody, pre-send gates, trusted-binding identity and
+    unknown-outcome mapping; nothing here issues a raw send or touches a secret.
+
+    The returned dispatch reads the reply BODY via a capturing wrapper around
+    W01's sender -- it only RECORDS the reply W01's transport already produced, so
+    it bypasses nothing (``http_send`` is a seat W01 itself parameterizes). The
+    body is needed for the baseline / read-back field comparison; the L01 result
+    envelope has no payload slot (the rows gap is W01's, see the SEAT 2 note), so
+    the fields are read from the recorded reply, never smuggled through the seat.
+
+    ``handle`` / ``selector`` / ``permitted`` / ``layers`` are W01 types passed in
+    by the composing caller (kept as ``Any`` here so this vendor module does not
+    re-import W01's whole type surface). ``now`` is for a deterministic test only;
+    unset uses ``execute``'s own server clock.
+
+    NOTE: W01's auth chain (L03 auth-code, L04 rotation fencing,
+    principal->binding) is NOT complete and carries reported gaps; this entry
+    rides W01's chain but does not make it complete or safe on its own.
+    """
+
+    import functools
+
+    from kiro_crew.connections.control_plane.executor import execute as _execute
+    from kiro_crew.connections.control_plane.production import (
+        build_production_transport,
+        urllib_http_send,
+    )
+
+    _captured: dict = {"reply": None}
+
+    def _capturing_send(request: HttpRequest, **kw: Any) -> HttpReply:
+        reply = urllib_http_send(request, **kw)
+        _captured["reply"] = reply
+        return reply
+
+    locator = functools.partial(graph_request_locator, endpoint_host=endpoint_host)
+    transport = graph_500_unknown_transport(
+        build_production_transport(
+            selector=selector,
+            vault=vault,
+            locator=locator,
+            http_send=_capturing_send,
+            decode=graph_result_decode,
+        )
+    )
+
+    def _dispatch(request_args: Mapping[str, Any]) -> DispatchResult:
+        _captured["reply"] = None
+        outcome = _execute(
+            descriptor,
+            handle,
+            transport,
+            now=now,
+            offered_mode=offered_mode,
+            permitted=permitted,
+            layers=layers,
+            governance_scope=governance_scope,
+            governance_item=governance_item,
+            request_args=request_args,
+        )
+        reply = _captured["reply"]
+        body: Optional[Mapping[str, Any]] = None
+        if reply is not None and 200 <= reply.status < 300:
+            parsed = _json_or_none(reply.body)
+            if isinstance(parsed, Mapping):
+                body = parsed
+        return DispatchResult(outcome=outcome, body=body)
+
+    return _dispatch
+
+
 @dataclass(frozen=True)
 class WriteSequenceOutcome:
     """The result of one version-safe write sequence routed through the executor."""
@@ -576,12 +684,24 @@ def run_version_safe_write(
     raw send and no credential; without the executor no ``Authorization`` is
     attached at all.
 
-    ``excel.range.write`` (mode NONE) is refused by :func:`conditional_write_args`
-    before its PATCH is dispatched. NOTE: an initial GET is still dispatched
-    first; the refusal is of the WRITE, not of the whole sequence.
+    An operation with no optimistic-concurrency mechanism
+    (``NONE_LAST_WRITE_WINS`` / ``excel.range.write``) is refused BEFORE step 1,
+    so it issues ZERO requests -- not even the initial GET. A version-safe write
+    on such an operation cannot exist, so the whole sequence is refused, not just
+    the PATCH.
     """
 
-    # Step 1: initial GET (authorized). Verify it succeeded before reading it.
+    # Step 0 (F2): concurrency-contract gate BEFORE any request. An operation
+    # with no If-Match mechanism (Excel range) cannot have a version-safe write,
+    # so it is refused here and NOTHING is dispatched -- no initial GET, no PATCH.
+    if not has_412_contract(mode):
+        raise ConcurrencyError(
+            f"{mode.value} has no optimistic-concurrency (eTag) mechanism "
+            "(excel.range.write is last-write-wins); a version-safe write "
+            "sequence cannot be run and issues zero requests"
+        )
+
+    # Step 1: initial GET (authorized). Verify it SUCCEEDED before reading it.
     get = dispatch({ARG_METHOD: "GET", ARG_PATH: path})
     if get.outcome.error is not None or get.body is None:
         return WriteSequenceOutcome(
@@ -616,13 +736,21 @@ def run_version_safe_write(
         outcome = write.outcome
 
         if outcome.ok:
-            # Step 3: independent read-back; verify identity + fields.
+            # Step 3: independent read-back; verify the read-back's OWN outcome
+            # first (F1), then identity + fields. An error read-back is not a
+            # verification even if its body happens to carry matching values.
             rb = dispatch({ARG_METHOD: "GET", ARG_PATH: path})
-            verdict = (
-                verify_read_back(intent, rb.body)
-                if rb.body is not None
-                else ReadBackVerdict(False, False, tuple(intent.changes), "read-back unreadable")
-            )
+            if rb.outcome.error is not None or rb.body is None:
+                return WriteSequenceOutcome(
+                    applied=True,
+                    conflict=None,
+                    verified=False,
+                    write_outcome=outcome.write_outcome,
+                    attempts=attempts,
+                    reason="write applied but the independent read-back failed "
+                    "(authorization/transport error); post-condition NOT verified",
+                )
+            verdict = verify_read_back(intent, rb.body)
             return WriteSequenceOutcome(
                 applied=True,
                 conflict=None,
@@ -633,16 +761,19 @@ def run_version_safe_write(
             )
 
         if outcome.precondition is not None:
-            # Step 4: 412 -> re-GET -> conflict-first recovery.
+            # Step 4: 412 -> re-GET -> conflict-first recovery. The re-read's OWN
+            # outcome is guarded first (F1): a failed re-read is not a safe-retry
+            # basis, even if its body carries values matching the baseline.
             re_read = dispatch({ARG_METHOD: "GET", ARG_PATH: path})
-            if re_read.body is None:
+            if re_read.outcome.error is not None or re_read.body is None:
                 return WriteSequenceOutcome(
                     applied=False,
-                    conflict=Conflict((), "re-read unreadable after 412"),
+                    conflict=Conflict((), "re-read after 412 failed or unreadable"),
                     verified=False,
                     write_outcome=None,
                     attempts=attempts,
-                    reason="re-read after 412 returned no body",
+                    reason="re-read after 412 failed (authorization/transport "
+                    "error) or returned no body; refusing to retry on it",
                 )
             plan = recover_from_precondition_failed(mode, intent, re_read.body)
             if plan.should_retry and retries_left > 0:
