@@ -73,7 +73,9 @@ from typing import Any, Mapping, Optional
 from kiro_crew.connections.control_plane.production import (
     HttpReply,
     HttpRequest,
+    HttpSend,
     neutral_decode,
+    urllib_http_send,
 )
 from kiro_crew.connections.control_plane.result import OperationResult
 from kiro_crew.connections.vendors.microsoft.graph.payload import (
@@ -505,6 +507,152 @@ def verify_read_back(intent: WriteIntent, read_back_reply: HttpReply) -> ReadBac
         reason="target post-condition holds on the read-back resource "
         "(not a claim that this write produced it)",
     )
+
+
+# =============================================================================
+# ORCHESTRATION -- the real version-safe write sequence.
+# =============================================================================
+# This is NOT a new general-purpose runtime: it orchestrates ONE operation --
+# the Graph optimistic-concurrency version-safe write -- by composing the two
+# vendor seats above with W01's real sender. Every network hop goes through the
+# INJECTED ``send`` (W01's :func:`urllib_http_send` by default; a test injects a
+# sender bound to a controlled TLS loopback). This module NEVER implements
+# transport and NEVER sees a credential: on the production path the transport
+# W01's executor composes adds ``Authorization`` around this sequence's requests.
+# Correlation is the ACTUAL CALL RELATIONSHIP: each decision below consumes the
+# ``HttpReply`` that ``send`` RETURNED for the ``HttpRequest`` this sequence
+# built -- not a header echo, and request-id/client-request-id are never read.
+
+
+@dataclass(frozen=True)
+class WriteSequenceOutcome:
+    """The result of one version-safe write sequence.
+
+    Exactly one disposition is true. ``applied`` -- the conditional write landed
+    (2xx) and the independent read-back confirmed the intended fields on the
+    read-back resource. ``conflict`` -- a 412 whose re-read showed a concurrent
+    writer moved an intended field: nothing was re-sent. ``verified`` mirrors the
+    read-back verdict when ``applied``. ``final_version`` is the version observed
+    on the read-back (evidence), or ``None``. ``attempts`` counts conditional-
+    write sends actually issued (1 with no 412, 2 after a safe retry).
+    """
+
+    applied: bool
+    conflict: Optional[Conflict]
+    verified: bool
+    final_version: Optional[VersionTag]
+    attempts: int
+    reason: str
+
+
+def run_version_safe_write(
+    *,
+    mode: ConcurrencyMode,
+    endpoint_host: str,
+    path: str,
+    intent: WriteIntent,
+    send: HttpSend = urllib_http_send,
+    encode_body: "Any" = None,
+    max_412_retries: int = 1,
+) -> WriteSequenceOutcome:
+    """Drive GET -> conditional PATCH -> 412 -> fresh re-GET -> retry -> read-back.
+
+    A real call sequence over the injected ``send`` (W01's real sender by
+    default). Steps, each consuming the reply the send call returned:
+
+    1. GET the resource; read its version (``eTag``/``cTag``). No version is a
+       precondition failure (:func:`conditional_write_request` refuses a blind
+       write), surfaced as a conflict-shaped outcome rather than a silent send.
+    2. Build and send the conditional PATCH (``If-Match`` = that version).
+    3. On 2xx: read the resource back and verify the intended fields hold on the
+       READ-BACK resource. Done.
+    4. On 412: re-GET, and let :func:`recover_from_precondition_failed` decide
+       CONFLICT-FIRST over the real replies -- retry (bounded by
+       ``max_412_retries``) only when every intended field's baseline still
+       equals fresh; otherwise return the conflict and send nothing more.
+    5. Any other status is not this protocol's business -- returned as a
+       non-applied outcome for W01's typed boundary to classify; no retry.
+
+    ``excel.range.write`` never reaches a send: :func:`conditional_write_request`
+    refuses it before step 2. This function issues no credential and reads none.
+    """
+
+    # Step 1: GET + version.
+    get_reply = send(graph_request_locator(method="GET", endpoint_host=endpoint_host, path=path))
+    version = _reply_version(get_reply)
+
+    attempts = 0
+    retries_left = max_412_retries
+    while True:
+        # Step 2: conditional write (refuses Excel / missing / unaccepted here).
+        write_req = conditional_write_request(
+            mode=mode,
+            endpoint_host=endpoint_host,
+            path=path,
+            version=version,
+            intent=intent,
+            encode_body=encode_body,
+        )
+        write_reply = send(write_req)
+        attempts += 1
+
+        if 200 <= write_reply.status < 300:
+            # Step 3: independent read-back over the reply that answered it.
+            rb_reply = send(
+                graph_request_locator(method="GET", endpoint_host=endpoint_host, path=path)
+            )
+            verdict = verify_read_back(intent, rb_reply)
+            return WriteSequenceOutcome(
+                applied=True,
+                conflict=None,
+                verified=verdict.verified,
+                final_version=_reply_version(rb_reply),
+                attempts=attempts,
+                reason=verdict.reason,
+            )
+
+        if write_reply.status == PRECONDITION_FAILED:
+            # Step 4: re-GET, conflict-first recovery over the real replies.
+            re_read = send(
+                graph_request_locator(method="GET", endpoint_host=endpoint_host, path=path)
+            )
+            plan = recover_from_precondition_failed(mode, write_reply, intent, re_read)
+            if plan.should_retry and retries_left > 0:
+                version = plan.fresh_version
+                retries_left -= 1
+                continue
+            return WriteSequenceOutcome(
+                applied=False,
+                conflict=plan.conflict,
+                verified=False,
+                final_version=_reply_version(re_read),
+                attempts=attempts,
+                reason=(
+                    plan.reason
+                    if plan.conflict is not None
+                    else "412 retry budget exhausted; not re-sending"
+                ),
+            )
+
+        # Step 5: any other status -> W01's typed boundary; not applied, no retry.
+        return WriteSequenceOutcome(
+            applied=False,
+            conflict=None,
+            verified=False,
+            final_version=None,
+            attempts=attempts,
+            reason=f"non-2xx/non-412 status {write_reply.status}; "
+            "left to W01's typed error boundary",
+        )
+
+
+def _reply_version(reply: HttpReply) -> Optional[VersionTag]:
+    """Read a version from a reply body, or ``None`` when the body is not JSON."""
+
+    body = _json_or_none(reply.body)
+    if not isinstance(body, Mapping):
+        return None
+    return extract_version(body)
 
 
 # --- helpers ----------------------------------------------------------------

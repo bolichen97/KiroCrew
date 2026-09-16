@@ -21,6 +21,7 @@ PARENT-BASE (parent W01 executor branch cd00f1837; not on main).
 from __future__ import annotations
 
 import datetime
+import functools
 import http.server
 import json
 import socket  # noqa: F401  (kept parallel to W01 harness imports)
@@ -57,6 +58,7 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     graph_result_decode,
     has_412_contract,
     recover_from_precondition_failed,
+    run_version_safe_write,
     supports_if_match,
     verify_read_back,
 )
@@ -512,3 +514,133 @@ def test_concurrent_field_change_surfaces_conflict_over_real_tls_sender(
     assert plan.conflict.moved_fields == ("Quantity",)
     # And no second PATCH was ever sent to the server.
     assert [r["method"] for r in state.requests] == ["GET", "PATCH", "GET"]
+
+
+# =============================================================================
+# ORCHESTRATOR over the real sender + controlled TLS loopback.
+# =============================================================================
+def test_orchestrator_applies_after_safe_retry_over_real_tls_sender(
+    trust_loopback: Tuple[Path, Path],
+) -> None:
+    """run_version_safe_write drives the whole sequence over W01's real sender.
+
+    The orchestration is MINE; the sender is W01's unmodified urllib_http_send,
+    bound to the controlled TLS loopback. Correlation rides the real call
+    relationship inside the orchestrator (each decision uses the reply that send
+    returned). This module never sees a credential.
+    """
+    certfile, keyfile = trust_loopback
+    state = _Scripted()  # GET v1 -> PATCH(v1)->412 (field untouched) -> GET v2 -> PATCH(v2)->200
+    intent = _intent(Quantity=(1, 2, ColumnKind.SCALAR))
+    with _https_server(_handler_for(state), certfile, keyfile) as port:
+        host = f"localhost:{port}"
+        sender = functools.partial(urllib_http_send, timeout_seconds=10.0)
+        outcome = run_version_safe_write(
+            mode=ConcurrencyMode.LISTITEM_ETAG,
+            endpoint_host=host,
+            path="/sites/S/lists/L/items/7/fields",
+            intent=intent,
+            send=sender,
+        )
+    assert outcome.applied is True and outcome.verified is True
+    assert outcome.attempts == 2  # one 412, then the safe retry
+    assert outcome.final_version == VersionTag(VersionKind.ETAG, _ETAG_V3)
+    # The server saw the real ordered sequence with the real If-Match values.
+    assert [(r["method"], r["if_match"]) for r in state.requests] == [
+        ("GET", None),
+        ("PATCH", _ETAG_V1),
+        ("GET", None),
+        ("PATCH", _ETAG_V2),
+        ("GET", None),
+    ]
+
+
+def test_orchestrator_surfaces_conflict_and_sends_no_second_patch(
+    trust_loopback: Tuple[Path, Path],
+) -> None:
+    """A concurrent writer that MOVED the field -> conflict; orchestrator sends no retry PATCH."""
+    certfile, keyfile = trust_loopback
+
+    class _MovedField(_Scripted):
+        def handle(self, method, if_match, body):
+            self.requests.append({"method": method, "if_match": if_match, "body": body})
+            if method == "GET" and not self._patched_once:
+                return (
+                    200,
+                    {},
+                    json.dumps({FIELD_ID: "7", ODATA_ETAG: _ETAG_V1, "Quantity": 1}).encode(),
+                )
+            if method == "PATCH":
+                self._patched_once = True
+                return 412, {"ETag": _ETAG_V2}, b""
+            return (
+                200,
+                {},
+                json.dumps({FIELD_ID: "7", ODATA_ETAG: _ETAG_V2, "Quantity": 9}).encode(),
+            )
+
+    state = _MovedField()
+    with _https_server(_handler_for(state), certfile, keyfile) as port:
+        host = f"localhost:{port}"
+        outcome = run_version_safe_write(
+            mode=ConcurrencyMode.LISTITEM_ETAG,
+            endpoint_host=host,
+            path="/sites/S/lists/L/items/7/fields",
+            intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            send=functools.partial(urllib_http_send, timeout_seconds=10.0),
+        )
+    assert outcome.applied is False and outcome.conflict.moved_fields == ("Quantity",)
+    assert [r["method"] for r in state.requests] == ["GET", "PATCH", "GET"]
+
+
+def test_orchestrator_multi_field_intent_no_count_cap_over_real_tls_sender(
+    trust_loopback: Tuple[Path, Path],
+) -> None:
+    """A write over the MS original required full set (many fields), no count cap.
+
+    Drives several scalar fields at once through the orchestrator; the number of
+    fields is whatever the operation requires, neither reduced to a count nor
+    enlarged by one.
+    """
+    certfile, keyfile = trust_loopback
+
+    class _MultiField(_Scripted):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = {"Title": "old", "Status": "Open", "Priority": "low", "Owner": "a"}
+
+        def handle(self, method, if_match, body):
+            self.requests.append({"method": method, "if_match": if_match, "body": body})
+            if method == "GET":
+                payload = {FIELD_ID: "7", ODATA_ETAG: self.etag, **self.state}
+                return 200, {}, json.dumps(payload).encode()
+            # First PATCH applies all named fields (no 412 this time).
+            self.state.update(json.loads(body.decode()))
+            self.etag = _ETAG_V2
+            return 200, {}, json.dumps({FIELD_ID: "7", ODATA_ETAG: self.etag}).encode()
+
+    intent = _intent(
+        Title=("old", "Q3 plan", ColumnKind.SCALAR),
+        Status=("Open", "Closed", ColumnKind.SCALAR),
+        Priority=("low", "high", ColumnKind.SCALAR),
+        Owner=("a", "b", ColumnKind.SCALAR),
+    )
+    state = _MultiField()
+    with _https_server(_handler_for(state), certfile, keyfile) as port:
+        host = f"localhost:{port}"
+        outcome = run_version_safe_write(
+            mode=ConcurrencyMode.LISTITEM_ETAG,
+            endpoint_host=host,
+            path="/sites/S/lists/L/items/7/fields",
+            intent=intent,
+            send=functools.partial(urllib_http_send, timeout_seconds=10.0),
+        )
+    assert outcome.applied is True and outcome.verified is True and outcome.attempts == 1
+    # The PATCH body carried EVERY intended field, verbatim.
+    patch = next(r for r in state.requests if r["method"] == "PATCH")
+    assert json.loads(patch["body"].decode()) == {
+        "Title": "Q3 plan",
+        "Status": "Closed",
+        "Priority": "high",
+        "Owner": "b",
+    }

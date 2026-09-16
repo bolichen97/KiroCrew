@@ -67,6 +67,7 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     VersionKind,
     VersionTag,
     WriteIntent,
+    WriteSequenceOutcome,
     accepts_validator,
     conditional_write_request,
     extract_version,
@@ -74,6 +75,7 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     graph_result_decode,
     has_412_contract,
     recover_from_precondition_failed,
+    run_version_safe_write,
     supports_if_match,
     verify_read_back,
 )
@@ -125,6 +127,7 @@ __all__ = [
     "VersionKind",
     "VersionTag",
     "WriteIntent",
+    "WriteSequenceOutcome",
     "accepts_validator",
     "conditional_write_request",
     "extract_version",
@@ -132,6 +135,7 @@ __all__ = [
     "graph_result_decode",
     "has_412_contract",
     "recover_from_precondition_failed",
+    "run_version_safe_write",
     "supports_if_match",
     "verify_read_back",
 ]
