@@ -64,7 +64,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from kiro_crew.connections.control_plane.executor import (
     ExecutionOutcome,
@@ -78,7 +78,12 @@ from kiro_crew.connections.control_plane.production import (
     HttpRequest,
     neutral_decode,
 )
-from kiro_crew.connections.control_plane.result import OperationResult
+from kiro_crew.connections.control_plane.result import (
+    CollectionPayload,
+    ObjectPayload,
+    OperationResult,
+    result_with_payload,
+)
 from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
 from kiro_crew.connections.vendors.microsoft.graph.payload import parse_collection
 
@@ -302,68 +307,46 @@ def conditional_write_args(
 # =============================================================================
 # SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult.
 # =============================================================================
-# NOTE ON ROWS (a W01-owned gap, NOT worked around here): W01's envelope chain
-# has NO data slot anywhere -- ``OperationResult`` is a two-member TypedDict
-# (``status`` / ``next_cursor``), and ``TransportResponse`` / ``ExecutionOutcome``
-# carry no data field either; W01's own ``Decoded2xx`` docstring says it "keeps
-# what OperationResult has no room for", and the loss happens at the ``.result``
-# narrowing. So on the real dispatch path a page's ``value`` rows (and a read's
-# field values) have NOWHERE to go and ARE DROPPED. This module does not invent a
-# side channel, capture the raw reply, or keep a store to smuggle them out (a
-# claim the type cannot back). :class:`DecodedPage` / :func:`decode_page` exist
-# only as a local reading that retains rows for THIS module's own use; they are
-# NOT on the seat's return path and do NOT deliver rows to a W01 caller. Root has
-# handed W01 a single NEUTRAL PAYLOAD SLOT to add (rows / object / bytes + cursor)
-# with permission to change ``result.py`` and bump the schema; until that commit
-# lands, rows do not reach a caller through this seat.
-@dataclass(frozen=True)
-class DecodedPage:
-    """A local reading of a 2xx reply that retains the page's rows for this module.
+# SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult WITH payload.
+# =============================================================================
+# W01 landed the neutral payload slot (result.py RESULT_SCHEMA_VERSION 3): an
+# ``OperationResult`` now carries ``payload`` -- exactly one of CollectionPayload
+# / ObjectPayload / BytesPayload, or None. The rows a 2xx returned now have a
+# real home, so this seat builds the envelope with :func:`result_with_payload`
+# and the data reaches a caller through ``ExecutionOutcome.payload``. The cursor
+# stays SINGLE-SOURCE on ``OperationResult.next_cursor`` (an explicit keyword to
+# result_with_payload); CollectionPayload carries items ONLY, never a cursor.
+def graph_result_decode(reply: HttpReply) -> OperationResult:
+    """Fill W01's ResultDecode seat: the L01 envelope WITH its payload.
 
-    ``result`` -- the L01 ``{status, next_cursor}`` envelope. ``rows`` -- the
-    collection's ``value`` items (empty for a non-collection reply). This is NOT
-    what the seat returns: the seat returns only ``result`` (see the module note
-    above), so ``rows`` here is for this module's own decode, not a delivery
-    channel to a W01 caller.
-    """
+    * A Graph collection body (``{"value": [...]}``) -> a
+      :class:`CollectionPayload` of its items, with the ``@odata.nextLink``
+      opaque cursor as ``next_cursor`` (single-source, on the envelope only;
+      ``partial`` when a cursor remains, else ``ok``). Rows are read through A's
+      :func:`parse_collection`.
+    * A single-object body (a list item's ``fields``, a drive item's metadata)
+      -> an :class:`ObjectPayload` of that object (``ok``, no cursor -- an object
+      is not a paged shape).
+    * An empty / non-JSON body (a 204, a write acknowledgement) -> ``None``
+      payload via W01's :func:`neutral_decode`.
 
-    result: OperationResult
-    rows: List[Any]
-
-
-def decode_page(reply: HttpReply) -> DecodedPage:
-    """Decode a 2xx Graph reply for THIS module's use. Cursor-shaped via A's paging.
-
-    A collection body is read through A's :func:`parse_collection`:
-    ``@odata.nextLink`` present -> ``partial`` + the opaque cursor; absent ->
-    ``ok`` + ``None``. A non-collection reply defers the envelope to W01's
-    :func:`neutral_decode`. ``rows`` is retained locally, but note (module doc):
-    the seat's contracted type has no payload slot, so this does NOT deliver rows
-    to a W01 caller.
+    Never guesses a cursor and never puts a cursor anywhere but the envelope.
     """
 
     parsed = _json_or_none(reply.body)
     if isinstance(parsed, Mapping) and "value" in parsed:
         page = parse_collection(parsed)
-        if page.next_link is not None:
-            return DecodedPage(
-                result={"status": "partial", "next_cursor": page.next_link}, rows=list(page.value)
-            )
-        return DecodedPage(result={"status": "ok", "next_cursor": None}, rows=list(page.value))
-    return DecodedPage(result=neutral_decode(reply), rows=[])
-
-
-def graph_result_decode(reply: HttpReply) -> OperationResult:
-    """Fill W01's ResultDecode seat: the L01 envelope for a 2xx reply.
-
-    Returns only the ``OperationResult`` the seat is contracted to return
-    (``{status, next_cursor}``), cursor-shaped via A's paging, never guessing a
-    cursor. The page's rows are NOT returned -- the L01 type has no payload slot
-    (see the module note above); that gap is W01's to close, and this module does
-    not smuggle rows out around it.
-    """
-
-    return decode_page(reply).result
+        cursor = page.next_link
+        return result_with_payload(
+            CollectionPayload(items=tuple(page.value)),
+            status="partial" if cursor is not None else "ok",
+            next_cursor=cursor,
+        )
+    if isinstance(parsed, Mapping):
+        # A single resource object (the read target's own fields).
+        return result_with_payload(ObjectPayload(object=dict(parsed)), status="ok")
+    # No JSON body (204 / empty ack): defer to W01's neutral decode (payload None).
+    return neutral_decode(reply)
 
 
 # =============================================================================
@@ -548,8 +531,9 @@ def verify_read_back(intent: WriteIntent, read_back_body: Mapping[str, Any]) -> 
 #: (with the descriptor/handle/permitted/layers/governance/transport composed
 #: from the two seats), so every hop runs custody + gates + unknown-outcome. It
 #: takes the operation ``request_args`` (method/path/if_match/body) and returns
-#: BOTH the executor's :class:`ExecutionOutcome` and the raw reply body (needed
-#: for version/field comparison, which the L01 result envelope cannot carry).
+#: the executor's :class:`ExecutionOutcome` plus the read body -- read from
+#: ``outcome.payload`` (W01's neutral payload slot), NEVER by indexing ``result``
+#: or capturing the raw reply.
 Dispatch = Callable[[Mapping[str, Any]], "DispatchResult"]
 
 
@@ -558,17 +542,14 @@ class DispatchResult:
     """What one authorized ``execute`` hop returns to the orchestrator.
 
     ``outcome`` -- the executor's :class:`ExecutionOutcome` (result / error /
-    precondition / write_outcome). ``body`` -- the resource's field values for a
-    READ hop, when the dispatch can supply them.
-
-    On the SHIPPED path today ``body`` is ``None``: W01's envelope chain
-    (``OperationResult`` / ``TransportResponse`` / ``ExecutionOutcome``) carries
-    NO data slot -- W01's own ``Decoded2xx`` docstring says it "keeps what
-    OperationResult has no room for", and the loss happens at ``.result``. Root
-    has handed W01 a single neutral payload slot to add; until that commit lands,
-    a production dispatch has nowhere the fields can legitimately arrive, and this
-    module does NOT smuggle them around the envelope. A test may inject a
-    ``Dispatch`` that supplies ``body`` to exercise the field-level steps.
+    precondition / write_outcome / payload / view). ``body`` -- the resource's
+    field values for a READ hop, taken from ``outcome.payload`` (W01's neutral
+    payload slot). For a single-resource GET the payload is an
+    :class:`~kiro_crew.connections.control_plane.result.ObjectPayload` and
+    ``body`` is its ``.object``; ``None`` when the hop returned no object payload
+    (an error, a 412, a write acknowledgement with no body). It is read through
+    ``outcome.payload``, NOT by indexing ``result`` and NOT from any captured
+    reply or side store.
     """
 
     outcome: ExecutionOutcome
@@ -600,26 +581,23 @@ def build_graph_write_dispatch(
     passes W01's custody, pre-send gates, trusted-binding identity and
     unknown-outcome mapping; nothing here issues a raw send or touches a secret.
 
-    ``DispatchResult.body`` is ``None`` on this path. The resource FIELD values
-    the orchestrator's baseline / read-back steps compare are not on W01's
-    envelope chain -- ``OperationResult`` / ``TransportResponse`` /
-    ``ExecutionOutcome`` have no data slot (W01's own source admits this), so
-    there is nowhere the fields can legitimately arrive yet. This module does NOT
-    capture the raw reply, keep a side store, or otherwise smuggle the body around
-    the envelope. The field-level baseline/read-back verification therefore WAITS
-    for W01's neutral payload slot; when that commit lands, this entry reads the
-    fields from the envelope and fills ``body``. Until then the version / If-Match
-    / 412 / 500-unknown dispositions all run through ``execute`` here; the
-    field-level checks conservatively report unverified rather than acting on data
-    obtained by a bypass.
+    ``DispatchResult.body`` is read from ``outcome.payload`` -- W01's neutral
+    payload slot (landed at RESULT_SCHEMA_VERSION 3). A single-resource read
+    decodes to an ObjectPayload and its ``.object`` is the resource's fields, so
+    the orchestrator's baseline / read-back steps operate on REAL data. The body
+    is taken through ``outcome.payload``, NEVER by indexing ``result``, NEVER from
+    a captured reply, a side store, or ``outcome.metadata`` (a closed rate-limit
+    allowlist, not a data channel). Identity is taken from ``outcome.view`` (the
+    trusted :class:`TrustedHandleView`), preferred over any caller-assembled one.
 
     ``handle`` / ``selector`` / ``permitted`` / ``layers`` are W01 types passed in
     by the composing caller (kept as ``Any`` here so this vendor module does not
     re-import W01's whole type surface). ``now`` is for a deterministic test only.
 
     NOTE: W01's auth chain (L03 auth-code, L04 rotation fencing,
-    principal->binding) is NOT complete and carries reported gaps; this entry
-    rides W01's chain but does not make it complete or safe on its own.
+    principal->binding) is NOT complete and carries reported gaps, and W01's own
+    fresh install is still being corrected; this entry rides W01's chain but does
+    not make it complete or safe on its own.
     """
 
     import functools
@@ -654,11 +632,15 @@ def build_graph_write_dispatch(
             governance_item=governance_item,
             request_args=request_args,
         )
-        # body stays None on the shipped path: W01's envelope has no data slot
-        # yet, and this entry does NOT capture the raw reply to smuggle fields
-        # around it. When W01's neutral payload slot lands, read the fields off
-        # the envelope here.
-        return DispatchResult(outcome=outcome, body=None)
+        # Read the body from W01's neutral payload slot -- ``outcome.payload`` --
+        # NOT by indexing ``result`` and NOT from any captured reply. A single
+        # resource read decodes to an ObjectPayload; its ``.object`` is the
+        # resource's fields the baseline / read-back steps compare against.
+        body: Optional[Mapping[str, Any]] = None
+        payload = outcome.payload
+        if isinstance(payload, ObjectPayload):
+            body = payload.object
+        return DispatchResult(outcome=outcome, body=body)
 
     return _dispatch
 

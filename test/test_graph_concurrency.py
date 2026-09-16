@@ -36,7 +36,7 @@ from kiro_crew.connections.control_plane.binding import (
     binding_secret_ref,
     create_binding,
 )
-from kiro_crew.connections.control_plane.executor import ExecutionOutcome, execute
+from kiro_crew.connections.control_plane.executor import ExecutionOutcome
 from kiro_crew.connections.control_plane.handle import (
     derive_handle,
     ensure_usable,
@@ -46,8 +46,8 @@ from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
     BindingSecretSelector,
     HttpReply,
-    urllib_http_send,
 )
+from kiro_crew.connections.control_plane.result import CollectionPayload, ObjectPayload
 from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
 from kiro_crew.secrets import SecretValue, SecretVault
 
@@ -70,8 +70,6 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
     baseline_conflict,
     build_graph_write_dispatch,
     conditional_write_args,
-    graph_500_unknown_transport,
-    decode_page,
     extract_version,
     graph_request_locator,
     graph_result_decode,
@@ -160,26 +158,36 @@ class TestVersionModesSeats:
             )
 
 
-class TestDecoderKeepsRows:
-    """D10: the decoder must not drop a page's rows."""
+class TestDecoderCarriesPayload:
+    """D10 closed via W01's payload slot: the seat now CARRIES the rows/object."""
 
-    def test_decode_page_keeps_rows_and_cursor(self):
+    def test_collection_with_cursor_is_partial_payload_items_only(self):
         link = "https://graph.microsoft.com/next?$skiptoken=abc"
-        page = decode_page(
+        env = graph_result_decode(
             _reply(200, {"value": [{"id": "1"}, {"id": "2"}], "@odata.nextLink": link})
         )
-        assert page.result == {"status": "partial", "next_cursor": link}
-        assert page.rows == [{"id": "1"}, {"id": "2"}]
+        assert env["status"] == "partial"
+        assert env["next_cursor"] == link  # cursor SINGLE-SOURCE on the envelope
+        payload = env["payload"]
+        assert isinstance(payload, CollectionPayload)
+        assert payload.items == ({"id": "1"}, {"id": "2"})
+        assert not hasattr(payload, "next_cursor")  # never a second cursor copy
 
-    def test_decode_page_ok_without_cursor_keeps_rows(self):
-        page = decode_page(_reply(200, {"value": [{"id": "1"}]}))
-        assert page.result == {"status": "ok", "next_cursor": None}
-        assert page.rows == [{"id": "1"}]
-
-    def test_seat_returns_only_envelope_but_rows_reachable(self):
+    def test_collection_without_cursor_is_ok_payload(self):
         env = graph_result_decode(_reply(200, {"value": [{"id": "1"}]}))
-        assert env == {"status": "ok", "next_cursor": None}
-        assert decode_page(_reply(200, {"value": [{"id": "1"}]})).rows == [{"id": "1"}]
+        assert env["status"] == "ok" and env["next_cursor"] is None
+        assert isinstance(env["payload"], CollectionPayload)
+        assert env["payload"].items == ({"id": "1"},)
+
+    def test_single_object_is_object_payload(self):
+        env = graph_result_decode(_reply(200, {FIELD_ID: "7", "Quantity": 2}))
+        assert env["status"] == "ok" and env["next_cursor"] is None
+        assert isinstance(env["payload"], ObjectPayload)
+        assert env["payload"].object == {FIELD_ID: "7", "Quantity": 2}
+
+    def test_empty_body_has_no_payload(self):
+        env = graph_result_decode(HttpReply(status=204, headers={}, body=b""))
+        assert env["payload"] is None
 
 
 class TestBaselineConflictBeforeWrite:
@@ -395,62 +403,25 @@ def trust_loopback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Tuple[Pat
 
 
 def _make_execute_dispatch(*, host: str, vault, selector, handle, descriptor):
-    """TEST DOUBLE Dispatch: runs the REAL execute (custody + gates) AND supplies
-    the read body.
+    """Build the dispatch via the PRODUCTION entry build_graph_write_dispatch.
 
-    This is NOT the shipped entry. build_graph_write_dispatch (the production
-    entry, exercised by test_f3) correctly returns body=None because W01's
-    envelope has no data slot yet. To exercise the orchestrator's field/version
-    steps BEFORE that W01 payload-slot commit lands, this test double composes the
-    same real transport (two seats + D9 wrapper + W01's real urllib_http_send) so
-    every hop still passes W01 custody + gates, and additionally captures the
-    reply IN THE TEST to stand in for the fields W01's forthcoming slot will
-    carry. The capture lives here in the test, not in the module.
+    The shipped entry now reads the body from ``outcome.payload`` (W01's neutral
+    payload slot), so the field/version sequence tests drive the REAL production
+    path -- no test-double capture. Every hop goes through W01's execute.
     """
-    import functools
-
-    from kiro_crew.connections.control_plane.production import build_production_transport
-
-    captured: Dict[str, Optional[HttpReply]] = {"reply": None}
-
-    def _capturing_send(request, **kw):
-        reply = urllib_http_send(request, **kw)
-        captured["reply"] = reply
-        return reply
-
-    locator = functools.partial(graph_request_locator, endpoint_host=host)
-    transport = graph_500_unknown_transport(
-        build_production_transport(
-            selector=selector,
-            vault=vault,
-            locator=locator,
-            http_send=_capturing_send,
-            decode=graph_result_decode,
-        )
+    return build_graph_write_dispatch(
+        descriptor=descriptor,
+        handle=handle,
+        endpoint_host=host,
+        selector=selector,
+        vault=vault,
+        offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)),
+        layers=LayerCeilings(),
+        governance_scope="tools",
+        governance_item="listitem.update",
+        now=_T0,
     )
-
-    def _dispatch(request_args: Mapping[str, Any]) -> DispatchResult:
-        captured["reply"] = None
-        outcome = execute(
-            descriptor,
-            handle,
-            transport,
-            now=_T0,
-            offered_mode="oauth_user",
-            permitted=declare_permitted_modes(("oauth_user",)),
-            layers=LayerCeilings(),
-            governance_scope="tools",
-            governance_item="listitem.update",
-            request_args=request_args,
-        )
-        reply = captured["reply"]
-        body = None
-        if reply is not None and 200 <= reply.status < 300 and reply.body:
-            parsed = json.loads(reply.body)
-            body = parsed if isinstance(parsed, dict) else None
-        return DispatchResult(outcome=outcome, body=body)
-
-    return _dispatch
 
 
 def _compose(tmp_path: Path):
@@ -703,12 +674,13 @@ def test_f2_excel_issues_zero_requests():
 
 
 # =============================================================================
-# F3 -- the production entry exists and binds to W01's execute (not a closure).
+# F3 -- the production entry binds to W01's execute and reads outcome.payload.
 # =============================================================================
-def test_f3_production_dispatch_entry_is_module_level(
+def test_f3_production_dispatch_entry_reads_payload_and_completes_the_sequence(
     trust_loopback: Tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """build_graph_write_dispatch is the shipped entry; it drives a real execute."""
+    """build_graph_write_dispatch (shipped, module-level) drives the whole real
+    sequence through W01 execute, reading the body from outcome.payload."""
     from kiro_crew.connections.vendors.microsoft.graph import concurrency as mod
 
     assert callable(mod.build_graph_write_dispatch)  # module-level, not a test closure
@@ -717,7 +689,19 @@ def test_f3_production_dispatch_entry_is_module_level(
     vault, selector, handle = _compose(tmp_path)
 
     def script(st, method, if_match, body):
-        return 200, {}, json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": 1}).encode()
+        if method == "GET":
+            return (
+                200,
+                {},
+                json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": st.quantity}).encode(),
+            )
+        st.quantity = json.loads(body.decode())["Quantity"]
+        st.etag = _ETAG_V2
+        return (
+            200,
+            {},
+            json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": st.quantity}).encode(),
+        )
 
     state = _Scripted(script=script)
     with _https_server(_handler_for(state), certfile, keyfile) as port:
@@ -734,12 +718,12 @@ def test_f3_production_dispatch_entry_is_module_level(
             governance_item="listitem.update",
             now=_T0,
         )
-        # One GET hop through the SHIPPED entry: it runs the real execute + W01
-        # custody (vault consulted) and returns body=None because W01's envelope
-        # has no data slot yet -- NOT a captured/smuggled body.
+        # One GET hop: the shipped entry reads the body from outcome.payload
+        # (an ObjectPayload) -- not a captured reply, not by indexing result.
         result = dispatch({ARG_METHOD: "GET", ARG_PATH: _PATH})
-        # The orchestrator, given the shipped entry, cannot yet verify fields: it
-        # conservatively reports no readable body rather than acting on a bypass.
+        assert result.outcome.error is None
+        assert result.body == {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V1, "Quantity": 1}
+        # And the full sequence completes on REAL payload data.
         outcome = run_version_safe_write(
             mode=ConcurrencyMode.LISTITEM_ETAG,
             path=_PATH,
@@ -748,6 +732,4 @@ def test_f3_production_dispatch_entry_is_module_level(
         )
 
     assert vault.asked  # the production entry ran W01 custody through execute
-    assert result.outcome.error is None  # the GET authorized and 2xx'd
-    assert result.body is None  # honest: fields await W01's neutral payload slot
-    assert outcome.applied is False and "readable body" in outcome.reason
+    assert outcome.applied is True and outcome.verified is True
