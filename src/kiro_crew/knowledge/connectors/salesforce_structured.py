@@ -90,6 +90,7 @@ from .base import BaseConnector
 if TYPE_CHECKING:
     from kiro_crew.connections.control_plane.executor import ExecutionOutcome, PageWalk
     from kiro_crew.connections.control_plane.operation import OperationDescriptor
+    from kiro_crew.connections.vendors.salesforce.runner import SalesforceRunnerFactory
     from kiro_crew.knowledge.acl import ProviderResourceRef
     from kiro_crew.knowledge.rows import SourceRow
 
@@ -1003,13 +1004,30 @@ class SalesforceStructuredConnector(BaseConnector):
     rather than fabricating a live read.
     """
 
-    def __init__(self, call_runner: Optional[SalesforceCallRunner] = None) -> None:
-        # ``call_runner`` authorizes+emits one Salesforce read through the W01
-        # executor. Left None in the offline/default construction; the real
-        # production assembly passes a runner composed over
-        # control_plane.production (vault custody + HTTP) with this vendor's
-        # locator/decode. It is NEVER a second HTTP client or a second auth.
+    def __init__(
+        self,
+        call_runner: Optional[SalesforceCallRunner] = None,
+        *,
+        runner_factory: Optional["SalesforceRunnerFactory"] = None,
+    ) -> None:
+        # Two mutually-exclusive ways to reach the W01 executor, both fail-closed
+        # when neither is wired:
+        #
+        # * ``runner_factory`` -- the PRODUCTION seam: a callable the real
+        #   registration injects, ``factory(source) -> SalesforceCallRunner``. It
+        #   is asked ONCE PER SOURCE (see :meth:`_runner_for`), so two sources get
+        #   two per-source runners with two distinct binding identities and never
+        #   share a credential. This is what the connector holds in production.
+        # * ``call_runner`` -- a single pre-composed runner. Convenient for a
+        #   test that drives one source, and for a caller that composed the runner
+        #   itself. NOT used across sources in production (the factory is).
+        #
+        # Neither is a second HTTP client or a second auth: the runner authorizes
+        # + emits through control_plane.production (vault custody + HTTP) with this
+        # vendor's locator/decode. Left unset in the offline/default construction;
+        # a live read then refuses fail-closed rather than fabricating one.
         self._runner = call_runner
+        self._runner_factory = runner_factory
 
     def source_type(self) -> str:
         return SOURCE_TYPE
@@ -1021,14 +1039,26 @@ class SalesforceStructuredConnector(BaseConnector):
             return False, str(exc)
         return True, ""
 
-    def _require_runner(self) -> SalesforceCallRunner:
-        if self._runner is None:
-            raise NotImplementedError(
-                "Salesforce live read needs the W01 control-plane executor runner, "
-                "which is not wired in this construction (fail-closed: a mock read "
-                "is not a live read)"
-            )
-        return self._runner
+    def _runner_for(self, source: dict) -> SalesforceCallRunner:
+        """Obtain the runner for THIS source -- per-source, fail-closed.
+
+        Prefers the injected per-source ``runner_factory`` (production): it is
+        asked once per source, so each source resolves its OWN binding identity
+        and no runner is shared across sources. Falls back to a single
+        pre-composed ``call_runner`` when one was supplied directly. With neither
+        wired, refuses fail-closed -- a mock read is not a live read, and the
+        factory itself refuses (``SalesforceRunnerUnavailable``) rather than
+        fabricating an identity when the binding resolver is unwired.
+        """
+        if self._runner_factory is not None:
+            return self._runner_factory(source)
+        if self._runner is not None:
+            return self._runner
+        raise NotImplementedError(
+            "Salesforce live read needs the W01 control-plane executor runner, "
+            "which is not wired in this construction (fail-closed: a mock read "
+            "is not a live read)"
+        )
 
     def _org_args(self, spec: SourceSpec, source: dict) -> dict:
         args: dict[str, Any] = {
@@ -1067,7 +1097,7 @@ class SalesforceStructuredConnector(BaseConnector):
         A read that cannot be authorized/emitted raises rather than reporting
         "unchanged" over a real failure.
         """
-        runner = self._require_runner()
+        runner = self._runner_for(source)
         spec = parse_source_spec(source)
         if spec.path == PATH_ANALYTICS_REPORT:
             return True
@@ -1097,7 +1127,7 @@ class SalesforceStructuredConnector(BaseConnector):
         FLS-unreadable field or unqueryable object is never selected; a report
         over the cap or a truncated report is refused by the converter.
         """
-        runner = self._require_runner()
+        runner = self._runner_for(source)
         spec = parse_source_spec(source)
         fetched_at = datetime.now(timezone.utc).isoformat()
         source_id = str(source.get("id") or source.get("source_id") or "")

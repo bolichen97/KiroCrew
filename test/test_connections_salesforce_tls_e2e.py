@@ -53,6 +53,9 @@ from kiro_crew.connections.control_plane.production import (
 from kiro_crew.connections.vendors.salesforce.runner import (
     SalesforceAuthContext,
     SalesforceProductionRunner,
+    SalesforceProductionRunnerFactory,
+    SalesforceRunnerUnavailable,
+    SalesforceSourceIdentity,
 )
 from kiro_crew.knowledge.connectors.salesforce_structured import (
     PATH_ANALYTICS_REPORT,
@@ -725,5 +728,160 @@ class TestMultiSourceIdentity:
                 asyncio.run(conn_x.fetch_rows(dict(src_a)))
             # The fence refused before any byte crossed the wire.
             assert len(served.authorization) == before
+        finally:
+            server.shutdown()
+
+
+class TestFactoryDrivenTwoSources:
+    """One SyncScheduler + ONE connector holding MY factory drives two sources.
+
+    Proves the per-source runner factory (SalesforceProductionRunnerFactory) is
+    real, and used the way production will: the connector holds ONE factory and
+    the scheduler drives two sources through it, so the factory is asked ONCE PER
+    SOURCE, resolves TWO DISTINCT identities, and their credentials never mix.
+    Plus the fail-closed leg: an unwired resolver (and a resolver that returns
+    None for a source) REFUSES -- never a call_runner=None empty registration,
+    never a fabricated identity, and zero bytes on the wire.
+    """
+
+    def _two_bindings_and_vault(self, real_vault, tmp_path):
+        bind_a = _binding_named(subject="alice", tenant="acme", secret_name="SF_TOKEN_A")
+        bind_b = _binding_named(subject="bob", tenant="globex", secret_name="SF_TOKEN_B")
+        real_vault.set_sync("SF_TOKEN_A", "token-for-acme-alice")
+        real_vault.set_sync("SF_TOKEN_B", "token-for-globex-bob")
+        store = BindingStore(tmp_path / "connections" / "control_plane_bindings.json")
+        store.insert(bind_a, deployment_id="dep://a", kiro_principal="kiro://owner/a")
+        store.insert(bind_b, deployment_id="dep://b", kiro_principal="kiro://owner/b")
+        return bind_a, bind_b, store
+
+    def test_scheduler_drives_two_sources_through_one_factory(
+        self, trust_loopback, real_vault, tmp_path
+    ):
+        import time as _time
+
+        certfile, keyfile = trust_loopback
+        script = {
+            "/services/data/v60.0/analytics/reports/00O000000000A01": _b(_REPORT_BODY),
+            "/services/data/v60.0/analytics/reports/00O000000000B02": _b(_REPORT_BODY),
+        }
+        server, served, port = _serve(script, certfile, keyfile)
+        bind_a, bind_b, bstore = self._two_bindings_and_vault(real_vault, tmp_path)
+
+        def _identity_for(binding):
+            handle = derive_binding_handle(binding)
+            view = ensure_usable(handle, now=_time.time())
+            return SalesforceSourceIdentity(
+                gate=BindingCustodyGate(
+                    binding=binding, binding_fingerprint=view.binding_fingerprint
+                ),
+                auth=SalesforceAuthContext(
+                    handle=handle,
+                    offered_mode="oauth_user",
+                    permitted=declare_permitted_modes(("oauth_user",)),
+                    governance_item="salesforce.read",
+                ),
+            )
+
+        # A REAL resolver: maps each source (by its report id) to ITS binding's
+        # trusted identity. This is the host seam the application injects.
+        calls: list[str] = []
+
+        class _Resolver:
+            def resolve(self, source):
+                calls.append(str(source.get("uri") or source.get("report_id")))
+                rid = (source.get("uri") or "").rsplit("/", 1)[-1]
+                if rid == "00O000000000A01":
+                    return _identity_for(bind_a)
+                if rid == "00O000000000B02":
+                    return _identity_for(bind_b)
+                return None
+
+        factory = SalesforceProductionRunnerFactory(
+            store=bstore, vault=real_vault, resolver=_Resolver(), http_send=urllib_http_send
+        )
+        conn = SalesforceStructuredConnector(runner_factory=factory)
+
+        kstore = KnowledgeStore(str(tmp_path / "k.db"))
+        try:
+            src_a = kstore.add_source(
+                "SF A",
+                "salesforce",
+                "salesforce://report/00O000000000A01",
+                properties={"instance_url": f"https://localhost:{port}", "org_id": ORG},
+            )
+            src_b = kstore.add_source(
+                "SF B",
+                "salesforce",
+                "salesforce://report/00O000000000B02",
+                properties={"instance_url": f"https://localhost:{port}", "org_id": ORG},
+            )
+            sched = SyncScheduler(kstore, _pipeline(kstore), {"salesforce": conn})
+            out_a = asyncio.run(sched.sync_source(src_a))
+            n_after_a = len(served.authorization)
+            out_b = asyncio.run(sched.sync_source(src_b))
+        finally:
+            server.shutdown()
+        try:
+            assert out_a["synced"] is True and out_b["synced"] is True
+            # The factory was asked per-source, resolving each source to ITS OWN
+            # identity: every resolve during source A's sync named A, every one
+            # during B's named B (A's all precede B's -- no cross-source reuse).
+            # (detect_changes + fetch_rows each ask, so a source may resolve more
+            # than once; what matters is the factory is per-source, never a single
+            # shared runner.)
+            assert calls, "factory resolver was never asked"
+            a_uri, b_uri = (
+                "salesforce://report/00O000000000A01",
+                "salesforce://report/00O000000000B02",
+            )
+            assert set(calls) == {a_uri, b_uri}
+            first_b = calls.index(b_uri)
+            assert all(c == a_uri for c in calls[:first_b])
+            assert all(c == b_uri for c in calls[first_b:])
+            # Each source's wire request carried ITS OWN token (no cross-talk).
+            auth_a = served.authorization[:n_after_a]
+            auth_b = served.authorization[n_after_a:]
+            assert auth_a and all(h == "Bearer token-for-acme-alice" for h in auth_a)
+            assert auth_b and all(h == "Bearer token-for-globex-bob" for h in auth_b)
+        finally:
+            kstore.close()
+
+    def test_factory_fail_closed_when_resolver_absent_or_empty(
+        self, trust_loopback, real_vault, tmp_path
+    ):
+        certfile, keyfile = trust_loopback
+        script = {"/services/data/v60.0/analytics/reports/00O000000000A01": _b(_REPORT_BODY)}
+        server, served, port = _serve(script, certfile, keyfile)
+        _a, _bind_b, bstore = self._two_bindings_and_vault(real_vault, tmp_path)
+        src = {
+            "id": "src-x",
+            "uri": "salesforce://report/00O000000000A01",
+            "instance_url": f"https://localhost:{port}",
+            "org_id": ORG,
+            "report_id": "00O000000000A01",
+        }
+        try:
+            # (1) resolver ABSENT -> refuse, no bytes, NOT call_runner=None.
+            f_none = SalesforceProductionRunnerFactory(
+                store=bstore, vault=real_vault, resolver=None, http_send=urllib_http_send
+            )
+            conn_none = SalesforceStructuredConnector(runner_factory=f_none)
+            with pytest.raises(SalesforceRunnerUnavailable):
+                asyncio.run(conn_none.fetch_rows(dict(src)))
+
+            # (2) resolver returns None for this source -> refuse, no bytes.
+            class _Empty:
+                def resolve(self, source):
+                    return None
+
+            f_empty = SalesforceProductionRunnerFactory(
+                store=bstore, vault=real_vault, resolver=_Empty(), http_send=urllib_http_send
+            )
+            conn_empty = SalesforceStructuredConnector(runner_factory=f_empty)
+            with pytest.raises(SalesforceRunnerUnavailable):
+                asyncio.run(conn_empty.fetch_rows(dict(src)))
+
+            # Neither refusal touched the wire.
+            assert served.authorization == []
         finally:
             server.shutdown()

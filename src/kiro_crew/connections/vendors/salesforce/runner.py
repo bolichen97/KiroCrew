@@ -39,7 +39,7 @@ isolated fixture vault in tests. Nothing here targets a live org.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from kiro_crew.connections.control_plane.auth_modes import PermittedModes
 from kiro_crew.connections.control_plane.executor import (
@@ -185,7 +185,128 @@ class SalesforceProductionRunner:
         )
 
 
+class SalesforceRunnerUnavailable(RuntimeError):
+    """A per-source runner could NOT be assembled -- refuse, never fake.
+
+    Raised when the application-level binding resolution seam is absent, or
+    resolves NO trusted identity for this source. This is the fail-closed leg of
+    the factory: the connector propagates it and the read refuses, rather than
+    the forbidden alternatives -- a ``call_runner=None`` empty registration, a
+    fabricated principal/handle, or a second vault/custody path.
+    """
+
+
+@dataclass(frozen=True)
+class SalesforceSourceIdentity:
+    """The per-source trusted W01 assembly the APPLICATION resolves for one source.
+
+    This is what a :class:`SalesforceSourceResolver` hands back. It carries the
+    two per-binding pieces the application (W01/host) owns and must NOT be
+    fabricated here:
+
+    * ``gate`` -- the :class:`BindingCustodyGate` composed for THIS source's
+      binding (its ``binding_fingerprint`` taken from the trusted view of a
+      handle derived for that binding). One gate serves one binding, so a
+      distinct source yields a distinct gate.
+    * ``auth`` -- the :class:`SalesforceAuthContext` for THIS source (the issued
+      handle + permitted modes + governance), again per-source.
+
+    The factory combines this with the injected SHARED ``store`` + ``vault`` to
+    build the runner. The factory does not derive a handle, mint a principal, or
+    compose a gate itself -- those are the host's trusted inputs, injected here.
+    """
+
+    gate: BindingCustodyGate
+    auth: SalesforceAuthContext
+
+
+class SalesforceSourceResolver(Protocol):
+    """Application seam: map ONE source to its trusted per-source W01 identity.
+
+    Implemented by the host/W01 layer (the same layer that owns
+    ``app['knowledge_binding_resolver']`` and constructs gate/store/vault). Given
+    a source's config (``instance_url`` / ``org_id`` / api version + the source's
+    already-resolved binding), it returns the :class:`SalesforceSourceIdentity`
+    for that source, or ``None`` when the source holds NO usable binding -- in
+    which case the factory refuses (fail-closed), it does NOT fall back to
+    another source's identity or a fabricated one.
+    """
+
+    def resolve(self, source: Mapping[str, Any]) -> Optional[SalesforceSourceIdentity]: ...
+
+
+class SalesforceProductionRunnerFactory:
+    """Owned per-source factory: ``factory(source) -> SalesforceProductionRunner``.
+
+    Constructed once at registration with the injected SHARED W01 custody
+    infrastructure -- the live :class:`BindingStore` and the :class:`SecretStore`
+    vault -- plus the application's :class:`SalesforceSourceResolver`. On EACH
+    call it resolves THIS source's trusted per-source identity (gate + auth) and
+    composes a fresh :class:`SalesforceProductionRunner` bound to it. It is a
+    callable (``__call__``), so the connector holds ONE factory and asks it per
+    source; it never caches a single runner across sources, so two sources never
+    share a binding/credential.
+
+    Fail-closed (never an empty registration, never a fabricated identity):
+
+    * a missing ``resolver`` -> :class:`SalesforceRunnerUnavailable`;
+    * ``resolver.resolve(source)`` returning ``None`` (no binding for this
+      source) -> :class:`SalesforceRunnerUnavailable`.
+
+    The factory composes NO auth of its own and holds NO secret: the credential
+    stays in the vault and is resolved per call by the live store behind the
+    gate.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: BindingStore,
+        vault: SecretStore,
+        resolver: Optional[SalesforceSourceResolver],
+        http_send: Any = urllib_http_send,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        self._store = store
+        self._vault = vault
+        self._resolver = resolver
+        self._http_send = http_send
+        self._timeout_seconds = timeout_seconds
+
+    def __call__(self, source: Mapping[str, Any]) -> SalesforceProductionRunner:
+        if self._resolver is None:
+            raise SalesforceRunnerUnavailable(
+                "no Salesforce binding resolver is wired "
+                "(app['knowledge_binding_resolver'] is unset); refusing rather "
+                "than reading with a fabricated identity"
+            )
+        identity = self._resolver.resolve(source)
+        if identity is None:
+            raise SalesforceRunnerUnavailable(
+                "the query principal holds no Salesforce binding for this source "
+                f"(instance_url={source.get('instance_url')!r}, "
+                f"org_id={source.get('org_id')!r}); refusing (fail-closed)"
+            )
+        return SalesforceProductionRunner(
+            gate=identity.gate,
+            store=self._store,
+            vault=self._vault,
+            auth=identity.auth,
+            http_send=self._http_send,
+            timeout_seconds=self._timeout_seconds,
+        )
+
+
+#: The type the connector holds: a callable mapping a source to its runner.
+SalesforceRunnerFactory = Callable[[Mapping[str, Any]], "SalesforceProductionRunner"]
+
+
 __all__ = [
     "SalesforceAuthContext",
     "SalesforceProductionRunner",
+    "SalesforceProductionRunnerFactory",
+    "SalesforceRunnerFactory",
+    "SalesforceRunnerUnavailable",
+    "SalesforceSourceIdentity",
+    "SalesforceSourceResolver",
 ]
