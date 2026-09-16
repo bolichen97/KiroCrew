@@ -155,6 +155,15 @@ def salesforce_request_locator(
         headers["Sforce-Query-Options"] = f"batchSize={batch}"
 
     if op == OP_SOQL_QUERY:
+        # PageWalk reuses ONE descriptor across pages and appends the cursor to
+        # the base args, so a page carries both the original ``soql`` AND a
+        # ``cursor``. Page 1 has cursor=None -> issue the query; page 2+ has the
+        # vendor's nextRecordsUrl -> follow it (query-more), never re-issue the
+        # query (which would re-fetch page 1 forever).
+        cursor = request_args.get("cursor")
+        if isinstance(cursor, str) and cursor:
+            url = urllib.parse.urljoin(_base(instance_url) + "/", cursor.lstrip("/"))
+            return HttpRequest(method="GET", url=url, headers=headers)
         soql = str(request_args.get("soql") or "")
         if not soql:
             raise ValueError("soql_query needs a 'soql' argument")
