@@ -556,37 +556,38 @@ def test_stale_if_match_is_a_412_conflict_nothing_clobbered(
 # Both go through THIS leaf's own factory -> W06 dispatch -> W01 execute, so the
 # unknown mapping is the SHIPPED one, not a stubbed transport.
 # =============================================================================
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "W01 transport gap (owner-crossing, NOT fixable in this leaf): "
-        "production.py:1276 catches only (urllib.error.URLError, TimeoutError, "
-        "TransportDeadlineExceededError). A connection dropped AFTER the request "
-        "was sent but BEFORE a response — urllib's getresponse() raises "
-        "http.client.RemoteDisconnected, an OSError/ConnectionResetError that is "
-        "NOT a URLError — escapes that clause UNCAUGHT and never maps to "
-        "write_outcome=UNKNOWN. This is exactly the canonical committed-then-"
-        "disconnected case. The fix is a one-line widen of production.py:1276 to "
-        "also catch ConnectionError (its docstring already says the two are "
-        "treated identically); it belongs to W01, so this negative is xfail until "
-        "the conductor coordinates that hunk. Negative (b) (500->UNKNOWN via the "
-        "shipped graph_500_unknown_transport) proves the outer-result UNKNOWN "
-        "invariant end-to-end today."
-    ),
-)
 @pytest.mark.parametrize("location,service_id,loc_factory", _LOCATIONS)
 def test_put_landed_then_connection_dropped_is_unknown_not_not_committed(
     trust_loopback, tmp_path, location, service_id, loc_factory
 ):
     """(a) The write LANDS on the server, then the connection drops before a
-    response. The INTENDED contract: W01 maps a dropped connection on a
+    response. REQUIRED contract: W01 maps a dropped connection on a
     non-idempotent write to write_outcome=UNKNOWN, and the round-trip surfaces
-    WriteStatus.UNKNOWN (never a determinate not-committed, which would license a
-    duplicate retry of a write that already landed). This is xfail today because
-    W01's transport catch clause misses the RemoteDisconnected the drop raises
-    (see the xfail reason). The round-trip's OWN unknown handling is correct and
-    is proven by negative (b); this test documents the upstream gap and flips to
-    a real pass the moment production.py:1276 is widened to catch ConnectionError."""
+    WriteStatus.UNKNOWN — never a determinate not-committed, which would license
+    a duplicate retry of a write that already landed.
+
+    THIS TEST IS RED TODAY, ON PURPOSE — it is NOT xfail, because a strict-xfail
+    would file a known, required contract under "expected" and show a green suite
+    while the contract is unproven. The committed-then-disconnect contract is NOT
+    yet proven end-to-end. It is blocked by a W01 transport gap I must NOT edit
+    (owner-crossing) and must NOT paper over by wrapping/patching/substituting the
+    sender:
+
+        production.py:1277 catches only
+        `(urllib.error.URLError, TimeoutError, TransportDeadlineExceededError)`.
+        A connection dropped AFTER the request was sent but BEFORE a response —
+        urllib's getresponse() raises http.client.RemoteDisconnected, whose MRO is
+        RemoteDisconnected -> ConnectionResetError -> ConnectionError -> OSError
+        -> BadStatusLine -> HTTPException. It is NOT a URLError and NOT a
+        TimeoutError, so it escapes that clause UNCAUGHT and never maps to
+        write_outcome=UNKNOWN.
+
+    The fix is a one-line widen of production.py:1277 to ALSO catch
+    ConnectionError (the transport docstring already says a dropped connection
+    and a timeout are treated identically for a non-idempotent write). That hunk
+    belongs to W01; when it lands, this test goes green with no change here.
+    Negative (b) (500->UNKNOWN via the shipped graph_500_unknown_transport)
+    proves the 500 path, NOT this drop path — the two are different failures."""
     certfile, keyfile = trust_loopback
     original, media_type, edit, check = _fixture_for(OfficeFormat.DOCX)
     item = _DriveItem(_ITEM_ID, _ETAG_V1, original, media_type)
