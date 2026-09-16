@@ -26,6 +26,7 @@ another delivered ``Bearer <token>`` to the second server.
 from __future__ import annotations
 
 import datetime
+import http.client
 import http.server
 import socket
 import ssl
@@ -1123,6 +1124,66 @@ def test_feeding_that_unknown_into_l07_refuses_a_blind_replay(
             descriptor, misrecorded, request_args=args, request_idempotency_key="idem-7"
         )["verdict"]
         == REPLAY_ALLOW
+    )
+
+
+def test_a_server_committed_then_disconnect_records_unknown_and_l07_refuses_replay(
+    tmp_path: Path,
+    real_vault: RecordingVault,
+) -> None:
+    """A raw ``http.client.RemoteDisconnected`` on a write -> ``unknown``, replay refused.
+
+    Regression for the escape the old ``except (URLError, TimeoutError, ...)``
+    tuple left open. ``RemoteDisconnected`` is a ``ConnectionResetError``
+    (-> ``ConnectionError``) AND an ``http.client.BadStatusLine``
+    (-> ``HTTPException``), but is NOT a ``URLError``, so a server that COMMITTED
+    the write and then dropped the reply used to propagate the exception past this
+    branch -- no ``write_outcome=unknown``, so no L07 replay-gate protection, so a
+    blind retry would double-send. The fix names ``ConnectionError`` and
+    ``http.client.HTTPException`` in the tuple; this pins the outcome as ``unknown``
+    (NOT ``failed_not_applied``) and asserts L07 refuses the replay.
+    """
+
+    def _committed_then_dropped(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+    descriptor = _write_descriptor()
+    binding, handle = _bound(requested=("mail.send",))
+    transport = build_production_transport(
+        gate=_gate_for(binding, handle),
+        store=_live_store(tmp_path, binding),
+        vault=real_vault,
+        locator=_locator_to(
+            "https://graph.example.invalid/v1/me/sendMail", method="POST", body=b"{}"
+        ),
+        http_send=_committed_then_dropped,
+    )
+    args = {"to": "someone@example.invalid"}
+    outcome = execute(
+        descriptor,
+        handle,
+        transport,
+        request_args=args,
+        request_idempotency_key="idem-disc-1",
+        **_kw(governance_item="messages.send"),
+    )
+    # The exception no longer escapes: a structured ambiguous outcome instead.
+    assert outcome.error is not None
+    assert outcome.write_outcome == ATTEMPT_UNKNOWN
+    assert outcome.write_outcome != ATTEMPT_FAILED_NOT_APPLIED
+
+    # And L07 refuses to replay the non-idempotent write on that `unknown`.
+    record = record_attempt(
+        operation_id=descriptor["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="idem-disc-1",
+        outcome="unknown",
+    )
+    assert (
+        replay_decision(
+            descriptor, record, request_args=args, request_idempotency_key="idem-disc-1"
+        )["verdict"]
+        == REPLAY_REFUSE
     )
 
 

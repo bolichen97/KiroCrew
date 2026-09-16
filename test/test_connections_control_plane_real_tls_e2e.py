@@ -86,6 +86,14 @@ from kiro_crew.connections.control_plane.result import (
     OperationResult,
     result_with_payload,
 )
+from kiro_crew.connections.control_plane.writes import (
+    ATTEMPT_FAILED_NOT_APPLIED,
+    ATTEMPT_UNKNOWN,
+    REPLAY_REFUSE,
+    args_fingerprint,
+    record_attempt,
+    replay_decision,
+)
 from kiro_crew.secrets import SecretVault
 
 _T0 = 1_000_000.0
@@ -1316,3 +1324,108 @@ def test_evidence_4_a_revoke_between_page_1_and_page_2_refuses_page_2(
     # The walk stopped rather than looping on a refusal.
     assert walk.done is True
     assert walk.pages == 1
+
+
+def _drop_after_commit_handler(received: List[bytes]) -> Any:
+    """A TLS handler that CONSUMES the request body, then drops the connection.
+
+    It reads the whole request (the server has "committed" -- the bytes arrived
+    and were accepted) and then closes the socket WITHOUT writing any status
+    line. On the client that surfaces as a raw ``http.client.RemoteDisconnected``
+    ("Remote end closed connection without response") on the real TLS path -- the
+    exact ambiguity a server-committed-then-dropped write produces, and the one
+    the old ``except`` tuple let escape.
+    """
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            received.append(self.rfile.read(length) if length else b"")
+            # Committed: request consumed. Now drop without a response line.
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+
+        def log_message(self, *args: Any) -> None:
+            return
+
+    return _H
+
+
+def _post_locator(port: int, path: str) -> Any:
+    def _locate(*, request_args: Mapping[str, Any], **_: Any) -> "production_module.HttpRequest":
+        return production_module.HttpRequest(
+            method="POST",
+            url=f"https://localhost:{port}{path}",
+            headers={"Accept": "*/*", "Content-Type": "application/json"},
+            body=b'{"to":"someone@example.invalid"}',
+        )
+
+    return _locate
+
+
+def test_a_real_tls_server_committed_then_disconnect_is_unknown_and_refuses_replay(
+    fresh_install: Path, trust_loopback: Tuple[Path, Path], real_vault: SecretVault
+) -> None:
+    """On the REAL TLS path: server consumes the write then drops -> unknown, replay refused.
+
+    The injected-sender regression (production test) proves the except tuple
+    catches ``RemoteDisconnected``; this proves it on a genuine TLS socket, where
+    the disconnect is produced by the wire rather than a raised stub. A
+    non-idempotent write (``external_send``) whose reply is dropped after the
+    server accepted the body must record ``write_outcome=unknown`` (NOT
+    ``failed_not_applied``) so L07 refuses a blind replay -- otherwise it double-sends.
+    """
+
+    certfile, keyfile = trust_loopback
+    binding, handle = _bound(subject="alice", tenant="acme")
+    store = _live_store(fresh_install, binding)
+    received: List[bytes] = []
+    descriptor: OperationDescriptor = {
+        "operation_id": "outlook.messages.send",
+        "service_id": "outlook",
+        "operation_kind": "mutation",
+        "effect": "external_send",
+        "credential_modes": ("oauth_user",),
+    }
+    args = {"to": "someone@example.invalid"}
+
+    with _https_server(_drop_after_commit_handler(received), certfile, keyfile) as port:
+        transport = build_production_transport(
+            gate=_gate_for(binding, handle),
+            store=store,
+            vault=real_vault,
+            locator=_post_locator(port, "/v1.0/me/sendMail"),
+        )
+        outcome = execute(
+            descriptor,
+            handle,
+            transport,
+            request_args=args,
+            request_idempotency_key="idem-tls-disc-1",
+            **_kw(governance_item="messages.send"),
+        )
+
+    # The server DID receive (commit) the request body -- the ambiguity is real.
+    assert received and received[0] == b'{"to":"someone@example.invalid"}'
+    # The raw RemoteDisconnected off the real socket is caught, not propagated.
+    assert outcome.error is not None
+    assert outcome.write_outcome == ATTEMPT_UNKNOWN
+    assert outcome.write_outcome != ATTEMPT_FAILED_NOT_APPLIED
+
+    # L07 refuses to replay the non-idempotent write on that `unknown`.
+    record = record_attempt(
+        operation_id=descriptor["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="idem-tls-disc-1",
+        outcome="unknown",
+    )
+    assert (
+        replay_decision(
+            descriptor, record, request_args=args, request_idempotency_key="idem-tls-disc-1"
+        )["verdict"]
+        == REPLAY_REFUSE
+    )

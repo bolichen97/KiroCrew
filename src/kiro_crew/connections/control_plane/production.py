@@ -70,6 +70,7 @@ two other things an unbounded ``urlopen`` will happily do to you.
 from __future__ import annotations
 
 import hmac
+import http.client
 import json
 import time
 import urllib.error
@@ -1400,10 +1401,26 @@ def build_production_transport(
                 http_status=400,
                 detail=f"operation {operation_id} was not dispatched over https",
             )
-        except (urllib.error.URLError, TimeoutError, TransportDeadlineExceededError):
-            # Ambiguous by construction: urllib cannot tell us whether the request
-            # bytes reached the server. See the docstring on why this is `unknown`
-            # for a non-idempotent write rather than a determinate not-applied.
+        except (
+            urllib.error.URLError,
+            ConnectionError,
+            http.client.HTTPException,
+            TimeoutError,
+            TransportDeadlineExceededError,
+        ):
+            # Ambiguous by construction: the transport cannot tell whether the
+            # request bytes reached the server. See the docstring on why this is
+            # `unknown` for a non-idempotent write rather than a determinate
+            # not-applied. The tuple names each ambiguity family explicitly rather
+            # than catching Exception (which would misclassify a programming error
+            # as network ambiguity): `urllib.error.URLError` is what the default
+            # opener wraps a connect/read failure in, but a raw
+            # `http.client.RemoteDisconnected` -- a server-committed-then-dropped
+            # reply -- is a `ConnectionResetError` (-> `ConnectionError`) AND an
+            # `http.client.BadStatusLine` (-> `HTTPException`), and is NOT a
+            # `URLError`, so it escaped this branch until both bases were named.
+            # `ConnectionError` also covers ConnectionAborted / BrokenPipe;
+            # `http.client.HTTPException` also covers IncompleteRead / BadStatusLine.
             return TransportResponse(
                 http_status=503,
                 detail=f"could not reach {service_id} for operation {operation_id}",
