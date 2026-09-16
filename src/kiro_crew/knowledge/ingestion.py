@@ -11,6 +11,7 @@ import logging
 import os
 import time as _time
 from collections.abc import AsyncIterator, Callable
+from collections import Counter
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1280,7 +1281,9 @@ class IngestionPipeline:
     async def ingest_text(self, text: str, title: str, source_type: str = 'manual',
                           source_id: str | None = None,
                           old_item_ids: list[str] | None = None,
-                          on_duplicate: Callable[[str], None] | None = None) -> str | None:
+                          on_duplicate: Callable[[str], None] | None = None,
+                          on_items: Callable[[list[str]], None] | None = None,
+                          on_items_owns_old_delete: bool = False) -> str | None:
         """Ingest raw text (dashboard drop, chat, or a shared aggregate source).
 
         Without ``source_id`` the source is found-or-created by a
@@ -1314,7 +1317,8 @@ class IngestionPipeline:
                 return await self._ingest_text_impl(
                     text, title, source_type=source_type, source_id=source_id,
                     old_item_ids=old_item_ids, on_duplicate=on_duplicate,
-                    budget_token=budget_token,
+                    budget_token=budget_token, on_items=on_items,
+                    on_items_owns_old_delete=on_items_owns_old_delete,
                 )
             finally:
                 # Reclaim on every non-settling exit, including the no-op success
@@ -1322,11 +1326,216 @@ class IngestionPipeline:
                 # consumes the token so this release is a no-op there. See ingest_file.
                 self._import_budget.release(budget_token)
 
+    async def ingest_rows(self, rows, *, source_id: str, snapshot: bool):
+        """Ingest a structured connector's fetched rows into ONE source, each row
+        as its own item group with its OWN ACL grant + ProviderResourceRef.
+
+        ``rows`` is an iterable of :class:`kiro_crew.knowledge.rows.SourceRow`.
+        Each row keys a per-row item group in ``connector_row_state`` (the same
+        per-document pattern the aggregate artifact/agent sources use), so:
+
+        * an UNCHANGED row (content_hash matches the ledger) is skipped -- no
+          re-chunk, no re-extract, no grant rewrite;
+        * a NEW/CHANGED row is chunked+extracted on ITS OWN text and its items
+          replace only that row's prior group; its per-user ACL grant
+          (subjects/tenant/managed) + ProviderResourceRef is written in the SAME
+          finalize unit as the item write (via ingest_text's on_items), so an
+          item never exists without its grant and a row is never marked active
+          without its items;
+        * different-permission rows NEVER share a chunk or a ref -- each row is a
+          separate ingest with its own grant.
+
+        Deletion follows snapshot semantics: with ``snapshot=True`` (a full
+        fetch) rows PRESENT in the ledger but ABSENT from ``rows`` are deleted
+        (their items + grant removed) and their keys returned; with
+        ``snapshot=False`` (incremental) nothing is deleted -- an absent row is
+        simply "not changed this round", never lost.
+
+        Returns a :class:`RowsIngestOutcome`; ``fully_persisted`` is True only
+        when every row persisted with no error, which the sync scheduler requires
+        before advancing the source checkpoint. A per-row failure is captured in
+        that row's :class:`RowResult` and leaves ``fully_persisted`` False, so the
+        checkpoint does not advance and the next sync re-attempts it.
+        """
+        from .rows import RowResult, RowsIngestOutcome
+
+        rows = list(rows)
+        prior = await asyncio.to_thread(self.store.get_connector_row_state, source_id)
+        results: list[RowResult] = []
+        fully_persisted = True
+        seen_keys: set[str] = set()
+
+        # Reject duplicate keys BEFORE ingesting the batch. Two rows with the
+        # same key (e.g. one object appearing on two overlapping fetch pages)
+        # would both read the same prior ledger snapshot; the second row's state
+        # write would then replace the first's item_ids, permanently orphaning
+        # the first group's items (searchable, ungoverned, never deletable by
+        # the ledger). A batch that cannot name its rows uniquely is a fetch bug,
+        # so every duplicated key fails-closed here rather than corrupting the
+        # ledger; the checkpoint does not advance and the next sync re-attempts.
+        key_counts = Counter(r.key for r in rows)
+        dup_keys = {k for k, n in key_counts.items() if n > 1}
+
+        for row in rows:
+            if row.key in dup_keys:
+                logger.error(
+                    "ingest_rows: duplicate row key %r in batch for source %s; "
+                    "skipping to avoid orphaning an item group", row.key, source_id)
+                results.append(RowResult(
+                    key=row.key, changed=False,
+                    error="duplicate row key in batch"))
+                fully_persisted = False
+                seen_keys.add(row.key)
+                continue
+            seen_keys.add(row.key)
+            prior_entry = prior.get(row.key)
+            row_hash = hashlib.sha256(row.text.encode()).hexdigest()
+            row_acl_hash = row.acl_hash
+            if prior_entry is not None and prior_entry.get("content_hash") == row_hash:
+                prior_ids = list(prior_entry.get("item_ids") or [])
+                prior_acl_hash = prior_entry.get("acl_hash")
+                if prior_acl_hash == row_acl_hash and prior_acl_hash is not None:
+                    # Text AND grant both unchanged: keep items + grant untouched.
+                    results.append(RowResult(
+                        key=row.key, item_ids=tuple(prior_ids), changed=False))
+                    continue
+                # Text unchanged but the GRANT changed (new subjects/tenant/ref)
+                # -- or a legacy row with no stored acl_hash whose grant we cannot
+                # trust. Re-apply the grant to the existing items and record the
+                # new acl_hash, WITHOUT re-ingesting the text: a query must never
+                # keep evaluating an obsolete grant. Atomic (grants + ledger in
+                # one transaction).
+                if prior_ids:
+                    grants = [
+                        {
+                            "item_id": iid,
+                            "subjects": list(row.subjects),
+                            "tenant": row.tenant,
+                            "managed": row.managed,
+                            "resource_ref": row.resource_ref,
+                        }
+                        for iid in prior_ids
+                    ]
+                    try:
+                        await asyncio.to_thread(
+                            self.store.regrant_connector_row,
+                            source_id, row.key,
+                            content_hash=row_hash, acl_hash=row_acl_hash,
+                            grants=grants, item_ids=prior_ids)
+                        results.append(RowResult(
+                            key=row.key, item_ids=tuple(prior_ids), changed=True))
+                    except Exception as e:
+                        logger.exception(
+                            "ingest_rows: ACL-only regrant failed for row %r "
+                            "source %s", row.key, source_id)
+                        results.append(RowResult(
+                            key=row.key, changed=False, error=str(e)))
+                        fully_persisted = False
+                    continue
+                # No prior items to regrant (should not happen for an active row
+                # with a content_hash): fall through to a full ingest.
+
+            old_ids = list(prior_entry.get("item_ids") or []) if prior_entry else []
+
+            def _persist_grant_and_state(created_ids: list[str], *, _row=row,
+                                         _hash=row_hash, _acl_hash=row_acl_hash,
+                                         _old_ids=old_ids):
+                # Runs INSIDE ingest_text's off-loop finalize unit (full success
+                # only): delete the row's PRIOR item group AND write EVERY created
+                # item's ACL grant with the row's own ProviderResourceRef AND the
+                # row's ledger entry in ONE transaction (finalize_connector_row),
+                # so the old-item delete, the new grants and the ledger advance
+                # together -- a failure part-way rolls the whole group back rather
+                # than deleting the old items while the new ones are left
+                # grantless and untracked (which a retry would duplicate).
+                grants = [
+                    {
+                        "item_id": iid,
+                        "subjects": list(_row.subjects),
+                        "tenant": _row.tenant,
+                        "managed": _row.managed,
+                        "resource_ref": _row.resource_ref,
+                    }
+                    for iid in created_ids
+                ]
+                self.store.finalize_connector_row(
+                    source_id, _row.key, content_hash=_hash, acl_hash=_acl_hash,
+                    grants=grants, item_ids=created_ids,
+                    delete_item_ids=_old_ids)
+
+            captured: list[str] = []
+            persisted = {"ok": False}
+
+            def _capture(created_ids, *, _sink=captured, _grant=_persist_grant_and_state,
+                         _flag=persisted):
+                _sink.extend(created_ids)
+                _grant(created_ids)
+                _flag["ok"] = True
+
+            try:
+                await self.ingest_text(
+                    row.text, row.display_title, source_type="__connector_row__",
+                    source_id=source_id, old_item_ids=old_ids,
+                    on_items=_capture,
+                    on_items_owns_old_delete=True,
+                )
+                if persisted["ok"]:
+                    results.append(RowResult(key=row.key, item_ids=tuple(captured),
+                                             changed=True))
+                else:
+                    # ingest_text returned WITHOUT firing on_items: a chunk failed
+                    # (processed < total), so the item group + its grant + its
+                    # ledger entry were never written. Treat the row as FAILED so
+                    # the checkpoint does not advance past content that is not
+                    # persisted; the next sync re-attempts it.
+                    logger.error(
+                        "ingest_rows: row %r for source %s did not fully persist "
+                        "(chunk failure); not advancing", row.key, source_id)
+                    results.append(RowResult(
+                        key=row.key, changed=False,
+                        error="row did not fully persist (chunk failure)"))
+                    fully_persisted = False
+            except Exception as e:
+                logger.exception("ingest_rows: row %r failed for source %s",
+                                 row.key, source_id)
+                results.append(RowResult(key=row.key, changed=False, error=str(e)))
+                fully_persisted = False
+
+        deleted_keys: list[str] = []
+        if snapshot:
+            # Only a FULL snapshot may infer deletion: a key in the ledger that
+            # the snapshot omits is gone at the source. An incremental
+            # round cannot conclude that, so it deletes nothing.
+            dropped = [k for k in prior.keys() if k not in seen_keys]
+            for key in dropped:
+                ids = list(prior[key].get("item_ids") or [])
+                try:
+                    await self._delete_connector_row(source_id, key, ids)
+                    deleted_keys.append(key)
+                except Exception:
+                    logger.exception("ingest_rows: failed to delete dropped row %r "
+                                     "for source %s", key, source_id)
+                    fully_persisted = False
+
+        return RowsIngestOutcome(
+            results=tuple(results), deleted_keys=tuple(deleted_keys),
+            fully_persisted=fully_persisted)
+
+    async def _delete_connector_row(self, source_id: str, row_key: str,
+                                    item_ids: list[str]) -> None:
+        """Remove a dropped connector row: its items (grants cascade with them)
+        and its ledger entry, in one atomic off-loop unit."""
+        await run_to_completion(
+            functools.partial(self.store.delete_connector_row_atomic,
+                              source_id, row_key, item_ids))
+
     async def _ingest_text_impl(self, text: str, title: str, source_type: str = 'manual',
                                 source_id: str | None = None,
                                 old_item_ids: list[str] | None = None,
                                 on_duplicate: Callable[[str], None] | None = None,
-                                budget_token: int | None = None) -> str | None:
+                                budget_token: int | None = None,
+                                on_items: Callable[[list[str]], None] | None = None,
+                                on_items_owns_old_delete: bool = False) -> str | None:
         content_hash = hashlib.sha256(text.encode()).hexdigest()
 
         # Resolve the source and the prior item ids this call should replace.
@@ -1456,9 +1665,49 @@ class IngestionPipeline:
             # Worker connection is autocommit; WAL + busy_timeout absorb
             # write-lock contention.
             if processed == total:
-                self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
+                if not on_items_owns_old_delete:
+                    self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
                 self.store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
                 self.store.update_source(source_id, last_synced=now)
+                # Per-row callers (ingest_rows) delete the row's PRIOR item group
+                # AND write the row's ACL grant + row state HERE, in the SAME
+                # transaction (finalize_connector_row with delete_item_ids), so
+                # the old-item delete, the new grants and the change-ledger entry
+                # advance together -- a crash between them cannot delete the old
+                # items while leaving the new ones grantless, nor leave a row
+                # marked active with no items. Runs only on full success; a
+                # partial/failed row (below) never calls it, so no grant is
+                # written for content that was rolled back. When on_items owns the
+                # old-item delete, the standalone delete above is SKIPPED so the
+                # two do not double-delete or split the transaction.
+                if on_items is not None:
+                    try:
+                        on_items(list(created_item_ids))
+                    except Exception:
+                        # The finalizer (grants + ledger, and for a connector row
+                        # the old-item delete) failed AFTER these chunks were
+                        # committed. Leaving them would strand grantless,
+                        # untracked items that a retry would duplicate, so delete
+                        # exactly the ids THIS call created (not owner-scoped --
+                        # an incomplete unit's chunks are destroyed, not detached)
+                        # before propagating. The row is then reported failed and
+                        # the checkpoint does not advance.
+                        try:
+                            self.store.delete_items_batch(list(created_item_ids))
+                        except Exception:
+                            logger.exception(
+                                "ingest: failed to clean up chunks after a "
+                                "finalize failure for source %s", source_id)
+                        self.store.db.execute(
+                            "UPDATE sources SET sync_status = 'error' WHERE id = ?",
+                            (source_id,))
+                        self.store.db.execute(
+                            "UPDATE ingestion_jobs SET status = 'error', "
+                            "items_total = ?, items_processed = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            (total, processed, now, job_id))
+                        self.store.db.commit()
+                        raise
             elif processed < total:
                 # Partial failure: remove only items created during THIS call so we
                 # never delete another item group sharing this source_id. Taken

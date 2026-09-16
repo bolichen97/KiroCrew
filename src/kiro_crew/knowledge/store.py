@@ -195,6 +195,48 @@ def is_auto_registered(props: dict) -> bool:
 # by type here for the same structural reason.)
 _WALKING_SOURCE_TYPES = ("local_folder", "obsidian_vault")
 
+# ---------------------------------------------------------------------------
+# Source trust classification (query-time ACL provenance -- knowledge/acl.py)
+#
+# ``sources.trust_class`` records, as EVIDENCE written when the source is
+# created, whether the source's content is admitted-local (on-host material with
+# no external per-user ACL) or managed (a remote connector whose items carry a
+# provider-enforced ACL). The query-time ACL gate reads ONLY this stamp; it does
+# NOT re-guess trust from a source_type string at read time. Default is
+# ``managed`` (fail-closed): a source created without an explicit local stamp,
+# or of an unknown/misspelled type, is treated as managed and gated.
+#
+# TRUST_LOCAL is stamped ONLY by the real LOCAL production creators enumerated
+# below -- the ingestion paths that write items directly on-host with no remote
+# fetch. This set is defined FROM those creators (dashboard file upload,
+# single-file ingestion, auto_research local files, the folder watcher, the
+# agent-added aggregate, and the dashboard artifact aggregate), not from a
+# guess, and is used at exactly two places: stamping at creation and the
+# one-time migration backfill below. Every OTHER source_type -- every remote
+# SyncScheduler connector (sharepoint/onedrive/salesforce/github_structured/…)
+# -- is created ``managed``.
+TRUST_LOCAL = "local_admitted"
+TRUST_MANAGED = "managed"
+
+# The source_types created by a genuinely-local, on-host ingestion path. Derived
+# from the production add_source creators, NOT from a runtime type guess: used
+# only to stamp trust_class at creation and to backfill legacy rows once. A
+# remote connector type is deliberately absent, so it defaults to managed.
+_LOCAL_CREATOR_SOURCE_TYPES = frozenset(
+    {"local_folder", "obsidian_vault", "local_file", "artifact", "agent", "doc"}
+)
+
+
+def initial_trust_class(source_type: str | None) -> str:
+    """The trust_class a NEW source of this type is created with.
+
+    Local iff the type is one the local production creators use; managed
+    otherwise (fail-closed). This runs at CREATE time only -- the query-time gate
+    reads the stored stamp, never this function.
+    """
+    return TRUST_LOCAL if source_type in _LOCAL_CREATOR_SOURCE_TYPES else TRUST_MANAGED
+
+
 # Every query in this module funnels through the ``db`` property, so one check
 # there covers every caller at any stack depth -- including the ones a lexical
 # ``async def`` scan cannot see, which is why this guard exists.
@@ -502,6 +544,7 @@ _DOC_STATE_TABLES: tuple[tuple[str, str], ...] = (
     ("folder_file_state", "done"),
     ("artifact_item_state", "active"),
     ("agent_item_state", "active"),
+    ("connector_row_state", "active"),
 )
 
 # Which column identifies ONE document within a doc-state table. Ownership has to
@@ -514,6 +557,7 @@ _DOC_STATE_KEY_COL: dict[str, str] = {
     "folder_file_state": "file_path",
     "artifact_item_state": "slug",
     "agent_item_state": "slug",
+    "connector_row_state": "row_key",
 }
 
 # Which column on each state table holds a hash in the SAME DOMAIN as
@@ -540,6 +584,7 @@ _OWNERSHIP_HASH_COL: dict[str, str] = {
     "folder_file_state": "COALESCE(text_hash, content_hash)",
     "artifact_item_state": "content_hash",
     "agent_item_state": "content_hash",
+    "connector_row_state": "content_hash",
 }
 # Folder rows COALESCE so a legacy row -- written before ``text_hash`` existed, and
 # deliberately never backfilled -- keeps behaving exactly as it does today: for the
@@ -679,6 +724,7 @@ class KnowledgeStore:
                 uri TEXT UNIQUE NOT NULL,
                 properties TEXT DEFAULT '{}',
                 last_synced TEXT,
+                trust_class TEXT NOT NULL DEFAULT 'managed',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -836,6 +882,28 @@ class KnowledgeStore:
                 PRIMARY KEY (source_id, slug)
             );
 
+            -- Per-ROW item-group tracking for a STRUCTURED connector source
+            -- (GitHub issues/PRs/commits/check-runs, Salesforce records, ...).
+            -- Same shape and role as artifact_item_state/agent_item_state: it is
+            -- what lets one connector source hold many independently-replaceable
+            -- ROWS, each keyed by its OWN stable row_key, and gives incremental
+            -- sync a per-row unit. content_hash short-circuits an unchanged row;
+            -- item_ids is the row's item group (replaced on update, deleted on a
+            -- full-snapshot removal). Each row's per-user ACL lives on its items'
+            -- item_acl rows (with the ProviderResourceRef), NOT here -- this
+            -- table is the identity/change ledger, item_acl is the grant.
+            CREATE TABLE IF NOT EXISTS connector_row_state (
+                source_id TEXT NOT NULL REFERENCES sources(id),
+                row_key TEXT NOT NULL,
+                content_hash TEXT,
+                acl_hash TEXT,
+                item_ids TEXT DEFAULT '[]',
+                updated_at TEXT NOT NULL,
+                status TEXT DEFAULT 'active',
+                merged_into_source_id TEXT,
+                PRIMARY KEY (source_id, row_key)
+            );
+
             -- Tombstones for auto-discovered sources the user deleted. Keyed by
             -- URI (not source_id) and deliberately NOT touched by
             -- delete_source_cascade: auto-discovery's only idempotency marker is
@@ -846,6 +914,55 @@ class KnowledgeStore:
                 uri TEXT PRIMARY KEY,
                 dismissed_at TEXT NOT NULL
             );
+
+            -- Query-time access-control grant for one item, written at INGEST
+            -- time from the source's own permission facts and read at QUERY
+            -- time by the retriever's ACL gate (knowledge/acl.py). This is the
+            -- security boundary the items.source_id / items.namespace filters
+            -- deliberately are NOT: those are relevance labels, this decides
+            -- who may see a row.
+            --
+            -- subjects: JSON array of subject ids allowed to see the item
+            --   (or the acl.PUBLIC_SUBJECT sentinel for tenant-public content).
+            -- tenant: the org/workspace boundary the grant belongs to
+            --   (acl.PUBLIC_TENANT for cross-tenant public).
+            -- acl_version: monotonic marker bumped on every rewrite, so a
+            --   revoke immediately invalidates any decision cached on
+            --   (item_id, acl_version) -- the mechanism that makes the NEXT
+            --   query after a revoke deny, without a re-crawl (ACL-02).
+            --
+            -- An item with NO row here is denied by the fail-closed policy:
+            -- absence of a grant is not permission. Rows are removed with their
+            -- item (see _delete_item_cascade / delete_items_batch_in_txn) so a
+            -- removed item's grant cannot outlive it (KB-10).
+            --
+            -- managed: 1 for a cloud/structured item whose per-user ACL must be
+            --   enforced (and revalidated) at query time, 0 for trusted-local
+            --   material. Written at ingest from the source's own type; the
+            --   retriever also re-derives it from the live source_type so a
+            --   mislabelled/legacy row cannot downgrade a managed item.
+            -- fresh_as_of: epoch seconds at which this grant was last CONFIRMED
+            --   current against the provider (0 = never / ingest-time only).
+            --   The freshness check reads it; a managed grant older than the
+            --   staleness window with no fresh revalidation is denied.
+            -- resource_ref: JSON acl.ProviderResourceRef -- WHICH provider object
+            --   this managed item came from (provider/account/resource_id/
+            --   locator). Written at ingest; the query-time gate reads it to
+            --   resolve the per-candidate binding (by provider+account) and to
+            --   build the revalidation probe. A managed item whose resource_ref
+            --   is absent/unparseable cannot be revalidated -> denied.
+            CREATE TABLE IF NOT EXISTS item_acl (
+                item_id TEXT PRIMARY KEY REFERENCES items(id),
+                subjects TEXT NOT NULL DEFAULT '[]',
+                tenant TEXT NOT NULL,
+                acl_version INTEGER NOT NULL DEFAULT 1,
+                managed INTEGER NOT NULL DEFAULT 0,
+                fresh_as_of REAL NOT NULL DEFAULT 0,
+                resource_ref TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_item_acl_tenant ON item_acl(tenant);
 
         """)
         self.db.commit()
@@ -903,6 +1020,21 @@ class KnowledgeStore:
         src_cols = {r[1] for r in self.db.execute("PRAGMA table_info(sources)").fetchall()}
         if "sync_status" not in src_cols:
             self.db.execute("ALTER TABLE sources ADD COLUMN sync_status TEXT DEFAULT 'pending'")
+        # trust_class: query-time ACL provenance stamp (knowledge/acl.py). Older
+        # rows predate the column; add it defaulting to MANAGED (fail-closed),
+        # then backfill TRUST_LOCAL onto exactly the rows created by a known
+        # LOCAL production creator type -- ONE-TIME migration semantics derived
+        # from the real creators, NOT a runtime type guess (the gate never reads
+        # source_type). A remote-connector row keeps the managed default. This is
+        # gated on the column being freshly added so it runs once, not every open.
+        if "trust_class" not in src_cols:
+            self.db.execute(
+                f"ALTER TABLE sources ADD COLUMN trust_class TEXT NOT NULL DEFAULT '{TRUST_MANAGED}'")
+            local_types = tuple(sorted(_LOCAL_CREATOR_SOURCE_TYPES))
+            placeholders = ",".join("?" for _ in local_types)
+            self.db.execute(
+                f"UPDATE sources SET trust_class = ? WHERE source_type IN ({placeholders})",  # noqa: S608
+                (TRUST_LOCAL, *local_types))
         # ONE pass over the rows that still carry a blob copy of the status:
         # repair the column where it was never written, then retire the copy.
         # After this pass no row has a copy at all, so on a store that has
@@ -1052,6 +1184,35 @@ class KnowledgeStore:
         if "source_uri" not in agent_cols:
             self.db.execute(
                 "ALTER TABLE agent_item_state ADD COLUMN source_uri TEXT")
+        # item_acl gained managed/fresh_as_of after first ship. A pre-existing
+        # grant row predates the managed/revalidation model, so it must NOT be
+        # assumed trusted: managed defaults to 0 here, but the retriever
+        # re-derives managed from the live source_type (get_item_grants' JOIN),
+        # so a legacy row on a cloud/structured item is still enforced. fresh_as_of
+        # defaults to 0 (never revalidated) -> a managed legacy grant is stale
+        # until a revalidation refreshes it, which is the correct fail-closed
+        # posture, not a regression.
+        acl_cols = {r[1] for r in self.db.execute(
+            "PRAGMA table_info(item_acl)").fetchall()}
+        if acl_cols:  # table exists (skip on a brand-new DB where DDL already made it)
+            if "managed" not in acl_cols:
+                self.db.execute(
+                    "ALTER TABLE item_acl ADD COLUMN managed INTEGER NOT NULL DEFAULT 0")
+            if "fresh_as_of" not in acl_cols:
+                self.db.execute(
+                    "ALTER TABLE item_acl ADD COLUMN fresh_as_of REAL NOT NULL DEFAULT 0")
+            if "resource_ref" not in acl_cols:
+                self.db.execute("ALTER TABLE item_acl ADD COLUMN resource_ref TEXT")
+        # connector_row_state.acl_hash -- a digest of the row's GRANT facts
+        # (subjects, tenant, resource_ref), stored beside content_hash so an
+        # ACL-only change (same text, different permissions) is detected even
+        # when the text hash is unchanged. A legacy row carries NULL, which the
+        # pipeline treats as "grant provenance unknown" and re-applies the grant
+        # on the next sync rather than trusting a possibly-obsolete one.
+        crs_cols = {r[1] for r in self.db.execute(
+            "PRAGMA table_info(connector_row_state)").fetchall()}
+        if crs_cols and "acl_hash" not in crs_cols:
+            self.db.execute("ALTER TABLE connector_row_state ADD COLUMN acl_hash TEXT")
         # The orphan sweep is NOT here any more -- see `reclaim_orphans`. The
         # constructor runs on the event loop before the socket binds, and the
         # sweep is data-scaled and writer-locked, so on a large store it
@@ -1412,6 +1573,384 @@ class KnowledgeStore:
             self.db.execute("ROLLBACK")
             raise
 
+    # ------------------------------------------------------------------
+    # Query-time access control (item_acl table)
+    #
+    # These are the store's half of the ACL contract: written at INGEST time
+    # from a source's real permission facts, read at QUERY time by the
+    # retriever's fail-closed gate. The DECISION (who may see what) lives in
+    # knowledge/acl.py; the store only persists and returns grant records.
+    # ------------------------------------------------------------------
+
+    def set_item_acl(self, item_id: str, subjects, tenant: str, *,
+                     managed: bool = False, fresh_as_of: float = 0.0,
+                     resource_ref=None) -> int:
+        """Write (or overwrite) *item_id*'s ACL grant. Returns the new acl_version.
+
+        ``subjects`` is an iterable of subject ids (or the ``acl.PUBLIC_SUBJECT``
+        sentinel); ``tenant`` is the org/workspace the grant belongs to (or
+        ``acl.PUBLIC_TENANT``). ``managed`` marks a cloud/structured item whose
+        per-user ACL must be revalidated at query time; ``fresh_as_of`` is the
+        epoch-seconds moment the grant was last confirmed current against the
+        provider (0.0 = ingest-time only, which the query-time freshness check
+        treats as stale for a managed item until a revalidation refreshes it).
+
+        ``resource_ref`` is the acl.ProviderResourceRef (or its ``.to_json()``
+        string, or a dict) naming WHICH provider object this managed item came
+        from -- persisted so the query-time gate can resolve the per-candidate
+        binding (by provider+account) and build the revalidation probe. Required
+        in practice for a managed item: a managed grant with no resource_ref
+        cannot be revalidated and the gate denies it. Ignored for a trusted-local
+        grant.
+
+        Overwriting an existing grant BUMPS ``acl_version`` monotonically, so any
+        decision cached on the old version is invalidated the moment the grant
+        changes -- this is what makes a narrowed grant take effect on the very
+        next query rather than after a re-crawl.
+        """
+        subj_list = sorted({str(s) for s in subjects})
+        ref_json = self._resource_ref_json(resource_ref)
+        now = datetime.now().isoformat()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            next_version = self._write_item_acl_locked(
+                item_id, subj_list, tenant, managed=managed,
+                fresh_as_of=fresh_as_of, ref_json=ref_json, now=now)
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return next_version
+
+    def _write_item_acl_locked(self, item_id: str, subj_list: list[str],
+                               tenant: str, *, managed: bool, fresh_as_of: float,
+                               ref_json: str | None, now: str) -> int:
+        """Write one item's ACL grant WITHOUT owning the transaction.
+
+        The caller must already hold an open ``BEGIN IMMEDIATE`` and is
+        responsible for COMMIT/ROLLBACK. This lets a caller write several grants
+        AND the row-state in ONE transaction (see ``finalize_connector_row``), so
+        a failure part-way rolls the whole group back rather than committing some
+        grants while the ledger is never written. ``set_item_acl`` wraps this in
+        its own single-grant transaction for standalone callers."""
+        row = self.db.execute(
+            "SELECT acl_version FROM item_acl WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        next_version = (row["acl_version"] + 1) if row else 1
+        self.db.execute(
+            "INSERT INTO item_acl "
+            "(item_id, subjects, tenant, acl_version, managed, fresh_as_of, "
+            "resource_ref, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(item_id) DO UPDATE SET "
+            "subjects = excluded.subjects, tenant = excluded.tenant, "
+            "acl_version = excluded.acl_version, managed = excluded.managed, "
+            "fresh_as_of = excluded.fresh_as_of, resource_ref = excluded.resource_ref, "
+            "updated_at = excluded.updated_at",
+            (item_id, json.dumps(subj_list), tenant, next_version,
+             1 if managed else 0, float(fresh_as_of), ref_json, now))
+        return next_version
+
+    @staticmethod
+    def _resource_ref_json(resource_ref) -> str | None:
+        """Normalise a resource_ref (ProviderResourceRef | dict | json str | None)
+        to a stored JSON string (or None). Kept tolerant so the ingest caller may
+        pass the dataclass, a dict, or a pre-serialised string."""
+        if resource_ref is None:
+            return None
+        to_json = getattr(resource_ref, "to_json", None)
+        if callable(to_json):
+            return to_json()
+        if isinstance(resource_ref, dict):
+            return json.dumps(resource_ref, sort_keys=True)
+        if isinstance(resource_ref, str):
+            return resource_ref
+        return None
+
+    def revoke_item_acl(self, item_id: str) -> int:
+        """Revoke ALL access to *item_id* by clearing its subject set.
+
+        The grant row is kept (not deleted) with an EMPTY subject set, a bumped
+        ``acl_version`` AND ``fresh_as_of`` reset to 0, so the next query denies
+        it (empty set matches no subject, and a managed grant with no fresh stamp
+        is stale) AND any cached decision keyed on the prior version is
+        invalidated. This is distinct from deleting the item: the content is
+        still present, only its visibility is revoked -- the ACL-02/ACL-03 case
+        where a group departure or link revocation must deny the next query
+        without removing the underlying document. Returns the new acl_version, or
+        0 if the item had no grant to revoke.
+        """
+        now = datetime.now().isoformat()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT acl_version FROM item_acl WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                self.db.execute("COMMIT")
+                return 0
+            next_version = row["acl_version"] + 1
+            self.db.execute(
+                "UPDATE item_acl SET subjects = '[]', acl_version = ?, "
+                "fresh_as_of = 0, updated_at = ? WHERE item_id = ?",
+                (next_version, now, item_id))
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return next_version
+
+    def mark_item_acl_revalidated(self, item_id: str, subjects, *,
+                                  fresh_as_of: float, tenant: str | None = None) -> int:
+        """Record that a managed item's grant was CONFIRMED current by the provider.
+
+        This is the store side of the revalidation chain (knowledge/acl.py's
+        RevalidationHook is the interface that performs the provider probe and
+        then calls this). It writes the provider's freshly-observed subject set
+        and stamps ``fresh_as_of``, bumping ``acl_version`` so the previous
+        (stale) decision is invalidated. A revocation observed by the provider is
+        recorded by passing an empty ``subjects`` -- the next query then denies.
+        Returns the new acl_version. No-op returning 0 if the item has no grant
+        row to refresh.
+        """
+        subj_list = sorted({str(s) for s in subjects})
+        now = datetime.now().isoformat()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT acl_version, tenant FROM item_acl WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                self.db.execute("COMMIT")
+                return 0
+            next_version = row["acl_version"] + 1
+            new_tenant = tenant if tenant is not None else row["tenant"]
+            self.db.execute(
+                "UPDATE item_acl SET subjects = ?, tenant = ?, acl_version = ?, "
+                "fresh_as_of = ?, updated_at = ? WHERE item_id = ?",
+                (json.dumps(subj_list), new_tenant, next_version,
+                 float(fresh_as_of), now, item_id))
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return next_version
+
+    def get_item_grants(self, item_ids):
+        """Batch-fetch grant rows for *item_ids*, keyed by item_id.
+
+        Returns, for each id that HAS a grant row::
+
+            {"subjects": <json str>, "tenant": str, "acl_version": int,
+             "managed": bool, "fresh_as_of": float, "trust_class": str|None}
+
+        ``trust_class`` is the source's PROVENANCE stamp (``local_admitted`` /
+        ``managed``), read via a LEFT JOIN -- the retriever classifies managed
+        from it, NOT from a source_type guess. ``None`` when the item has no
+        source (sourceless -> trusted-local) OR its source row is missing
+        (dangling -> the retriever fails that closed). The stored ``managed``
+        flag is also returned so an item explicitly ingested managed cannot be
+        downgraded. Ids with no grant row are absent; the classifier decides
+        those from trust_class + the fail-closed policy. Chunked under
+        SQLITE_MAX_VARIABLE_NUMBER.
+        """
+        out: dict[str, dict] = {}
+        ids = list(item_ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.execute(
+                "SELECT a.item_id, a.subjects, a.tenant, a.acl_version, "  # noqa: S608
+                "a.managed, a.fresh_as_of, a.resource_ref, i.source_id, s.trust_class "
+                "FROM item_acl a "
+                "LEFT JOIN items i ON i.id = a.item_id "
+                "LEFT JOIN sources s ON s.id = i.source_id "
+                f"WHERE a.item_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                out[row["item_id"]] = {
+                    "subjects": row["subjects"],
+                    "tenant": row["tenant"],
+                    "acl_version": row["acl_version"],
+                    "managed": bool(row["managed"]),
+                    "fresh_as_of": row["fresh_as_of"],
+                    "resource_ref": row["resource_ref"],
+                    "trust_class": row["trust_class"],
+                    "has_source": row["source_id"] is not None,
+                }
+        return out
+
+    def get_item_trust(self, item_ids):
+        """Batch-fetch each item's ``(has_source, trust_class)``, keyed by id.
+
+        The retriever's ACL classifier needs the source PROVENANCE for EVERY
+        candidate, including ones with no grant row:
+
+        * ``has_source`` False -- a SOURCELESS item: on-host content, trusted-local.
+        * ``has_source`` True, ``trust_class`` == ``local_admitted`` -- trusted-local.
+        * ``has_source`` True, ``trust_class`` == ``managed`` (or a MISSING source
+          row -> ``trust_class`` None) -- managed, fail-closed.
+
+        The gate reads THIS stamp; it never re-guesses trust from source_type.
+        An id with no item row resolves to ``(False, None)``.
+        """
+        out: dict[str, tuple[bool, str | None]] = {}
+        ids = list(item_ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.execute(
+                "SELECT i.id, i.source_id, s.trust_class FROM items i "  # noqa: S608
+                "LEFT JOIN sources s ON s.id = i.source_id "
+                f"WHERE i.id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                out[row["id"]] = (row["source_id"] is not None, row["trust_class"])
+        return out
+
+    def get_connector_row_state(self, source_id: str) -> dict:
+        """The per-row change ledger for a structured connector source.
+
+        Returns ``{row_key: {"content_hash": str|None, "item_ids": [str],
+        "status": str}}`` for the ACTIVE rows of *source_id*. The pipeline reads
+        this before ingest to short-circuit unchanged rows (matching
+        content_hash) and to find the prior item group a changed row replaces;
+        the sync scheduler reads it to compute which rows a full snapshot dropped.
+        """
+        out: dict[str, dict] = {}
+        for row in self.db.execute(
+            "SELECT row_key, content_hash, acl_hash, item_ids, status "
+            "FROM connector_row_state "
+            "WHERE source_id = ? AND status = 'active'", (source_id,)
+        ).fetchall():
+            try:
+                ids = json.loads(row["item_ids"]) if row["item_ids"] else []
+            except (json.JSONDecodeError, TypeError):
+                ids = []
+            out[row["row_key"]] = {
+                "content_hash": row["content_hash"],
+                "acl_hash": row["acl_hash"],
+                "item_ids": ids,
+                "status": row["status"],
+            }
+        return out
+
+    def set_connector_row_state(self, source_id: str, row_key: str, *,
+                                content_hash: str | None, item_ids: list[str],
+                                acl_hash: str | None = None) -> None:
+        """Record (or overwrite) which items one connector row owns.
+
+        Written by the pipeline in the SAME durable step as the row's items +
+        ACL grant, so the ledger, the content and the grant advance together --
+        a crash between them cannot leave a row marked active with no items or an
+        item with no grant."""
+        self._write_connector_row_state_locked(
+            source_id, row_key, content_hash=content_hash,
+            item_ids=item_ids, acl_hash=acl_hash)
+
+    def _write_connector_row_state_locked(self, source_id: str, row_key: str, *,
+                                          content_hash: str | None,
+                                          item_ids: list[str],
+                                          acl_hash: str | None) -> None:
+        """Row-state write with no transaction of its own (caller owns it)."""
+        self.db.execute(
+            "INSERT INTO connector_row_state "
+            "(source_id, row_key, content_hash, acl_hash, item_ids, updated_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'active') "
+            "ON CONFLICT(source_id, row_key) DO UPDATE SET "
+            "content_hash = excluded.content_hash, acl_hash = excluded.acl_hash, "
+            "item_ids = excluded.item_ids, "
+            "updated_at = excluded.updated_at, status = 'active', "
+            "merged_into_source_id = NULL",
+            (source_id, row_key, content_hash, acl_hash, json.dumps(item_ids),
+             datetime.now().isoformat()))
+
+    def finalize_connector_row(self, source_id: str, row_key: str, *,
+                               content_hash: str | None, acl_hash: str | None,
+                               grants: list[dict], item_ids: list[str],
+                               delete_item_ids: list[str] | None = None) -> None:
+        """Write a connector row's ACL grants AND its ledger entry ATOMICALLY.
+
+        ``grants`` is a list of ``{"item_id", "subjects", "tenant", "managed",
+        "fresh_as_of", "resource_ref"}`` dicts (one per created item). When
+        ``delete_item_ids`` is given (the row's PRIOR item group being replaced),
+        those items are deleted in the SAME transaction as the new grants + the
+        ledger row. Every step is written under ONE ``BEGIN IMMEDIATE``: if any
+        part fails, the whole unit rolls back, so the store never ends up with
+        the old items deleted while the new items are grantless and the ledger
+        unwritten -- the corruption where a retry then created permanently
+        untracked duplicate items."""
+        now = datetime.now().isoformat()
+        did_delete = bool(delete_item_ids)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if delete_item_ids:
+                self.delete_items_batch_in_txn(
+                    list(delete_item_ids), owner_source_id=source_id)
+            for g in grants:
+                subj_list = sorted({str(s) for s in g["subjects"]})
+                ref_json = self._resource_ref_json(g.get("resource_ref"))
+                self._write_item_acl_locked(
+                    g["item_id"], subj_list, g["tenant"],
+                    managed=bool(g.get("managed", False)),
+                    fresh_as_of=float(g.get("fresh_as_of", 0.0)),
+                    ref_json=ref_json, now=now)
+            self._write_connector_row_state_locked(
+                source_id, row_key, content_hash=content_hash,
+                item_ids=item_ids, acl_hash=acl_hash)
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        if did_delete:
+            # The in-txn delete seam drops entities the in-memory graph still
+            # holds; reload after COMMIT, as that seam requires.
+            self.reload_graph()
+
+    def delete_connector_row_atomic(self, source_id: str, row_key: str,
+                                    item_ids: list[str]) -> None:
+        """Delete a dropped connector row's items AND its ledger entry ATOMICALLY.
+
+        The item delete and the ``connector_row_state`` delete run under ONE
+        ``BEGIN IMMEDIATE`` (via the in-txn delete seam), so a crash or grant/
+        state failure can never commit the item deletion while leaving the ledger
+        row behind (which would permanently skip that row's data) or vice versa.
+        The graph reload runs after COMMIT, as the in-txn seam requires."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if item_ids:
+                self.delete_items_batch_in_txn(item_ids, owner_source_id=source_id)
+            self.db.execute(
+                "DELETE FROM connector_row_state WHERE source_id = ? AND row_key = ?",
+                (source_id, row_key))
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        if item_ids:
+            self.reload_graph()
+
+    def regrant_connector_row(self, source_id: str, row_key: str, *,
+                              content_hash: str | None, acl_hash: str | None,
+                              grants: list[dict], item_ids: list[str]) -> None:
+        """Re-apply an ACL-only change to an existing row's item group.
+
+        Used when a row's text is unchanged (same content_hash) but its grant
+        facts changed (subjects/tenant/resource_ref): the items stay, only the
+        grants and the ledger's acl_hash are rewritten -- atomically, so a query
+        never keeps evaluating an obsolete grant. Same transaction discipline as
+        ``finalize_connector_row``; kept as a named method so the intent (regrant,
+        not re-ingest) is explicit at the call site."""
+        self.finalize_connector_row(
+            source_id, row_key, content_hash=content_hash, acl_hash=acl_hash,
+            grants=grants, item_ids=item_ids)
+
     def _delete_item_cascade(self, item_id):
         """Delete item and its dependents without commit/graph reload (for batch use)."""
         row = self.db.execute("SELECT rowid, title, content, tags FROM items WHERE id = ?", (item_id,)).fetchone()
@@ -1420,6 +1959,7 @@ class KnowledgeStore:
         self.db.execute("DELETE FROM source_locations WHERE item_id = ?", (item_id,))
         self.db.execute("DELETE FROM mentions WHERE item_id = ?", (item_id,))
         self.db.execute("DELETE FROM entity_relations WHERE source_item_id = ?", (item_id,))
+        self.db.execute("DELETE FROM item_acl WHERE item_id = ?", (item_id,))
         self.db.execute("DELETE FROM items WHERE id = ?", (item_id,))
 
     def delete_item(self, item_id):
@@ -1729,6 +2269,7 @@ class KnowledgeStore:
                 self.db.execute(f"DELETE FROM mentions WHERE item_id IN ({q})", doomed)  # noqa: S608
                 self.db.execute(
                     f"DELETE FROM entity_relations WHERE source_item_id IN ({q})", doomed)  # noqa: S608
+                self.db.execute(f"DELETE FROM item_acl WHERE item_id IN ({q})", doomed)  # noqa: S608
                 self.db.execute(f"DELETE FROM items WHERE id IN ({q})", doomed)  # noqa: S608
 
             # Documents that deferred to this source need their marker cleared, or the
@@ -2238,11 +2779,35 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
         now = datetime.now().isoformat()
         properties = kwargs.get("properties", {})
         stored = _without_sync_status(properties)
+        # trust_class is EVIDENCE issued by a TRUSTED creator, not a
+        # caller-assertable field. The base value is derived from the source
+        # TYPE (initial_trust_class): only the fixed local-creator types yield
+        # TRUST_LOCAL. An explicit trust_class kwarg may only NARROW to
+        # TRUST_MANAGED (a remote connector stamping managed for a type that
+        # would otherwise default local); it can NEVER upgrade a non-local type
+        # to TRUST_LOCAL. So a caller passing trust_class=local_admitted for a
+        # 'sharepoint' (or any non-local) source is refused the local stamp and
+        # gets managed -- the stamp does not prove the issuer is trusted, the
+        # creator TYPE does. This is what stops external API input / a
+        # source_type rename / a forged kwarg from minting local trust.
+        base = initial_trust_class(source_type)
+        requested = kwargs.get("trust_class")
+        if requested == TRUST_MANAGED:
+            trust_class = TRUST_MANAGED  # narrowing is always allowed
+        elif requested in (None, ""):
+            trust_class = base
+        elif requested == TRUST_LOCAL:
+            # Honoured ONLY when the type itself is a local creator; otherwise
+            # the request is refused and the type-derived (managed) value stands.
+            trust_class = base
+        else:
+            # Unknown trust_class value -> fail-closed managed, never the request.
+            trust_class = TRUST_MANAGED
         self.db.execute(
             "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "trust_class, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sid, name, source_type, uri, json.dumps(stored),
-             self._initial_sync_status(properties), now, now))
+             self._initial_sync_status(properties), trust_class, now, now))
         self.db.commit()
         return sid
 
@@ -2567,6 +3132,12 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             relations = [dict(r) for r in self.db.execute("SELECT * FROM entity_relations")]
             source_locations = [dict(r) for r in self.db.execute("SELECT * FROM source_locations")]
             mentions = [dict(r) for r in self.db.execute("SELECT * FROM mentions")]
+        if item_ids is not None:
+            item_acls = [dict(r) for r in self.db.execute(
+                f"SELECT * FROM item_acl WHERE item_id IN ({items_subq})",  # noqa: S608
+                (namespace,))]
+        else:
+            item_acls = [dict(r) for r in self.db.execute("SELECT * FROM item_acl")]
         return {
             "items": items,
             "entities": [dict(r) for r in self.db.execute("SELECT * FROM entities")],
@@ -2574,6 +3145,7 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "sources": [dict(r) for r in self.db.execute("SELECT * FROM sources")],
             "source_locations": source_locations,
             "mentions": mentions,
+            "item_acls": item_acls,
         }
 
     def import_bundle(self, bundle: dict) -> dict:
@@ -2581,6 +3153,28 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
         entities_created = 0
         relations_rebuilt = 0
         now = datetime.now().isoformat()
+        # ── Trust-boundary invariant for an UNTRUSTED bundle ──────────────────
+        # ONE principle governs all four data-flow segments: a bundle's CLAIM, a
+        # MISSING field, or its NAMING an existing source id NEVER produces local
+        # trust or a new (non-managed) authorization. Concretely:
+        #
+        # 1. SOURCE CLASSIFICATION: an imported source is stamped local ONLY when
+        #    a source with its id ALREADY EXISTS in this store as TRUST_LOCAL
+        #    (independently admitted by the real local creator). A bundle can
+        #    neither create a new local source nor flip a managed one.
+        # 2. ITEM ATTRIBUTION: a NEWLY-inserted imported item is MANAGED at query
+        #    time regardless of which source id it names -- it gets an explicit
+        #    managed grant below. So a bundle cannot make new content
+        #    trusted-local by pointing item.source_id at a pre-existing local
+        #    source; only items that ALREADY exist here (idempotent re-import,
+        #    INSERT OR IGNORE no-op) keep their real, locally-established trust.
+        # 3. GRANT RESTORATION: a bundle-provided item_acl may only ever be
+        #    MANAGED (restrict, never un-gate). An explicit managed=0 in the
+        #    bundle is IGNORED -- imported grants are forced managed.
+        # 4. QUERY EXEMPTION: unchanged. The gate treats an item as managed when
+        #    its source is not TRUST_LOCAL OR it carries a managed grant; a
+        #    managed item without a resolvable binding is denied (fail-closed).
+        _newly_imported_item_ids: list[str] = []
         self.db.execute("BEGIN IMMEDIATE")
         try:
             for src in bundle.get("sources", []):
@@ -2619,12 +3213,36 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 if (src.get("source_type") in _WALKING_SOURCE_TYPES
                         and restored != "paused"):
                     restored = "pending_confirmation"
+                # trust_class is PROVENANCE, and a bundle is UNTRUSTED input.
+                # NEITHER the bundle's claimed source_type/trust_class NOR the
+                # ABSENCE of a managed grant is provenance: a crafted bundle can
+                # claim a local source_type and simply omit its grants, and
+                # "no managed grant in the bundle" does not prove the content is
+                # not managed. So imported provenance is MANAGED unless the source
+                # is INDEPENDENTLY RE-ADMITTED locally -- the ONLY verifiable
+                # signal is that a source with this id ALREADY EXISTS in THIS
+                # store as TRUST_LOCAL, established by the real local creator
+                # (add_source over a real folder the watcher admitted), not by any
+                # bundle. Absent that, the source is managed and the query-time
+                # gate + revalidation govern it; a genuine local library is
+                # restored by re-creating it through its local creator, never by
+                # trusting an imported bundle. (A one-step local restore would
+                # need a named, authenticated re-admission step; it does not exist
+                # today and is not invented here.)
+                existing_row = self.db.execute(
+                    "SELECT trust_class FROM sources WHERE id = ?", (src["id"],)
+                ).fetchone()
+                if existing_row is not None and existing_row["trust_class"] == TRUST_LOCAL:
+                    src_trust = TRUST_LOCAL
+                else:
+                    src_trust = TRUST_MANAGED
                 self.db.execute(
                     "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, "
-                    "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "sync_status, trust_class, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (src["id"], src["name"], src["source_type"], src["uri"],
                      _without_sync_status(props_text),
-                     self._initial_status_or_default(restored),
+                     self._initial_status_or_default(restored), src_trust,
                      src.get("created_at", now), now))
             for item in bundle.get("items", []):
                 raw_emb = item.get("embedding")
@@ -2652,6 +3270,7 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                      item.get("created_at", now), now))
                 if cursor.rowcount > 0:
                     items_imported += 1
+                    _newly_imported_item_ids.append(item["id"])
                     row = self.db.execute("SELECT rowid FROM items WHERE id = ?", (item["id"],)).fetchone()
                     if row:
                         self._fts_index(row[0], item["title"], item["content"],
@@ -2685,6 +3304,69 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                     "INSERT OR IGNORE INTO mentions (item_id, entity_id, context, created_at) "
                     "VALUES (?, ?, ?, ?)",
                     (m["item_id"], m["entity_id"], m.get("context"), m.get("created_at", now)))
+            granted_item_ids: set = set()
+            for acl in bundle.get("item_acls", []):
+                # A bundle is untrusted input: an entry that is not an object
+                # (e.g. ``[1]``) must be SKIPPED, not crash the whole import with
+                # an AttributeError -> HTTP 500. Validate the shape before reading.
+                if not isinstance(acl, dict):
+                    continue
+                # SEGMENT 3 -- grant restoration. A bundle-provided grant may only
+                # ever be MANAGED: an imported grant can carry subjects/tenant to
+                # RESTRICT, but it can never mark an item trusted-local / un-gated.
+                # So ``managed`` is FORCED to 1 regardless of what the bundle says
+                # (an explicit managed=0 is IGNORED -- an untrusted bundle cannot
+                # confer a non-managed identity). fresh_as_of is forced to 0
+                # (stale, needs revalidation) so an imported grant cannot be
+                # served live off the exporter's old confirmation.
+                item_id = acl.get("item_id")
+                if not item_id:
+                    continue
+                is_managed = 1
+                # Validate the numeric field: an untrusted bundle may carry a
+                # non-numeric acl_version, and an uncaught ValueError here would
+                # 500 the whole import. A malformed entry is SKIPPED (fail-closed).
+                try:
+                    acl_version = int(acl.get("acl_version") or 1)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "import_bundle: skipping item_acl for %r with a malformed "
+                        "acl_version", item_id)
+                    continue
+                self.db.execute(
+                    "INSERT OR IGNORE INTO item_acl "
+                    "(item_id, subjects, tenant, acl_version, managed, fresh_as_of, "
+                    "resource_ref, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (item_id, acl.get("subjects", "[]"), acl.get("tenant", ""),
+                     acl_version, is_managed, 0.0,
+                     acl.get("resource_ref"), now))
+                granted_item_ids.add(item_id)
+            # SEGMENT 2 -- item attribution. Every NEWLY-inserted imported item
+            # that did NOT already exist here as a genuine local item, and did not
+            # receive a grant above, gets a MANAGED, deny-all, stale grant. This
+            # makes it managed at query time REGARDLESS of the source id it names
+            # -- so a bundle cannot make new content trusted-local by pointing
+            # item.source_id at a pre-existing local source. An item that landed
+            # under a pre-existing-local source AND already existed here is an
+            # idempotent re-import (INSERT OR IGNORE no-op, not in
+            # _newly_imported_item_ids), so its real local trust is untouched.
+            for iid in _newly_imported_item_ids:
+                if iid in granted_item_ids:
+                    continue
+                # A newly-inserted item from an untrusted bundle is unverified
+                # content: force a managed, deny-all, stale grant so the query
+                # gate treats it as managed REGARDLESS of the source id it names.
+                # This is uniform -- even an item attached to a pre-existing local
+                # source is new bundle content, so it is fenced the same way;
+                # only items that ALREADY existed here (idempotent re-import, not
+                # in this list) keep their real, locally-established trust.
+                self.db.execute(
+                    "INSERT OR IGNORE INTO item_acl "
+                    "(item_id, subjects, tenant, acl_version, managed, fresh_as_of, "
+                    "resource_ref, updated_at) "
+                    "VALUES (?, '[]', '', 1, 1, 0.0, NULL, ?)",
+                    (iid, now))
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
