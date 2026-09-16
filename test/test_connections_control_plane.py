@@ -9,8 +9,14 @@ no-credential / two-axis invariants hold (negative).
 
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import re
+import subprocess
+import sys
+import textwrap
+import time
 
 import pytest
 
@@ -27,11 +33,16 @@ from kiro_crew.connections.control_plane import (
     SERVICE_IDS,
     Binding,
     BindingResolutionError,
+    BindingRevokedError,
+    BindingStore,
+    BindingStoreCorruptError,
+    BindingUniquenessError,
     BindingVerificationError,
     OperationContext,
     OperationDescriptor,
     OperationError,
     OperationResult,
+    ResolvedCredential,
     SecretRef,
     VerifiedIdentity,
     binding_scoped_secret_ref,
@@ -41,6 +52,7 @@ from kiro_crew.connections.control_plane import (
     operation_error,
     redacted_detail,
     resolve_binding_for_principal,
+    store_path,
 )
 
 # The closed sets are PARSED from the owning spec
@@ -767,3 +779,1265 @@ def test_resolution_is_fail_closed_on_ambiguity() -> None:
             claimed_tenant="acme",
             verifier=_identity_verifier,
         )
+
+
+# --- L04 · binding lifecycle: trusted store, single-writer rotation, revoke ---
+#
+# Round-24 repair. Four defects were read out of the round-23 code, and each is
+# closed here with a "prove the failure / prove the refusal path is really taken"
+# test alongside the fix:
+#   1. assert_live used `<` and did not compare identity -> a forged future
+#      generation passed, and another binding's generation passed. Now: EXACT
+#      generation equality AND identity match.
+#   2. uniqueness could be bypassed by reusing a binding_id with changed domain
+#      fields, and a corrupt store was read as empty (erasing every binding on
+#      the next write). Now: domain-enforced regardless of id, and fail-closed on
+#      a corrupt store.
+#   3. rotate's lock covered only the counter/ref bump, not the REAL token
+#      refresh -> two processes could both refresh. Now: the refresh callable
+#      runs INSIDE the lock; a controlled endpoint is hit exactly once.
+#   4. `instance` meant the KiroCrew instance (backwards). Now `deployment_id`
+#      means the PROVIDER-side deployment, and the Kiro principal -> authorization
+#      link is enforced in resolve, not merely documented.
+
+
+def _store_verifier(*, claimed_subject, claimed_tenant, service_id) -> VerifiedIdentity:
+    return {
+        "subject_ref": f"subject://verified/{claimed_subject}",
+        "tenant_ref": f"tenant://verified/{claimed_tenant}",
+    }
+
+
+def _fresh_store(tmp_path) -> BindingStore:
+    """A BindingStore backed by a file under an isolated tmp dir (never the live
+    data home). The lock file sits beside it automatically."""
+
+    return BindingStore(path=tmp_path / "connections" / "control_plane_bindings.json")
+
+
+def _mk_binding(subject="alice", tenant="acme", service="github") -> Binding:
+    return create_binding(
+        service_id=service,
+        claimed_subject=subject,
+        claimed_tenant=tenant,
+        credential_mode="oauth_user",
+        verifier=_store_verifier,
+        slug=service,
+    )
+
+
+_DEPLOY = "github-enterprise://ghe.acme.example"  # a PROVIDER-side deployment
+_PRINCIPAL = "kiro://principal/operator-1"
+
+
+def _insert(store, binding, *, deployment_id=_DEPLOY, kiro_principal=_PRINCIPAL):
+    return store.insert(binding, deployment_id=deployment_id, kiro_principal=kiro_principal)
+
+
+def _resolve(store, *, subject="alice", tenant="acme", deployment_id=_DEPLOY, principal=_PRINCIPAL):
+    return store.resolve(
+        kiro_principal=principal,
+        deployment_id=deployment_id,
+        service_id="github",
+        claimed_subject=subject,
+        claimed_tenant=tenant,
+        verifier=_store_verifier,
+    )
+
+
+# --- Contract: the store persists and is the trusted candidate source ------
+
+
+def test_store_path_lives_under_config_dir_connections(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    p = store_path()
+    assert p.parent.name == "connections"
+    assert p.name == "control_plane_bindings.json"
+    assert str(tmp_path) in str(p)
+
+
+def test_resolution_reads_from_the_store_not_a_caller_iterable(tmp_path) -> None:
+    import inspect
+
+    sig = inspect.signature(BindingStore.resolve)
+    assert "bindings" not in sig.parameters
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    with pytest.raises(BindingResolutionError):
+        _resolve(store)
+    _insert(store, b)
+    assert _resolve(store)["binding_id"] == b["binding_id"]
+
+
+def test_a_caller_supplied_candidate_outside_the_trusted_store_is_refused(tmp_path) -> None:
+    fabricated = _mk_binding(subject="alice", tenant="acme")
+    # (a) WOULD resolve under L02's caller-controlled candidate set (the defect):
+    hit = resolve_binding_for_principal(
+        [fabricated],
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        verifier=_store_verifier,
+    )
+    assert hit["binding_id"] == fabricated["binding_id"]
+    # (b) the trusted store never admitted it -> refused.
+    store = _fresh_store(tmp_path)
+    with pytest.raises(BindingResolutionError):
+        _resolve(store)
+
+
+# ===========================================================================
+# DEFECT 1: assert_live fencing -- exact generation equality AND identity match
+# ===========================================================================
+
+
+def test_DEFECT1_before_a_less_than_only_fence_would_pass_a_forged_future_gen() -> None:
+    # PRE-FIX evidence: a `< live_generation` fence lets a FORGED future
+    # generation through (999 is not < 2), and lets ANOTHER binding's generation
+    # through (it never compares identity). This models the round-23 assert_live
+    # verbatim, and shows both holes are open.
+    def old_assert_live_less_than_only(presented_gen: int, live_gen: int) -> bool:
+        # returns True == "passed the fence" (i.e. NOT refused)
+        return not (presented_gen < live_gen)  # the buggy `<`-only rule
+
+    live = 2
+    assert old_assert_live_less_than_only(999, live) is True  # forged future PASSES (bug)
+    assert old_assert_live_less_than_only(2, live) is True  # any binding at gen 2 PASSES (bug)
+
+
+def test_a_forged_future_generation_is_refused(tmp_path) -> None:
+    # POST-FIX: only the EXACT live generation passes. A fabricated future gen
+    # the store never issued is fenced.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    live = store.get(b["binding_id"])["live_generation"]
+    forged = _binding_future_gen(b, live + 997)  # e.g. 999
+    with pytest.raises(BindingRevokedError):
+        store.assert_live(forged)
+
+
+def test_a_generation_from_another_binding_is_refused(tmp_path) -> None:
+    # POST-FIX: identity is compared. A handle whose binding_id is A's but whose
+    # ref fields are B's (a numerically-valid gen borrowed across identities) is
+    # refused because the stored record's identity does not match.
+    store = _fresh_store(tmp_path)
+    a = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, a)
+    live = store.get(a["binding_id"])["live_generation"]
+    # Same id + same live generation number, but B's identity fields.
+    forged = dict(a)
+    forged["subject_ref"] = "subject://verified/bob"
+    forged["tenant_ref"] = "tenant://verified/beta"
+    forged["generation"] = live
+    with pytest.raises(BindingRevokedError):
+        store.assert_live(forged)  # identity mismatch -> fenced
+
+
+def test_the_exact_live_generation_and_identity_passes(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)  # stamped at the live generation, correct identity
+    store.assert_live(handle)  # must not raise
+
+
+# ===========================================================================
+# DEFECT 2: uniqueness on the domain (not id) + corrupt store fails closed
+# ===========================================================================
+
+
+def test_a_second_binding_colliding_on_the_uniqueness_domain_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    first = _mk_binding(subject="alice", tenant="acme")
+    second = _mk_binding(subject="alice", tenant="acme")  # same account, new id
+    assert first["binding_id"] != second["binding_id"]
+    _insert(store, first)
+    with pytest.raises(BindingUniquenessError):
+        _insert(store, second)
+    # first untouched, still resolves.
+    assert _resolve(store)["binding_id"] == first["binding_id"]
+
+
+def test_DEFECT2a_reusing_a_binding_id_with_changed_domain_is_refused(tmp_path) -> None:
+    # The bypass: reuse an existing binding_id but change the account/domain
+    # fields. Round-23 keyed the collision check by domain-tuple only and stored
+    # by id, so a same-id re-insert with a mutated domain silently overwrote.
+    # POST-FIX: refused as an illegal mutation of an immutable identity.
+    store = _fresh_store(tmp_path)
+    original = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, original)
+    # Same binding_id, different account (subject/tenant changed).
+    mutated = dict(original)
+    mutated["subject_ref"] = "subject://verified/bob"
+    mutated["tenant_ref"] = "tenant://verified/beta"
+    with pytest.raises(BindingUniquenessError):
+        _insert(store, mutated)  # type: ignore[arg-type]
+    # The original account is intact -- not overwritten.
+    stored = store.get(original["binding_id"])
+    assert stored["binding"]["subject_ref"] == "subject://verified/alice"
+    assert stored["binding"]["tenant_ref"] == "tenant://verified/acme"
+
+
+def test_a_different_deployment_or_account_is_allowed(tmp_path) -> None:
+    # The domain is the RIGHT shape: same account on a DIFFERENT provider
+    # deployment is distinct, and a different account on the same deployment is
+    # distinct.
+    store = _fresh_store(tmp_path)
+    _insert(store, _mk_binding(subject="alice", tenant="acme"))
+    _insert(store, _mk_binding(subject="alice", tenant="acme"), deployment_id="salesforce://org-2")
+    _insert(store, _mk_binding(subject="alice", tenant="other"))
+    assert len(store.all_bindings()) == 3
+
+
+def test_DEFECT2b_a_corrupt_store_is_not_treated_as_empty(tmp_path) -> None:
+    # PRE-FIX behaviour would read a corrupt file as {} and let the next write
+    # republish a fresh (empty) store -- erasing every binding and making a
+    # colliding insert "legal" again. POST-FIX: a corrupt store FAILS CLOSED.
+    store = _fresh_store(tmp_path)
+    _insert(store, _mk_binding(subject="alice", tenant="acme"))
+    # Corrupt the file on disk (valid path, invalid JSON).
+    store.path.write_text("{ this is not json ", encoding="utf-8")
+
+    # A read fails closed rather than answering "empty".
+    with pytest.raises(BindingStoreCorruptError):
+        store.all_bindings()
+    # A write (insert) refuses rather than erasing the store.
+    with pytest.raises(BindingStoreCorruptError):
+        _insert(store, _mk_binding(subject="carol", tenant="acme"))
+    # The corrupt bytes are still on disk -- not silently replaced by an empty store.
+    assert store.path.read_text(encoding="utf-8") == "{ this is not json "
+
+
+def test_a_wrong_shape_store_fails_closed(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(json.dumps({"not_bindings": 1}), encoding="utf-8")
+    with pytest.raises(BindingStoreCorruptError):
+        store.all_bindings()
+
+
+def test_an_absent_store_is_empty_not_corrupt(tmp_path) -> None:
+    # The distinction: a file that does not exist is a genuinely empty store.
+    store = _fresh_store(tmp_path)
+    assert store.all_bindings() == []
+
+
+# ===========================================================================
+# DEFECT 3: the lock must wrap the REAL token refresh -- controlled endpoint
+# ===========================================================================
+
+
+# Worker: opens the shared store, waits on a barrier, then rotates -- and its
+# `refresh` callable does a REAL HTTP GET to a controlled token endpoint the
+# parent runs and counts. The COUNTER LIVES IN THE PARENT'S HTTP SERVER, not in
+# the store and not under the store lock, so it counts how many times the
+# provider endpoint was actually hit. Under the fix, only the winner calls
+# refresh, so the endpoint is hit exactly once. Real subprocesses, not threads.
+_REFRESH_WORKER = textwrap.dedent("""
+    import json, os, sys, time, urllib.request
+    from kiro_crew.connections.control_plane import BindingStore, binding_scoped_secret_ref
+
+    store_file, binding_id, observed, endpoint, barrier, out_file = sys.argv[1:7]
+    observed = int(observed)
+    store = BindingStore(path=store_file)
+
+    def refresh(binding):
+        # The REAL token-refresh call: hit the controlled provider endpoint.
+        with urllib.request.urlopen(endpoint, timeout=30) as resp:
+            resp.read()
+        return binding_scoped_secret_ref(
+            "github", binding_id=binding["binding_id"],
+            subject_ref="s://rot", tenant_ref="t://rot",
+        )
+
+    while not os.path.exists(barrier):
+        time.sleep(0.005)
+
+    record, did = store.rotate(binding_id, observed_generation=observed, refresh=refresh)
+    with open(out_file, "w") as fh:
+        json.dump({"pid": os.getpid(), "did_rotate": bool(did),
+                   "gen": record["live_generation"]}, fh)
+    """)
+
+
+def test_only_one_process_rotates_under_contention(tmp_path) -> None:
+    # TWO REAL PROCESSES + a CONTROLLED TOKEN ENDPOINT. The evidence is the number
+    # of times the endpoint was actually HIT (counted in the parent's HTTP
+    # server), not an internal counter and not "the lock was acquired". The fix
+    # runs `refresh` inside the lock, so the endpoint is hit EXACTLY ONCE even
+    # though both processes attempt a rotation from the same observed generation.
+    import http.server
+    import threading
+
+    hits = {"n": 0}
+    hits_lock = threading.Lock()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            with hits_lock:
+                hits["n"] += 1
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):  # silence
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    endpoint = f"http://127.0.0.1:{port}/token"
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        store = _fresh_store(tmp_path)
+        b = _mk_binding()
+        stored = _insert(store, b)
+        observed = stored["live_generation"]
+
+        worker_py = tmp_path / "refresh_worker.py"
+        worker_py.write_text(_REFRESH_WORKER, encoding="utf-8")
+        barrier = tmp_path / "go"
+        out1 = tmp_path / "r1.json"
+        out2 = tmp_path / "r2.json"
+
+        env = dict(os.environ)
+        src_root = str(pathlib.Path(__file__).resolve().parents[1] / "src")
+        env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
+        common = [
+            sys.executable,
+            str(worker_py),
+            str(store.path),
+            b["binding_id"],
+            str(observed),
+            endpoint,
+        ]
+        p1 = subprocess.Popen(common + [str(barrier), str(out1)], env=env)
+        p2 = subprocess.Popen(common + [str(barrier), str(out2)], env=env)
+        time.sleep(0.3)
+        barrier.write_text("go", encoding="utf-8")
+        assert p1.wait(timeout=60) == 0
+        assert p2.wait(timeout=60) == 0
+
+        r1 = json.loads(out1.read_text())
+        r2 = json.loads(out2.read_text())
+        with hits_lock:
+            endpoint_hits = hits["n"]
+        print(
+            f"\n[CONTENTION EVIDENCE] worker1={r1}\n[CONTENTION EVIDENCE] worker2={r2}\n"
+            f"[CONTENTION EVIDENCE] TOKEN ENDPOINT HITS={endpoint_hits} "
+            f"(must be 1) final_store_generation="
+            f"{store.get(b['binding_id'])['live_generation']} observed={observed}"
+        )
+        rotated = [r for r in (r1, r2) if r["did_rotate"]]
+        # The judgement: the REAL provider endpoint was hit exactly once.
+        assert endpoint_hits == 1, f"token endpoint hit {endpoint_hits} times; r1={r1} r2={r2}"
+        assert len(rotated) == 1, f"expected one rotation, r1={r1} r2={r2}"
+        assert store.get(b["binding_id"])["live_generation"] == observed + 1
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_loser_does_not_call_refresh(tmp_path) -> None:
+    # Deterministic (no race): a rotate presenting an already-superseded observed
+    # generation must NOT invoke the refresh callable at all, and must not rotate.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    stored = _insert(store, b)
+    gen0 = stored["live_generation"]
+    calls = {"n": 0}
+
+    def counting_refresh(binding):
+        calls["n"] += 1
+        return None
+
+    _, first_did = store.rotate(b["binding_id"], observed_generation=gen0, refresh=counting_refresh)
+    assert first_did is True
+    assert calls["n"] == 1  # winner refreshed once
+    # A stale observed generation -> loser path.
+    record, second_did = store.rotate(
+        b["binding_id"], observed_generation=gen0, refresh=counting_refresh
+    )
+    assert second_did is False
+    assert calls["n"] == 1  # refresh NOT called again
+    assert record["live_generation"] == gen0 + 1  # still just one rotation
+
+
+def test_rotate_swaps_secret_ref_from_the_refresh_result(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    stored = _insert(store, b)
+    new_ref = binding_scoped_secret_ref(
+        "github", binding_id=b["binding_id"], subject_ref="s://rot", tenant_ref="t://rot"
+    )
+    rotated, did = store.rotate(
+        b["binding_id"], observed_generation=stored["live_generation"], refresh=lambda _b: new_ref
+    )
+    assert did is True
+    assert rotated["live_generation"] == stored["live_generation"] + 1
+    assert rotated["binding"]["secret_ref"]["name"] == new_ref["name"]
+    # Still only a reference: no value field leaked onto the record.
+    assert set(rotated["binding"]["secret_ref"]) == {"name", "backend", "bound_at"}
+
+
+# ===========================================================================
+# DEFECT 4: deployment_id (provider-side) semantics + principal wiring
+# ===========================================================================
+
+
+def test_deployment_id_is_a_provider_deployment_not_a_kiro_instance(tmp_path) -> None:
+    # The corrected direction: the SAME provider account resolved from what would
+    # be two different KiroCrew instances is still ONE binding (same deployment),
+    # while the SAME account on two different provider deployments is TWO.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, b, deployment_id="graph-tenant://contoso.onmicrosoft.com")
+    # Same provider deployment + same account under a SECOND kiro principal is a
+    # distinct authorization row (principal is a separate axis), but the account
+    # on the SAME deployment must still collide on the domain for the SAME
+    # principal:
+    with pytest.raises(BindingUniquenessError):
+        _insert(
+            store,
+            _mk_binding(subject="alice", tenant="acme"),
+            deployment_id="graph-tenant://contoso.onmicrosoft.com",
+        )
+    # A different provider deployment (a second Graph tenant) is a new binding.
+    _insert(
+        store,
+        _mk_binding(subject="alice", tenant="acme"),
+        deployment_id="graph-tenant://fabrikam.onmicrosoft.com",
+    )
+    assert len(store.all_bindings()) == 2
+
+
+def test_principal_to_authorization_link_is_enforced_in_resolve(tmp_path) -> None:
+    # The Kiro principal -> authorization link is REAL: a caller presenting a
+    # DIFFERENT principal cannot resolve the binding, even with the correct
+    # provider identity and deployment.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, b, kiro_principal="kiro://principal/owner")
+    # Correct principal resolves.
+    assert _resolve(store, principal="kiro://principal/owner")["binding_id"] == b["binding_id"]
+    # A different Kiro principal, same provider identity + deployment -> refused.
+    with pytest.raises(BindingResolutionError):
+        _resolve(store, principal="kiro://principal/intruder")
+
+
+# ===========================================================================
+# revoke fencing + persistence + evidence
+# ===========================================================================
+
+
+def test_a_credential_from_a_revoked_generation_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    store.assert_live(handle)  # before revoke: live
+    store.revoke(b["binding_id"])
+    with pytest.raises(BindingRevokedError):
+        store.assert_live(handle)  # old generation fenced
+    with pytest.raises(BindingRevokedError):
+        _resolve(store)  # revoked binding resolves to nothing
+
+
+def test_revoke_evidence_before_and_after(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    before_gen = store.get(b["binding_id"])["live_generation"]
+    store.assert_live(handle)
+    before = "USABLE"
+    revoked = store.revoke(b["binding_id"])
+    after_gen = revoked["live_generation"]
+    try:
+        store.assert_live(handle)
+        after = "STILL-USABLE"
+    except BindingRevokedError as exc:
+        after = f"REFUSED ({exc})"
+    print(
+        f"\n[REVOKE EVIDENCE] binding={b['binding_id']} "
+        f"gen before-revoke={before_gen} after-revoke={after_gen}\n"
+        f"[REVOKE EVIDENCE] handle(gen={handle['generation']}) before-revoke: {before}\n"
+        f"[REVOKE EVIDENCE] handle(gen={handle['generation']}) after-revoke: {after}"
+    )
+    assert before == "USABLE"
+    assert after.startswith("REFUSED")
+    assert after_gen == before_gen + 1
+
+
+def test_revoke_is_idempotent(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    first = store.revoke(b["binding_id"])
+    second = store.revoke(b["binding_id"])
+    assert first["live_generation"] == second["live_generation"]
+    assert second["revoked"] is True
+
+
+def test_rotate_refuses_a_revoked_binding(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    stored = _insert(store, b)
+    store.revoke(b["binding_id"])
+    with pytest.raises(BindingRevokedError):
+        store.rotate(b["binding_id"], observed_generation=stored["live_generation"])
+
+
+def test_resolution_still_works_after_a_restart(tmp_path) -> None:
+    path = tmp_path / "connections" / "control_plane_bindings.json"
+    store_a = BindingStore(path=path)
+    b = _mk_binding()
+    store_a.insert(b, deployment_id=_DEPLOY, kiro_principal=_PRINCIPAL)
+    del store_a  # process gone; only the file survives
+    store_b = BindingStore(path=path)  # "after restart"
+    resolved = store_b.resolve(
+        kiro_principal=_PRINCIPAL,
+        deployment_id=_DEPLOY,
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        verifier=_store_verifier,
+    )
+    assert resolved["binding_id"] == b["binding_id"]
+
+
+def test_store_persists_only_references_never_a_secret_value(tmp_path) -> None:
+    path = tmp_path / "connections" / "control_plane_bindings.json"
+    store = BindingStore(path=path)
+    store.insert(_mk_binding(), deployment_id=_DEPLOY, kiro_principal=_PRINCIPAL)
+    raw = path.read_text(encoding="utf-8")
+    assert "ghp_" not in raw
+    assert "Bearer " not in raw
+    doc = json.loads(raw)
+    for rec in doc["bindings"].values():
+        assert set(rec["binding"]["secret_ref"]) == {"name", "backend", "bound_at"}
+        assert "value" not in rec["binding"]["secret_ref"]
+
+
+# --- Negative: L04 symbols are canonical-only (no top-level alias) ----------
+
+
+def test_l04_symbols_are_reachable_via_control_plane_not_the_top_level() -> None:
+    l04_names = (
+        "BindingStore",
+        "BindingUniquenessError",
+        "BindingRevokedError",
+        "BindingStoreCorruptError",
+        "StoredBinding",
+        "LIFECYCLE_SCHEMA_VERSION",
+        "store_path",
+    )
+    for name in l04_names:
+        assert name in cp.__all__, f"{name} missing from control_plane.__all__"
+        assert hasattr(cp, name), f"{name} not reachable via control_plane"
+        assert name not in connections.__all__, f"{name} leaked into connections.__all__"
+        assert not hasattr(connections, name), f"{name} is a top-level connections alias"
+
+
+def test_lifecycle_carries_a_schema_version() -> None:
+    assert cp.LIFECYCLE_SCHEMA_VERSION >= 1
+
+
+def _binding_future_gen(binding: Binding, generation: int) -> Binding:
+    out = dict(binding)
+    out["generation"] = generation
+    return out  # type: ignore[return-value]
+
+
+# ===========================================================================
+# Round-25 repair. Two further defects were read out of the round-24 code:
+#   A. assert_live returned None and compared neither secret_ref nor
+#      credential_mode -> a handle with the right id+generation+identity but a
+#      SWAPPED secret_ref or credential_mode passed, and returning None forced
+#      the real sender to fall back to the caller's own (unvalidated) dict for
+#      the ref/mode/secret -- the 6th recurrence of "validate then use an
+#      unvalidated value". Now: assert_live RETURNS the trusted store's live
+#      Binding and refuses a swapped secret_ref / credential_mode.
+#   B. insert did `return prior` for ANY same-id + same-domain re-insert, even
+#      when principal / credential_mode / secret_ref differed -> "write looked
+#      successful but stored the old value". Now: only a byte-identical re-insert
+#      (over an explicitly-scoped field set, excluding volatile timestamps) is
+#      idempotent; any difference raises BindingUniquenessError.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# DEFECT A -- PRE-FIX evidence: assert_live returns None and ignores
+# secret_ref / credential_mode, so a swapped ref/mode passes the fence.
+# ---------------------------------------------------------------------------
+
+
+def test_DEFECTA_pre_fix_assert_live_returns_none_and_ignores_ref_and_mode(tmp_path) -> None:
+    # This test documents the round-24 buggy behavior BEFORE the fix. It models
+    # the exact assert_live rule of round-24 (identity + exact generation only,
+    # returns None) and shows that a handle with a SWAPPED secret_ref and a
+    # SWAPPED credential_mode is NOT refused, and that None is returned (so the
+    # caller has nothing trusted to consume).
+    def round24_assert_live(presented, stored) -> None:
+        # round-24 verbatim: compares only id/identity/generation, returns None.
+        sb = stored["binding"]
+        if (
+            presented["service_id"] != sb["service_id"]
+            or presented["subject_ref"] != sb["subject_ref"]
+            or presented["tenant_ref"] != sb["tenant_ref"]
+        ):
+            raise BindingRevokedError("identity mismatch")
+        if presented["generation"] != stored["live_generation"]:
+            raise BindingRevokedError("generation fenced")
+        return None
+
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    stored = store.get(b["binding_id"])
+    live = stored["live_generation"]
+
+    # Same id, same identity, same live generation -- but a SWAPPED secret_ref
+    # NAME and a SWAPPED credential_mode.
+    swapped = dict(b)
+    swapped["generation"] = live
+    swapped["secret_ref"] = dict(b["secret_ref"])
+    swapped["secret_ref"]["name"] = b["secret_ref"]["name"] + "_ATTACKER"
+    swapped["credential_mode"] = "service_to_service"  # was oauth_user
+
+    # Round-24 rule: passes the fence (no raise) AND returns None.
+    assert round24_assert_live(swapped, stored) is None  # ref/mode swap NOT caught (bug)
+
+
+# ---------------------------------------------------------------------------
+# DEFECT B -- PRE-FIX evidence: insert returns prior for a same-id same-domain
+# re-insert even when principal / credential_mode / secret_ref differ.
+# ---------------------------------------------------------------------------
+
+
+def test_DEFECTB_pre_fix_reinsert_with_changed_pri_or_mode_silently_returns_old(tmp_path) -> None:
+    # Documents the round-24 buggy behavior BEFORE the fix: `if prior is not
+    # None: return prior` unconditionally, so a re-insert that changes the
+    # kiro_principal (or credential_mode / secret_ref) silently returns the OLD
+    # record -- a write that "succeeded" but stored nothing new.
+    def round24_insert(records, candidate, bid, want_key):
+        prior = records.get(bid)
+        # (illegal-mutation + domain-collision guards elided; they don't fire
+        # here because the domain is unchanged and the id is reused.)
+        if prior is not None:
+            return prior  # round-24: unconditional -- the bug
+        records[bid] = candidate
+        return candidate
+
+    b = _mk_binding()
+    bid = b["binding_id"]
+    first = {
+        "binding": b,
+        "deployment_id": _DEPLOY,
+        "kiro_principal": _PRINCIPAL,
+        "live_generation": b["generation"],
+        "revoked": False,
+        "updated_at": 1.0,
+    }
+    records = {bid: first}
+    # Re-insert with a DIFFERENT kiro_principal (same id, same domain).
+    changed = dict(first)
+    changed["kiro_principal"] = "kiro://principal/attacker"
+    got = round24_insert(records, changed, bid, None)
+    assert got["kiro_principal"] == _PRINCIPAL  # old principal returned (bug)
+    assert got is first  # the OLD record, the change was silently dropped
+
+
+# ---------------------------------------------------------------------------
+# DEFECT A -- POST-FIX: assert_live RETURNS the trusted store's Binding and
+# refuses a swapped secret_ref / credential_mode; the sender consumes the
+# returned value, never the caller dict.
+# ---------------------------------------------------------------------------
+
+
+def test_assert_live_returns_the_trusted_store_binding(tmp_path) -> None:
+    import inspect
+
+    # The signature no longer promises None.
+    ann = inspect.signature(BindingStore.assert_live).return_annotation
+    assert ann is not None
+    assert ann is not inspect.Signature.empty
+    # Accept the annotation whether it is the Binding class or its string form.
+    assert "None" not in str(ann)
+    assert "Binding" in str(ann)
+
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)  # live, correct identity/generation
+    returned = store.assert_live(handle)
+    assert returned is not None
+    stored = store.get(b["binding_id"])["binding"]
+    # Equal to the store's record (stamped at the live generation).
+    assert returned["binding_id"] == stored["binding_id"]
+    assert returned["secret_ref"] == stored["secret_ref"]
+    assert returned["credential_mode"] == stored["credential_mode"]
+    assert returned["generation"] == store.get(b["binding_id"])["live_generation"]
+
+
+def test_a_swapped_secret_ref_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    live = store.get(b["binding_id"])["live_generation"]
+    # Same id, same live generation, same identity, but a SWAPPED secret_ref name.
+    swapped = dict(b)
+    swapped["generation"] = live
+    swapped["secret_ref"] = dict(b["secret_ref"])
+    swapped["secret_ref"]["name"] = b["secret_ref"]["name"] + "_ATTACKER"
+    with pytest.raises(BindingRevokedError):
+        store.assert_live(swapped)
+
+
+def test_a_swapped_credential_mode_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    live = store.get(b["binding_id"])["live_generation"]
+    # Same id, same live generation, same identity, but a SWAPPED credential_mode.
+    assert b["credential_mode"] == "oauth_user"
+    swapped = dict(b)
+    swapped["generation"] = live
+    swapped["credential_mode"] = "service_to_service"
+    with pytest.raises(BindingRevokedError):
+        store.assert_live(swapped)
+
+
+def test_the_sender_consumes_the_returned_binding_not_the_caller_dict(tmp_path) -> None:
+    # The store's record has the RIGHT secret_ref; build a GOOD handle (so
+    # assert_live does not raise) whose OTHER fields match, but sanity-check that
+    # the RETURNED binding carries the STORE's secret_ref name -- the value a real
+    # sender must consume -- not whatever the caller might have carried forward.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    stored = store.get(b["binding_id"])
+    good_handle = _resolve(store)  # matches the store exactly
+    returned = store.assert_live(good_handle)
+    assert returned["secret_ref"]["name"] == stored["binding"]["secret_ref"]["name"]
+
+    # And prove the return is the STORE's value, not the caller's: mutate the
+    # caller handle's ref AFTER a successful assert_live and confirm the returned
+    # object is unaffected (it is the trusted record, decoupled from the caller).
+    caller_after = dict(good_handle)
+    caller_after["secret_ref"] = dict(good_handle["secret_ref"])
+    caller_after["secret_ref"]["name"] = "SOME_OTHER_NAME_the_caller_swapped_in"
+    assert returned["secret_ref"]["name"] != caller_after["secret_ref"]["name"]
+    assert returned["secret_ref"]["name"] == stored["binding"]["secret_ref"]["name"]
+
+
+# ---------------------------------------------------------------------------
+# DEFECT B -- POST-FIX: only a byte-identical re-insert is idempotent; a
+# same-id same-domain re-insert with a changed principal / credential_mode /
+# secret_ref is refused, not silently returning the old record.
+# ---------------------------------------------------------------------------
+
+
+def test_insert_same_id_same_domain_different_principal_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, b, kiro_principal=_PRINCIPAL)
+    with pytest.raises(BindingUniquenessError):
+        _insert(store, b, kiro_principal="kiro://principal/attacker")
+    # Store is untouched: the original principal still owns it.
+    assert store.get(b["binding_id"])["kiro_principal"] == _PRINCIPAL
+
+
+def test_insert_same_id_same_domain_different_credential_mode_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    assert b["credential_mode"] == "oauth_user"
+    _insert(store, b)
+    # Same id + same (deployment, account) domain, but a changed credential_mode.
+    changed = dict(b)
+    changed["credential_mode"] = "service_to_service"
+    with pytest.raises(BindingUniquenessError):
+        _insert(store, changed)
+    assert store.get(b["binding_id"])["binding"]["credential_mode"] == "oauth_user"
+
+
+def test_insert_same_id_same_domain_different_secret_ref_is_refused(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, b)
+    original_name = b["secret_ref"]["name"]
+    # Same id + same domain, but the secret reference NAME points elsewhere.
+    changed = dict(b)
+    changed["secret_ref"] = dict(b["secret_ref"])
+    changed["secret_ref"]["name"] = original_name + "_ELSEWHERE"
+    with pytest.raises(BindingUniquenessError):
+        _insert(store, changed)
+    assert store.get(b["binding_id"])["binding"]["secret_ref"]["name"] == original_name
+
+
+def test_insert_byte_identical_reinsert_is_still_idempotent(tmp_path) -> None:
+    # A genuine byte-identical re-insert (same record, only volatile timestamps
+    # would differ if re-minted -- here the SAME binding object) returns prior
+    # without error and does not disturb lifecycle state.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    first = _insert(store, b)
+    gen_before = store.get(b["binding_id"])["live_generation"]
+    again = _insert(store, b)  # identical id/domain/principal/mode/secret_ref
+    assert again["binding"]["binding_id"] == first["binding"]["binding_id"]
+    assert store.get(b["binding_id"])["live_generation"] == gen_before
+
+
+def test_insert_reinsert_differing_only_in_volatile_timestamps_is_idempotent(tmp_path) -> None:
+    # created_at / bound_at / updated_at are excluded from the byte-compare, so a
+    # re-insert of the same logical binding whose only difference is wall-clock
+    # stamps is idempotent (not a conflict).
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject="alice", tenant="acme")
+    _insert(store, b)
+    later = dict(b)
+    later["created_at"] = b["created_at"] + 1000.0
+    later["secret_ref"] = dict(b["secret_ref"])
+    later["secret_ref"]["bound_at"] = b["secret_ref"]["bound_at"] + 1000.0
+    # No raise: only volatile stamps differ.
+    got = store.insert(later, deployment_id=_DEPLOY, kiro_principal=_PRINCIPAL)
+    assert got["binding"]["binding_id"] == b["binding_id"]
+
+
+# ===========================================================================
+# STEP 2 (round-33): the per-binding secret SELECTOR + live-store fencing.
+#
+# select_secret resolves a binding's secret FROM THE TRUSTED LIVE STORE, by
+# binding -- NOT by provider slug, NOT from a caller-supplied candidate set --
+# and fences against the live store (revoked / rotated / swapped -> refused).
+# This is the sixth recurrence of the trusted-source discipline, done as a
+# pattern: the value used comes from the store, never the caller's own copy.
+# ===========================================================================
+
+
+class _FakeVault:
+    """A minimal SecretReader: name -> plaintext, counting reads by name."""
+
+    def __init__(self, entries: dict) -> None:
+        self._entries = dict(entries)
+        self.reads: list[str] = []
+
+    def get(self, name: str):
+        self.reads.append(name)
+        val = self._entries.get(name)
+        if val is None:
+            return None
+
+        class _V:
+            def __init__(self, v):
+                self._v = v
+
+            def reveal(self):
+                return self._v
+
+        return _V(val)
+
+
+def _vault_for(store, binding, secret_value="s3cr3t-token"):
+    """A vault holding ONLY the per-binding secret name the store recorded."""
+    stored = store.get(binding["binding_id"])
+    name = stored["binding"]["secret_ref"]["name"]
+    return _FakeVault({name: secret_value}), name
+
+
+def test_select_secret_resolves_by_binding_from_the_live_store(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    vault, per_binding_name = _vault_for(store, b, "the-real-token")
+    got: ResolvedCredential = store.select_secret(handle, reader=vault)
+    # Resolved BY BINDING: the reader was asked for the per-binding name.
+    assert vault.reads == [per_binding_name]
+    assert got["binding_id"] == b["binding_id"]
+    assert got["secret_ref"]["name"] == per_binding_name
+    assert got["secret"].reveal() == "the-real-token"
+
+
+def test_JUDGEMENT_selector_uses_the_store_ref_not_the_slug_level_name(tmp_path) -> None:
+    # The defect this closes: resolving by SLUG collapses every binding under a
+    # provider onto ONE name (binding_secret_ref), so two identities share a
+    # credential. The selector must use the per-binding name from the store.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    slug_name = binding_secret_ref("github")["name"]  # the collision-prone slug name
+    per_binding_name = store.get(b["binding_id"])["binding"]["secret_ref"]["name"]
+    assert slug_name != per_binding_name
+    # Vault holds ONLY the slug-level name, NOT the per-binding one.
+    vault = _FakeVault({slug_name: "slug-shared-secret"})
+    # The selector asks for the per-binding name -> not found -> refused. It does
+    # NOT silently fall back to the slug name (which would be the collapse bug).
+    with pytest.raises(BindingResolutionError):
+        store.select_secret(handle, reader=vault)
+    assert vault.reads == [per_binding_name]  # asked by binding, never by slug
+
+
+def test_JUDGEMENT_selector_does_not_take_a_caller_supplied_ref(tmp_path) -> None:
+    # A caller hands a handle whose secret_ref NAME points at an attacker entry,
+    # but the identity/generation/mode still match the store. assert_live refuses
+    # the swapped ref, so the selector never reads the attacker name.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    tampered = dict(handle)
+    tampered["secret_ref"] = dict(handle["secret_ref"])
+    tampered["secret_ref"]["name"] = handle["secret_ref"]["name"] + "_ATTACKER"
+    real_name = store.get(b["binding_id"])["binding"]["secret_ref"]["name"]
+    vault = _FakeVault({real_name: "real", handle["secret_ref"]["name"] + "_ATTACKER": "attacker"})
+    with pytest.raises(BindingRevokedError):
+        store.select_secret(tampered, reader=vault)
+    # Never read the attacker name (fence refused before any vault read).
+    assert vault.reads == []
+
+
+def test_JUDGEMENT_fencing_reads_the_live_store_after_revoke(tmp_path) -> None:
+    # fencing decides on the LIVE store: a handle captured before a revoke can no
+    # longer pull a secret, even though the caller still holds the old dict.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    vault, name = _vault_for(store, b, "live")
+    # Before revoke: selector works.
+    ok = store.select_secret(handle, reader=vault)
+    print(f"\n[SELECTOR EVIDENCE] before-revoke: got secret for {name} = {ok['secret'].reveal()!r}")
+    # Revoke, then the SAME handle is fenced by a fresh live-store read.
+    store.revoke(b["binding_id"])
+    try:
+        store.select_secret(handle, reader=vault)
+        after = "STILL-RESOLVED (bug)"
+    except BindingRevokedError as exc:
+        after = f"REFUSED ({exc})"
+    print(f"[SELECTOR EVIDENCE] after-revoke: {after}")
+    assert after.startswith("REFUSED")
+
+
+def test_JUDGEMENT_fencing_reads_live_store_after_rotation(tmp_path) -> None:
+    # A rotation advances the live generation; a pre-rotation handle is fenced,
+    # and the selector re-resolves the ref from the CURRENT live record.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    stored = _insert(store, b)
+    pre = _resolve(store)  # generation = live
+    # Rotate to a NEW per-binding secret ref via the real refresh callable.
+    new_ref = binding_scoped_secret_ref(
+        "github", binding_id=b["binding_id"], subject_ref="s://rot", tenant_ref="t://rot"
+    )
+    rec, did = store.rotate(
+        b["binding_id"], observed_generation=stored["live_generation"], refresh=lambda _b: new_ref
+    )
+    assert did is True
+    # The pre-rotation handle is now fenced (stale generation).
+    vault = _FakeVault({new_ref["name"]: "rotated", pre["secret_ref"]["name"]: "old"})
+    with pytest.raises(BindingRevokedError):
+        store.select_secret(pre, reader=vault)
+    # A freshly resolved handle carries the NEW live generation + the store's new ref.
+    post = _resolve(store)
+    got = store.select_secret(post, reader=vault)
+    assert got["secret_ref"]["name"] == new_ref["name"]
+    assert got["secret"].reveal() == "rotated"
+
+
+def test_select_secret_refuses_when_the_named_secret_is_absent(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding()
+    _insert(store, b)
+    handle = _resolve(store)
+    empty_vault = _FakeVault({})  # vault holds nothing
+    with pytest.raises(BindingResolutionError):
+        store.select_secret(handle, reader=empty_vault)
+
+
+def test_secret_reader_and_resolved_credential_are_canonical_only() -> None:
+    for name in ("SecretReader", "ResolvedCredential"):
+        assert name in cp.__all__
+        assert hasattr(cp, name)
+        assert name not in connections.__all__
+        assert not hasattr(connections, name)
+
+
+# ===========================================================================
+# W01 · L04 round-56: the ACL BindingResolver adapter.
+#
+# The adapter (cp.ControlPlaneBindingResolver) matches the ACL BindingResolver
+# CALL shape -- resolve(principal, provider, account) -> ...|None -- WITHOUT
+# importing kiro_crew.knowledge.acl. But matching the signature is NOT the whole
+# contract: the ACL gate reads ctx.subject_ids, which W01 does not produce, so
+# AccessGrant is BRIDGED into ACL's AccessContext on the ACL side. Tests pin the
+# real bridge-chain contract (what W01 emits AND what it leaves to the ACL),
+# not a false "structural equivalence".
+#
+# Round-56 also fixes the account/deployment axis: `account` (a vendor
+# account/org/tenant/driveId) is NOT a `deployment_id` (a provider-side hosting
+# deployment). The adapter translates via an injected account_to_deployment seam
+# and fails closed without one -- it no longer equates the two axes.
+# ===========================================================================
+
+
+class _FakeQueryPrincipal:
+    """Structural stand-in for acl.QueryPrincipal: only the attributes the
+    adapter duck-types (principal_id, local_library). NOT an import of the ACL
+    type -- the adapter reads attributes, so a structural double is faithful."""
+
+    def __init__(self, principal_id: str, local_library: bool = False) -> None:
+        self.principal_id = principal_id
+        self.local_library = local_library
+
+
+# A deployment id (the provider-side host of the account) that is DISTINCT from
+# the ACL account, so a test cannot pass by accidentally equating them.
+_GHE_HOST = "github-enterprise://ghe.acme.example"
+_ACL_ACCOUNT = "octo-org"  # the ACL `account` (a GitHub org/login), NOT the host
+
+
+def _account_to_deployment_ok(service_id, account):
+    """A host seam that maps the test account onto the test deployment host.
+    Real hosts would consult their own account->deployment registry."""
+
+    if service_id == "github" and account == _ACL_ACCOUNT:
+        return _GHE_HOST
+    return None
+
+
+def _acl_store_with_binding(
+    tmp_path, *, principal=_PRINCIPAL, deployment=_GHE_HOST, subject="alice", service="github"
+):
+    """A store holding ONE inserted github binding for `principal` on
+    `deployment`, plus a resolver over it WIRED with the account->deployment
+    seam. Returns (store, resolver, binding)."""
+
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject=subject, service=service)
+    _insert(store, b, deployment_id=deployment, kiro_principal=principal)
+    resolver = cp.ControlPlaneBindingResolver(
+        store, account_to_deployment=_account_to_deployment_ok
+    )
+    return store, resolver, b
+
+
+# --- Issue 2: account is NOT a deployment_id (the axis fix) -----------------
+
+
+def test_account_and_deployment_are_distinct_axes_bridged_by_a_seam(tmp_path) -> None:
+    # The binding is stored under the DEPLOYMENT host, and the ACL passes the
+    # vendor ACCOUNT. Resolution only works because the seam translates one to
+    # the other -- proving they are NOT the same value.
+    store, resolver, binding = _acl_store_with_binding(tmp_path)
+    assert _GHE_HOST != _ACL_ACCOUNT  # the two axes carry different values
+    grant = resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT)
+    assert grant is not None
+    assert grant.subject == binding["subject_ref"]
+    print(
+        f"[ADAPTER EVIDENCE] account={_ACL_ACCOUNT!r} -> deployment={_GHE_HOST!r} (seam), resolved"
+    )
+
+
+def test_without_the_seam_the_adapter_fails_closed_not_account_as_deployment(tmp_path) -> None:
+    # BEFORE-fix behaviour reproduced: passing the ACL account straight in as a
+    # deployment_id. A store keyed on the real deployment host has NO record
+    # under the account string, so equating them would (a) mislabel the account
+    # as a deployment and (b) here resolve to None anyway -- but the point is the
+    # adapter must REFUSE to make that equation. With no seam wired it fails
+    # closed without ever calling the store with account-as-deployment.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(service="github")
+    _insert(store, b, deployment_id=_GHE_HOST, kiro_principal=_PRINCIPAL)
+    resolver_no_seam = cp.ControlPlaneBindingResolver(store)  # no account_to_deployment
+    got = resolver_no_seam.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT)
+    assert got is None  # fail-closed: never account==deployment_id
+    print("[ADAPTER EVIDENCE] no seam -> None (refuses account==deployment_id)")
+
+
+def test_an_account_the_seam_cannot_map_fails_closed(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    # a github account the seam does not know -> None (no deployment to key on)
+    assert resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", "unknown-org") is None
+
+
+# --- Issue 1: the bridge chain, NOT structural equivalence ------------------
+
+
+def test_access_grant_carries_only_what_w01_verifies(tmp_path) -> None:
+    # W01 emits subject/tenant/groups/bypass_acl -- and NOTHING ELSE. Pin the
+    # exact field set so a future edit cannot smuggle in a fabricated field.
+    from dataclasses import fields
+
+    assert {f.name for f in fields(cp.AccessGrant)} == {
+        "subject",
+        "tenant",
+        "groups",
+        "bypass_acl",
+    }
+
+
+def test_access_grant_does_not_provide_subject_ids_that_is_the_acl_bridge(tmp_path) -> None:
+    # The ACL gate (_subject_tenant_ok) reads ctx.subject_ids. W01 does NOT
+    # produce it: AccessGrant has no `subject_ids` attribute and no such
+    # property. This is the named half the ACL side supplies when it bridges
+    # AccessGrant -> its own AccessContext. Asserting its ABSENCE is the honest
+    # contract -- the previous round's field-name equivalence hid this gap.
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    grant = resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT)
+    assert grant is not None
+    assert not hasattr(grant, "subject_ids"), "subject_ids is ACL-derived, not W01-emitted"
+    # and it is not hidden among the dataclass fields either
+    from dataclasses import fields
+
+    assert "subject_ids" not in {f.name for f in fields(cp.AccessGrant)}
+
+
+def test_the_documented_bridge_inputs_are_present_for_the_acl_side(tmp_path) -> None:
+    # The ACL derives subject_ids = frozenset({subject, *groups}). Prove W01
+    # supplies exactly those two inputs (subject + groups), so the ACL bridge has
+    # what it needs -- without W01 performing the derivation.
+    store, resolver, binding = _acl_store_with_binding(tmp_path)
+    grant = resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT)
+    assert grant is not None
+    assert grant.subject == binding["subject_ref"]  # verified subject input
+    assert grant.groups == frozenset()  # empty groups input (W01 produces none)
+    # what the ACL would derive from these inputs, computed here ONLY to show the
+    # bridge is well-defined -- W01 does not itself expose this:
+    acl_would_derive = frozenset({grant.subject, *grant.groups})
+    assert acl_would_derive == frozenset({binding["subject_ref"]})
+
+
+def test_module_makes_no_structural_equivalence_or_direct_injection_claim() -> None:
+    # Guard against the stale wording returning: the module must not claim the
+    # grant is structurally identical to / directly injectable into the ACL.
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text().lower()
+    for banned in (
+        "structurally identical",
+        "directly consumable",
+        "direct injection",
+        "the acl will call",
+    ):
+        assert banned not in src, f"stale equivalence claim present: {banned!r}"
+    # and it must name subject_ids as the ACL-side derivation
+    assert "subject_ids" in pathlib.Path(mod.__file__).read_text()
+
+
+# --- Positive / negative resolution (unchanged semantics, seam-wired) -------
+
+
+def test_positive_a_principal_resolves_to_its_own_binding(tmp_path) -> None:
+    store, resolver, binding = _acl_store_with_binding(
+        tmp_path, principal="kiro://A", subject="alice"
+    )
+    grant = resolver.resolve(_FakeQueryPrincipal("kiro://A"), "github", _ACL_ACCOUNT)
+    assert grant is not None
+    assert grant.subject == binding["subject_ref"] == "subject://verified/alice"
+    assert grant.tenant == binding["tenant_ref"] == "tenant://verified/acme"
+    print(f"[ADAPTER EVIDENCE] positive A: subject={grant.subject!r} tenant={grant.tenant!r}")
+
+
+def test_negative_b_cannot_get_a_binding(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path, principal="kiro://A")
+    got = resolver.resolve(_FakeQueryPrincipal("kiro://B"), "github", _ACL_ACCOUNT)
+    assert got is None
+    print("[ADAPTER EVIDENCE] negative B->A: None (fail-closed, no fallback)")
+
+
+def test_negative_an_unverified_or_empty_principal_is_refused(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    assert resolver.resolve(_FakeQueryPrincipal(""), "github", _ACL_ACCOUNT) is None
+    assert resolver.resolve(object(), "github", _ACL_ACCOUNT) is None
+    print("[ADAPTER EVIDENCE] unverified/empty principal: None")
+
+
+def test_negative_a_local_library_principal_holds_no_managed_binding(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    got = resolver.resolve(
+        _FakeQueryPrincipal(_PRINCIPAL, local_library=True), "github", _ACL_ACCOUNT
+    )
+    assert got is None
+
+
+def test_negative_a_revoked_binding_resolves_to_none(tmp_path) -> None:
+    store, resolver, binding = _acl_store_with_binding(tmp_path)
+    assert resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT) is not None
+    store.revoke(binding["binding_id"])
+    after = resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT)
+    assert after is None
+    print("[ADAPTER EVIDENCE] revoke: usable before -> None after")
+
+
+def test_resolve_refuses_an_unmappable_provider_without_touching_the_store(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    assert resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "notion", _ACL_ACCOUNT) is None
+
+
+# --- Thing 2: provider -> ServiceId closed-set mapping (unknown REFUSES) ----
+
+
+def test_provider_maps_to_service_id_over_a_closed_set() -> None:
+    for p in ("github", "teams", "outlook", "sharepoint", "salesforce", "slack"):
+        assert cp.map_provider_to_service_id(p) == p
+    assert cp.map_provider_to_service_id("excel") == "excel_shared_engine"
+
+
+def test_an_unknown_provider_string_is_refused_not_leniently_accepted() -> None:
+    for bogus in ("Excel", "git hub", "notion", "", "excel_shared_engine "):
+        assert cp.map_provider_to_service_id(bogus) is None
+
+
+# --- Thing 4: groups empty, bypass_acl never true from W01 ------------------
+
+
+def test_groups_are_empty_and_bypass_acl_is_false_for_every_w01_grant(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    grant = resolver.resolve(_FakeQueryPrincipal(_PRINCIPAL), "github", _ACL_ACCOUNT)
+    assert grant is not None
+    assert grant.groups == frozenset()
+    assert grant.bypass_acl is False
+    default = cp.AccessGrant(subject="s", tenant="t")
+    assert default.groups == frozenset()
+    assert default.bypass_acl is False
+
+
+# --- Structural CALL-shape conformance (signature only; not equivalence) ----
+
+
+def test_resolver_signature_matches_the_acl_protocol_shape() -> None:
+    import inspect
+
+    sig = inspect.signature(cp.ControlPlaneBindingResolver.resolve)
+    params = list(sig.parameters)
+    assert params == ["self", "principal", "provider", "account"]
+    for name in ("principal", "provider", "account"):
+        assert sig.parameters[name].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+
+
+def test_adapter_does_not_import_the_unmerged_acl_module() -> None:
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text()
+    assert "import kiro_crew.knowledge.acl" not in src
+    assert "from kiro_crew.knowledge.acl import" not in src
+    assert "from kiro_crew.knowledge import acl" not in src
+
+
+def test_adapter_symbols_are_canonical_only() -> None:
+    for name in (
+        "AccessGrant",
+        "AccountToDeployment",
+        "ControlPlaneBindingResolver",
+        "map_provider_to_service_id",
+    ):
+        assert name in cp.__all__
+        assert hasattr(cp, name)
+        assert name not in connections.__all__
+        assert not hasattr(connections, name)

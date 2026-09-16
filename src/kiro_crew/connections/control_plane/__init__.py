@@ -23,6 +23,12 @@ re-export these symbols, so consumers import them from
 ``kiro_crew.connections.<name>`` aliases.
 """
 
+from kiro_crew.connections.control_plane.acl_binding_resolver import (
+    AccessGrant,
+    AccountToDeployment,
+    ControlPlaneBindingResolver,
+    map_provider_to_service_id,
+)
 from kiro_crew.connections.control_plane.binding import (
     BINDING_SCHEMA_VERSION,
     INITIAL_GENERATION,
@@ -52,6 +58,17 @@ from kiro_crew.connections.control_plane.errors import (
     operation_error,
     redacted_detail,
 )
+from kiro_crew.connections.control_plane.lifecycle import (
+    LIFECYCLE_SCHEMA_VERSION,
+    BindingRevokedError,
+    BindingStore,
+    BindingStoreCorruptError,
+    BindingUniquenessError,
+    ResolvedCredential,
+    SecretReader,
+    StoredBinding,
+    store_path,
+)
 from kiro_crew.connections.control_plane.operation import (
     CREDENTIAL_MODES,
     EFFECTS,
@@ -79,6 +96,7 @@ __all__ = [
     "ERRORS_SCHEMA_VERSION",
     "ERROR_CLASSES",
     "INITIAL_GENERATION",
+    "LIFECYCLE_SCHEMA_VERSION",
     "MAX_ERROR_CHARS",
     "OPERATION_KINDS",
     "OPERATION_SCHEMA_VERSION",
@@ -86,9 +104,16 @@ __all__ = [
     "RESULT_STATUSES",
     "SECRET_BACKEND_VAULT",
     "SERVICE_IDS",
+    "AccessGrant",
+    "AccountToDeployment",
     "Binding",
     "BindingResolutionError",
+    "BindingRevokedError",
+    "BindingStore",
+    "BindingStoreCorruptError",
+    "BindingUniquenessError",
     "BindingVerificationError",
+    "ControlPlaneBindingResolver",
     "CredentialMode",
     "Effect",
     "ErrorClass",
@@ -97,16 +122,21 @@ __all__ = [
     "OperationError",
     "OperationKind",
     "OperationResult",
+    "ResolvedCredential",
     "ResultStatus",
+    "SecretReader",
     "SecretRef",
     "ServiceId",
+    "StoredBinding",
     "SubjectTenantVerifier",
     "VerifiedIdentity",
     "binding_scoped_secret_ref",
     "binding_secret_ref",
     "create_binding",
+    "map_provider_to_service_id",
     "next_generation",
     "operation_error",
     "redacted_detail",
     "resolve_binding_for_principal",
+    "store_path",
 ]
