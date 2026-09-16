@@ -20,16 +20,27 @@ from kiro_crew.connections.control_plane import (
     CREDENTIAL_MODES,
     EFFECTS,
     ERROR_CLASSES,
+    INITIAL_GENERATION,
     MAX_ERROR_CHARS,
     OPERATION_KINDS,
     RESULT_STATUSES,
     SERVICE_IDS,
+    Binding,
+    BindingResolutionError,
+    BindingVerificationError,
     OperationContext,
     OperationDescriptor,
     OperationError,
     OperationResult,
+    SecretRef,
+    VerifiedIdentity,
+    binding_scoped_secret_ref,
+    binding_secret_ref,
+    create_binding,
+    next_generation,
     operation_error,
     redacted_detail,
+    resolve_binding_for_principal,
 )
 
 # The closed sets are PARSED from the owning spec
@@ -371,3 +382,388 @@ def test_success_partial_and_error_partial_are_distinct_concepts() -> None:
     assert "partial" in RESULT_STATUSES
     assert "partial" in ERROR_CLASSES
     assert set(RESULT_STATUSES).isdisjoint(set(ERROR_CLASSES) - {"partial"})
+
+
+# --- L02 · AUTH-01 binding record ------------------------------------------
+#
+# The binding is the record a context's ``binding_ref`` points at. Its four
+# properties each get a distinct test: random id (negative), verified-only
+# subject/tenant (fault + negative), generation increment (contract), and
+# secret-is-a-reference-never-a-value (negative). A verifier stub stands in for
+# the real IO-doing verifier a later leaf provides.
+
+
+def _accepting_verifier(*, claimed_subject, claimed_tenant, service_id) -> VerifiedIdentity:
+    """A verifier that verifies the claim and normalizes it to canonical refs.
+
+    Deliberately RETURNS DIFFERENT strings than the caller claimed, so a test
+    can prove the binding stores the verifier's output rather than the raw
+    claim.
+    """
+
+    return {
+        "subject_ref": f"subject://verified/{claimed_subject}",
+        "tenant_ref": f"tenant://verified/{claimed_tenant}",
+    }
+
+
+def _rejecting_verifier(*, claimed_subject, claimed_tenant, service_id) -> VerifiedIdentity:
+    raise BindingVerificationError("claimed subject/tenant did not verify")
+
+
+def _make_binding() -> Binding:
+    return create_binding(
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_accepting_verifier,
+        slug="github",
+    )
+
+
+# --- Contract --------------------------------------------------------------
+
+
+def test_binding_has_a_schema_version() -> None:
+    assert cp.BINDING_SCHEMA_VERSION >= 1
+
+
+def test_binding_typed_dict_has_every_declared_field() -> None:
+    binding = _make_binding()
+    assert set(binding) == set(Binding.__annotations__)
+    secret_ref: SecretRef = binding["secret_ref"]
+    assert set(secret_ref) == set(SecretRef.__annotations__)
+
+
+def test_created_binding_starts_at_the_initial_generation() -> None:
+    assert _make_binding()["generation"] == INITIAL_GENERATION
+
+
+def test_next_generation_increments_by_one_and_carries_every_other_field() -> None:
+    binding = _make_binding()
+    bumped = next_generation(binding)
+    assert bumped["generation"] == binding["generation"] + 1
+    # Every other field is carried through unchanged.
+    for field in set(Binding.__annotations__) - {"generation"}:
+        assert bumped[field] == binding[field]
+
+
+def test_next_generation_is_monotonic_over_repeated_bumps() -> None:
+    binding = _make_binding()
+    gens = [binding["generation"]]
+    for _ in range(5):
+        binding = next_generation(binding)
+        gens.append(binding["generation"])
+    assert gens == sorted(gens)
+    assert gens == list(range(INITIAL_GENERATION, INITIAL_GENERATION + 6))
+
+
+def test_next_generation_does_not_mutate_the_input() -> None:
+    binding = _make_binding()
+    before = binding["generation"]
+    next_generation(binding)
+    assert binding["generation"] == before  # caller's record is untouched
+
+
+def test_legacy_binding_secret_ref_is_slug_level_not_identity_bound() -> None:
+    # binding_secret_ref is the LEGACY slug-level name, retained for compat. It
+    # follows the CONNECTIONS_<SLUG>_ family oauth_clients uses, with the
+    # binding suffix distinguishing it from _CLIENT_SECRET. It is NOT what a
+    # binding stores (that is binding_scoped_secret_ref) precisely because it is
+    # keyed by slug alone.
+    ref = binding_secret_ref("google-drive")
+    assert ref["name"] == "CONNECTIONS_GOOGLE_DRIVE_BINDING_SECRET"
+    assert ref["backend"] == cp.SECRET_BACKEND_VAULT
+    assert isinstance(ref["bound_at"], float)
+
+
+def test_scoped_secret_ref_differs_per_identity_same_slug() -> None:
+    # The per-binding name a binding actually stores: same slug, two different
+    # identities -> two different vault names.
+    a = binding_scoped_secret_ref(
+        "github", binding_id="id-a", subject_ref="s://a", tenant_ref="t://a"
+    )
+    b = binding_scoped_secret_ref(
+        "github", binding_id="id-b", subject_ref="s://b", tenant_ref="t://b"
+    )
+    assert a["name"] != b["name"]
+    assert a["name"].startswith("CONNECTIONS_GITHUB_BINDING_")
+    assert a["name"].endswith("_SECRET")
+    # Same identity -> stable name (deterministic scope).
+    a2 = binding_scoped_secret_ref(
+        "github", binding_id="id-a", subject_ref="s://a", tenant_ref="t://a"
+    )
+    assert a["name"] == a2["name"]
+
+
+# --- Fault -----------------------------------------------------------------
+
+
+def test_create_binding_refuses_when_verification_fails() -> None:
+    with pytest.raises(BindingVerificationError):
+        create_binding(
+            service_id="github",
+            claimed_subject="mallory",
+            claimed_tenant="evil-corp",
+            credential_mode="oauth_user",
+            verifier=_rejecting_verifier,
+            slug="github",
+        )
+
+
+def test_a_rejected_binding_is_never_partially_built() -> None:
+    # The verifier runs BEFORE anything is minted, so a rejection leaves no
+    # record at all -- the only observable is the raised error.
+    seen: list[str] = []
+
+    def _recording_reject(*, claimed_subject, claimed_tenant, service_id):
+        seen.append("verifier-ran")
+        raise BindingVerificationError("nope")
+
+    with pytest.raises(BindingVerificationError):
+        create_binding(
+            service_id="slack",
+            claimed_subject="x",
+            claimed_tenant="y",
+            credential_mode="service_to_service",
+            verifier=_recording_reject,
+            slug="slack",
+        )
+    assert seen == ["verifier-ran"]
+
+
+# --- Negative --------------------------------------------------------------
+
+
+def test_binding_stores_the_verified_identity_not_the_raw_claim() -> None:
+    binding = create_binding(
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_accepting_verifier,
+        slug="github",
+    )
+    # The verifier normalized the claim; the binding must carry ITS output.
+    assert binding["subject_ref"] == "subject://verified/alice"
+    assert binding["tenant_ref"] == "tenant://verified/acme"
+    # And never the raw claimed values verbatim.
+    assert binding["subject_ref"] != "alice"
+    assert binding["tenant_ref"] != "acme"
+
+
+def test_binding_id_is_random_not_derived_from_slug_tenant_or_subject() -> None:
+    # Two bindings with IDENTICAL inputs must still get different ids: the id is
+    # random, not a function of any input. (A derived id would collide here.)
+    a = _make_binding()
+    b = _make_binding()
+    assert a["binding_id"] != b["binding_id"]
+    # The id does not embed the slug/tenant/subject, so it cannot be
+    # reconstructed from those (often public) values.
+    for token in ("github", "alice", "acme", "verified"):
+        assert token not in a["binding_id"]
+    # Hex handle of the advertised width (128 bits -> 32 hex chars).
+    assert len(a["binding_id"]) == 32
+    int(a["binding_id"], 16)  # pure hex, raises if not
+
+
+def test_binding_ids_do_not_repeat_across_many_mints() -> None:
+    ids = {_make_binding()["binding_id"] for _ in range(200)}
+    assert len(ids) == 200  # no collisions -> genuinely random, not sequential
+
+
+def test_secret_ref_carries_only_a_reference_never_a_value() -> None:
+    # The whole binding record, recursively stringified, must not contain a
+    # secret value: it holds a NAME and metadata only. Feed a credential-shaped
+    # value through the flow to prove none of it can land on the record.
+    fake_secret = "ghp_" + "s" * 36
+    binding = _make_binding()
+    blob = repr(binding)
+    assert fake_secret not in blob
+    # secret_ref exposes name + backend + bound_at, and nothing that could be a
+    # value field.
+    assert set(binding["secret_ref"]) == {"name", "backend", "bound_at"}
+    assert "value" not in binding["secret_ref"]
+    assert "secret" not in Binding.__annotations__  # no bare secret value field
+
+
+def test_binding_credential_mode_is_axis_b_from_l01() -> None:
+    # The binding's credential_mode is the L01 Axis-B closed set, not a new one.
+    binding = create_binding(
+        service_id="salesforce",
+        claimed_subject="s",
+        claimed_tenant="t",
+        credential_mode="fine_grained_pat",
+        verifier=_accepting_verifier,
+        slug="salesforce",
+    )
+    assert binding["credential_mode"] in CREDENTIAL_MODES
+
+
+def test_binding_symbols_are_reachable_via_control_plane_not_the_top_level() -> None:
+    # The canonical home for the L02 binding names is the control_plane
+    # subpackage; the top-level connections package deliberately carries NO
+    # control-plane symbol (the 14-alias second-spelling was a rename trap and
+    # was converged away). Same shape as L01's registration-mode guard: pin
+    # where a name lives, and pin where it must NOT be aliased.
+    binding_names = (
+        "Binding",
+        "SecretRef",
+        "VerifiedIdentity",
+        "SubjectTenantVerifier",
+        "BindingVerificationError",
+        "BindingResolutionError",
+        "create_binding",
+        "next_generation",
+        "binding_secret_ref",
+        "binding_scoped_secret_ref",
+        "resolve_binding_for_principal",
+        "INITIAL_GENERATION",
+    )
+    for name in binding_names:
+        # Reachable through the canonical control_plane subpackage...
+        assert name in cp.__all__, f"{name} missing from control_plane.__all__"
+        assert hasattr(cp, name), f"{name} not reachable via control_plane"
+        # ...and NOT re-exported as a top-level connections alias.
+        assert name not in connections.__all__, f"{name} leaked into connections.__all__"
+        assert not hasattr(connections, name), f"{name} is a top-level connections alias"
+
+
+# --- L02 fix: per-binding secret ref + trusted principal resolution --------
+#
+# The judgement point. A two-binding fixture (different tenants, different
+# subjects, same provider) proves: (1) the OLD slug-level ref collapses both to
+# ONE reference (the defect, kept as a counter-example); (2) the per-binding ref
+# each binding actually stores is DIFFERENT; (3) resolving A's verified principal
+# yields only A's binding and A's secret; (4) B's verified principal can never
+# reach A's secret; (5) resolution keys on the VERIFIED identity, refusing an
+# unverified claim and a no-match, both typed.
+
+
+def _identity_verifier(*, claimed_subject, claimed_tenant, service_id) -> VerifiedIdentity:
+    """Verifier that canonicalizes each distinct claim to a distinct identity."""
+
+    return {
+        "subject_ref": f"subject://verified/{claimed_subject}",
+        "tenant_ref": f"tenant://verified/{claimed_tenant}",
+    }
+
+
+def _two_bindings() -> tuple[Binding, Binding]:
+    a = create_binding(
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_identity_verifier,
+        slug="github",
+    )
+    b = create_binding(
+        service_id="github",
+        claimed_subject="bob",
+        claimed_tenant="beta",
+        credential_mode="oauth_user",
+        verifier=_identity_verifier,
+        slug="github",
+    )
+    return a, b
+
+
+def test_COUNTEREXAMPLE_slug_level_ref_collapses_both_bindings_to_one() -> None:
+    # The defect, pinned: the legacy slug-level selector returns the SAME
+    # reference for two different-identity bindings under one provider.
+    a, b = _two_bindings()
+    slug_ref_a = binding_secret_ref("github")
+    slug_ref_b = binding_secret_ref("github")
+    assert slug_ref_a["name"] == slug_ref_b["name"] == "CONNECTIONS_GITHUB_BINDING_SECRET"
+    # Two distinct identities would have shared this one credential name.
+    assert a["subject_ref"] != b["subject_ref"]
+    assert a["tenant_ref"] != b["tenant_ref"]
+
+
+def test_two_bindings_get_different_per_binding_secret_refs() -> None:
+    # The fix: each binding stores a per-identity secret ref, so the two differ.
+    a, b = _two_bindings()
+    assert a["secret_ref"]["name"] != b["secret_ref"]["name"]
+    # Both still in the provider's family, distinguished by the scope segment.
+    assert a["secret_ref"]["name"].startswith("CONNECTIONS_GITHUB_BINDING_")
+    assert b["secret_ref"]["name"].startswith("CONNECTIONS_GITHUB_BINDING_")
+    # And neither is the legacy slug-level (collision-prone) name.
+    assert a["secret_ref"]["name"] != "CONNECTIONS_GITHUB_BINDING_SECRET"
+    assert b["secret_ref"]["name"] != "CONNECTIONS_GITHUB_BINDING_SECRET"
+
+
+def test_resolve_principal_yields_only_its_own_binding_and_secret() -> None:
+    a, b = _two_bindings()
+    store = [a, b]
+    resolved = resolve_binding_for_principal(
+        store,
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        verifier=_identity_verifier,
+    )
+    assert resolved["binding_id"] == a["binding_id"]
+    assert resolved["secret_ref"]["name"] == a["secret_ref"]["name"]
+    # A's principal never surfaces B's secret.
+    assert resolved["secret_ref"]["name"] != b["secret_ref"]["name"]
+
+
+def test_principal_B_cannot_reach_principal_A_secret() -> None:
+    a, b = _two_bindings()
+    store = [a, b]
+    resolved_b = resolve_binding_for_principal(
+        store,
+        service_id="github",
+        claimed_subject="bob",
+        claimed_tenant="beta",
+        verifier=_identity_verifier,
+    )
+    # B resolves to B's own binding/secret, and A's secret is unreachable via B.
+    assert resolved_b["binding_id"] == b["binding_id"]
+    assert resolved_b["secret_ref"]["name"] == b["secret_ref"]["name"]
+    assert resolved_b["secret_ref"]["name"] != a["secret_ref"]["name"]
+
+
+def test_resolution_keys_on_verified_identity_not_the_claim() -> None:
+    # A claim whose verified identity does not match A's stored identity must not
+    # resolve to A, even if the raw claimed strings look plausible. Here the
+    # verifier maps a different claim to a different verified identity, so the
+    # store (holding only A and B) has no match -> typed refusal.
+    a, b = _two_bindings()
+    with pytest.raises(BindingResolutionError):
+        resolve_binding_for_principal(
+            [a, b],
+            service_id="github",
+            claimed_subject="mallory",
+            claimed_tenant="acme",
+            verifier=_identity_verifier,
+        )
+
+
+def test_resolution_refuses_an_unverified_claim() -> None:
+    a, b = _two_bindings()
+    with pytest.raises(BindingVerificationError):
+        resolve_binding_for_principal(
+            [a, b],
+            service_id="github",
+            claimed_subject="x",
+            claimed_tenant="y",
+            verifier=_rejecting_verifier,
+        )
+
+
+def test_resolution_is_fail_closed_on_ambiguity() -> None:
+    # Two bindings with the SAME verified identity is a corrupt store; resolution
+    # must refuse rather than silently pick one.
+    a, _ = _two_bindings()
+    dup = dict(a)  # same subject_ref/tenant_ref/service_id
+    with pytest.raises(BindingResolutionError):
+        resolve_binding_for_principal(
+            [a, dup],  # type: ignore[list-item]
+            service_id="github",
+            claimed_subject="alice",
+            claimed_tenant="acme",
+            verifier=_identity_verifier,
+        )
