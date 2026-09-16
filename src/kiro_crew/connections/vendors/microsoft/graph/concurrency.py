@@ -1,66 +1,62 @@
-"""Microsoft Graph optimistic-concurrency version-safe write protocol (vendor seats).
+"""Microsoft Graph optimistic-concurrency version-safe write protocol.
 
-WHAT THIS OWNS -- THE TWO VENDOR SEATS W01 LEAVES OPEN
-======================================================
-W01's executor (``connections/control_plane/executor.py`` +
-``production.py``) owns the decision chain, credential custody, and the real
-HTTP sender. It deliberately leaves two seats VENDOR-OWNED and injected, because
-turning an operation into a concrete request and reading a 2xx body back are
-per-provider:
+WHAT THIS OWNS
+==============
+W01's executor (``connections/control_plane/executor.py`` + ``production.py``)
+owns the decision chain, credential custody, the pre-send gates, and the real
+HTTP sender. It leaves two seats VENDOR-OWNED and injected:
 
 * :data:`~kiro_crew.connections.control_plane.production.RequestLocator`
-  ``= Callable[..., HttpRequest]`` -- shape the concrete Graph request.
+  ``= Callable[..., HttpRequest]`` -- shape the concrete Graph request. It is
+  called by the transport with ``service_id`` / ``credential_mode`` /
+  ``descriptor`` / ``request_args`` / ``request_idempotency_key``; the vendor
+  reads ``request_args`` for the operation's method / path / If-Match / body.
 * :data:`~kiro_crew.connections.control_plane.production.ResultDecode`
-  ``= Callable[..., OperationResult]`` -- map a 2xx reply to the L01 envelope;
-  W01 marks it vendor-owned for anything CURSOR-SHAPED, which is where A's paging
-  (``vendors/microsoft/graph/paging.py``) meets it.
+  ``= Callable[..., OperationResult]`` -- map a 2xx reply to the L01 envelope,
+  cursor-shaped via A's paging.
 
-This module FILLS those two seats for the Graph optimistic-concurrency write
-operations and carries the pure protocol logic they build on. It does NOT
-implement transport, set ``Authorization``, copy a W01 module, or build a vault.
+This module fills both seats AND owns the version-safe WRITE ORCHESTRATION --
+GET -> conditional PATCH -> 412 -> fresh -> retry -> read-back. The orchestration
+routes EVERY hop THROUGH W01's :func:`~kiro_crew.connections.control_plane.executor.execute`
+(via a composed :data:`Transport`), so the trusted binding identity, the vault
+custody fencing, the pre-send gates and the unknown-outcome mapping ALL run --
+it never calls a raw sender itself. It is not a new general-purpose runtime; it
+orchestrates this one operation.
 
-WHERE AUTHENTICITY ACTUALLY COMES FROM (not from this module)
-=============================================================
-An earlier iteration tried to prove a call's origin with a caller-supplied
-"correlation id" echoed in a caller-supplied response Mapping. Both sides were
-the caller's, so it proved nothing -- and W01's own transport says why it never
-could: ``HttpRequest.headers`` are "vendor headers WITHOUT the credential; the
-transport adds ``Authorization`` itself so a locator never touches a secret". A
-vendor layer does not own auth, so nothing it echoes can attest a call. That
-echo layer is REMOVED. Authenticity is established by the two things this module
-does not fabricate:
+AUTHENTICITY (from W01, not fabricated here)
+============================================
+The auth chain is W01's: ``BindingSecretSelector`` refuses a call whose
+``binding_fingerprint`` is not the composed one BEFORE any vault read, and the
+transport reveals the credential into ``Authorization`` for exactly one send.
+Routing every hop through ``execute`` is what makes that hold; a hop that called
+a sender directly would attach no credential and pass no gate. Correlation is
+the executor's own call: each :class:`ExecutionOutcome` this orchestration reads
+is ``execute``'s return for the request the seat produced. ``request-id`` /
+``client-request-id`` are never read and are no auth proof.
 
-1. **Trusted binding identity.** W01's executor passes the ``TrustedHandleView``
-   to the transport, and ``BindingSecretSelector`` REFUSES a call whose
-   ``binding_fingerprint`` (a keyed HMAC) is not the composed one, BEFORE any
-   vault read. Identity comes from there, not from a quadruple this module lets
-   a caller assemble.
-2. **The sender call relationship.** The reply this module reads back is the
-   :class:`HttpReply` W01's sender RETURNED for the :class:`HttpRequest` this
-   module's :data:`RequestLocator` produced -- a call-return binding in the
-   executor's own code path. A read-back verdict is therefore about the reply to
-   the request that was issued, not about "some bytes". ``request-id`` and
-   ``client-request-id`` are NOT relied on: they are not necessarily equal and
-   are not an auth proof.
+NOTE ON COMPLETENESS: this wires the version-safe WRITE onto W01's real chain,
+but the full connector auth stack (L03 auth-code, L04 rotation fencing,
+principal->binding resolution) is W01's and NOT complete; nothing here should be
+read as "the auth chain is done".
 
-THE VERSION-SAFE PROTOCOL (pure logic, on real replies)
-=======================================================
-* Read the version identifier (``eTag`` / ``cTag``) from a reply; the two kinds
-  are DISTINCT and ``If-Match`` acceptance is decided PER ENDPOINT.
+THE VERSION-SAFE PROTOCOL
+=========================
+* Read ``eTag`` / ``cTag`` (distinct kinds; ``If-Match`` acceptance per endpoint).
+* BEFORE the write, compare the intent's baseline against the INITIAL GET's
+  actual field values: if a field already moved, CONFLICT there -- do not send an
+  ``If-Match`` that would match the moved state and clobber it.
 * Conditional write only where evidence supports it (SharePoint list item;
-  OneDrive driveitem metadata -- both a real 412 contract, equal in force,
-  accepting eTag [+ cTag for driveitem]). ``excel.range.write`` has NO eTag
-  mechanism and a conditional write is REFUSED.
-* 412 recovery is CONFLICT-FIRST: retry only when every intended field's
-  baseline still equals its fresh value; otherwise surface the conflict and
-  resend nothing (never a blind etag-swap replay).
-* Read-back verifies the target fields hold the intended values on the reply
-  that answered the read request; it never claims write ATTRIBUTION.
+  OneDrive driveitem metadata -- both a real 412 contract, eTag [+cTag for
+  driveitem]). ``excel.range.write`` has no eTag mechanism and is REFUSED.
+* 412 recovery is CONFLICT-FIRST over the fresh re-read.
+* Read-back verifies the intended fields hold ON THE TARGET RESOURCE (its id
+  asserted) and never claims write attribution.
+* A non-idempotent write that returns 500 is UNKNOWN (commit-ambiguous), which
+  W01 leaves to the vendor: :func:`graph_500_unknown_transport` sets it.
 
-Field comparison is PER TYPED COLUMN: a scalar compares directly, a typed
-column (lookup / person-or-group / multi-value) has no documented per-type
-equality schema, so comparing it is REFUSED rather than guessed (a false
-"unmoved" would auto-retry and clobber). ``column_kind`` is REQUIRED.
+Field comparison is PER TYPED COLUMN; an undocumented typed column (lookup /
+person-or-group / multi-value) is REFUSED rather than guessed. ``column_kind``
+is required.
 """
 
 from __future__ import annotations
@@ -68,47 +64,47 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, List, Mapping, Optional
 
+from kiro_crew.connections.control_plane.executor import (
+    ExecutionOutcome,
+    Transport,
+    TransportResponse,
+    is_non_idempotent_effect,
+)
+from kiro_crew.connections.control_plane.operation import OperationDescriptor
 from kiro_crew.connections.control_plane.production import (
     HttpReply,
     HttpRequest,
-    HttpSend,
     neutral_decode,
-    urllib_http_send,
 )
 from kiro_crew.connections.control_plane.result import OperationResult
-from kiro_crew.connections.vendors.microsoft.graph.payload import (
-    ODATA_NEXT_LINK,
-    parse_collection,
-)
+from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
+from kiro_crew.connections.vendors.microsoft.graph.payload import parse_collection
 
-# --- version-identifier keys on a read reply body ---------------------------
+# --- version-identifier + identity keys on a read reply body ----------------
 ODATA_ETAG = "@odata.etag"
 FIELD_ETAG = "eTag"
 FIELD_CTAG = "cTag"
 FIELD_ID = "id"
 ODATA_ID = "@odata.id"
 
+# request_args keys the RequestLocator seat reads for THIS operation.
+ARG_METHOD = "method"
+ARG_PATH = "path"
+ARG_IF_MATCH = "if_match"
+ARG_BODY = "body"
+
 
 class VersionKind(str, Enum):
-    """Which version-like tag a :class:`VersionTag` carries. Closed set.
-
-    ``ETAG`` -- entity tag (any change). ``CTAG`` -- content tag. Kept distinct;
-    ``If-Match`` acceptance is per-endpoint, never global.
-    """
+    """``ETAG`` (any change) vs ``CTAG`` (content). Distinct; If-Match per endpoint."""
 
     ETAG = "etag"
     CTAG = "ctag"
 
 
 class ColumnKind(str, Enum):
-    """How a SharePoint ``fields``-facet column is compared. Closed set.
-
-    ``SCALAR`` compares directly. ``LOOKUP`` / ``PERSON_OR_GROUP`` /
-    ``MULTIVALUE`` have no documented per-type equality schema, so a comparison
-    is REFUSED rather than guessed. Required on every :class:`FieldChange`.
-    """
+    """How a ``fields``-facet column is compared. Typed columns are REFUSED, not guessed."""
 
     SCALAR = "scalar"
     LOOKUP = "lookup"
@@ -122,17 +118,11 @@ _UNDOCUMENTED_COLUMN_KINDS = frozenset(
 
 
 class ConcurrencyError(ValueError):
-    """A version-safe write precondition was violated, or a guarantee refused.
-
-    A shaping/precondition fault only -- NOT a vendor error (vendor errors are
-    W01's typed boundary).
-    """
+    """A version-safe write precondition was violated, or a guarantee refused."""
 
 
 @dataclass(frozen=True)
 class VersionTag:
-    """A validated version identifier read from a reply body."""
-
     kind: VersionKind
     value: str
 
@@ -142,13 +132,7 @@ class VersionTag:
 
 
 class ConcurrencyMode(str, Enum):
-    """The optimistic-concurrency contract of a single operation. Closed set.
-
-    ``LISTITEM_ETAG`` -- ``sharepoint.listitem.update``; ``If-Match`` = eTag.
-    ``DRIVEITEM_ETAG_OR_CTAG`` -- ``onedrive.driveitem.metadata.update``; a real
-    412 contract equal in force, ``If-Match`` = eTag OR cTag.
-    ``NONE_LAST_WRITE_WINS`` -- ``excel.range.write``; no mechanism, refused.
-    """
+    """``LISTITEM_ETAG`` / ``DRIVEITEM_ETAG_OR_CTAG`` (both real 412) / ``NONE_LAST_WRITE_WINS``."""
 
     LISTITEM_ETAG = "listitem_etag"
     DRIVEITEM_ETAG_OR_CTAG = "driveitem_etag_or_ctag"
@@ -164,30 +148,19 @@ _IF_MATCH_VALIDATORS: Mapping[ConcurrencyMode, frozenset[VersionKind]] = Mapping
 
 
 def supports_if_match(mode: ConcurrencyMode) -> bool:
-    """Whether ``mode`` has an ``If-Match`` conditional-write mechanism at all."""
-
     return mode in _IF_MATCH_VALIDATORS
 
 
 def accepts_validator(mode: ConcurrencyMode, kind: VersionKind) -> bool:
-    """Whether ``mode``'s endpoint accepts a ``kind`` version as ``If-Match``."""
-
     return kind in _IF_MATCH_VALIDATORS.get(mode, frozenset())
 
 
 def has_412_contract(mode: ConcurrencyMode) -> bool:
-    """Whether ``mode`` has a real 412 conditional-write contract (both writers)."""
-
     return mode in _IF_MATCH_VALIDATORS
 
 
 def extract_version(body: Mapping[str, Any]) -> Optional[VersionTag]:
-    """Read a version identifier from a reply body, preferring the entity tag.
-
-    Prefers ``eTag`` (``@odata.etag`` annotation, else the ``eTag`` field), falls
-    back to a ``cTag`` reported as ``CTAG`` kind (never relabelled). Returns
-    ``None`` when absent; raises for a present-but-malformed value.
-    """
+    """Read a version tag from a reply body (eTag preferred, cTag distinct)."""
 
     etag = _optional_str(body, ODATA_ETAG)
     if etag is None:
@@ -200,35 +173,42 @@ def extract_version(body: Mapping[str, Any]) -> Optional[VersionTag]:
     return None
 
 
+def extract_resource_id(body: Mapping[str, Any]) -> Optional[str]:
+    """Read the resource id (``id`` / ``@odata.id``) from a reply body."""
+
+    rid = _optional_str(body, FIELD_ID)
+    if rid is None:
+        rid = _optional_str(body, ODATA_ID)
+    return rid
+
+
 @dataclass(frozen=True)
 class FieldChange:
-    """One intended field change, with the BASELINE it was decided against.
-
-    ``baseline`` -- the field's value in the read that produced the ``If-Match``
-    version. ``intended`` -- the value this write sets. ``column_kind`` -- how it
-    is compared (REQUIRED, no default: an untagged typed column must never be
-    silently compared as a scalar).
-    """
-
     baseline: Any
     intended: Any
-    column_kind: ColumnKind
+    column_kind: ColumnKind  # REQUIRED: no silent SCALAR fallback.
 
 
 @dataclass(frozen=True)
 class WriteIntent:
-    """The baseline-anchored change THIS write intends, keyed by field name."""
+    """The baseline-anchored change THIS write intends, keyed by field name.
 
+    ``resource_id`` -- the id of the resource this write targets, so a read-back
+    can assert it read back the SAME resource. ``changes`` -- the full required
+    field set for the operation (no field-count cap).
+    """
+
+    resource_id: str
     changes: Mapping[str, FieldChange]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.resource_id, str) or not self.resource_id.strip():
+            raise ConcurrencyError("a write intent must carry a non-empty resource_id")
         if not self.changes:
             raise ConcurrencyError("a write intent must name at least one field to change")
         object.__setattr__(self, "changes", MappingProxyType(dict(self.changes)))
 
     def merge_patch_body(self) -> Mapping[str, Any]:
-        """The PATCH merge body -- each named field's INTENDED value."""
-
         return {name: change.intended for name, change in self.changes.items()}
 
 
@@ -237,61 +217,58 @@ class WriteIntent:
 # =============================================================================
 def graph_request_locator(
     *,
-    method: str,
+    service_id: str,
+    credential_mode: str,
+    descriptor: OperationDescriptor,
+    request_args: Mapping[str, Any],
+    request_idempotency_key: str = "",
     endpoint_host: str,
-    path: str,
-    if_match: Optional[str] = None,
-    body: Optional[bytes] = None,
-    extra_headers: Optional[Mapping[str, str]] = None,
 ) -> HttpRequest:
-    """Shape one concrete Graph :class:`HttpRequest`. Fills W01's RequestLocator seat.
+    """Fill W01's RequestLocator seat: shape one Graph :class:`HttpRequest`.
 
-    Assembles the absolute ``https`` URL from ``endpoint_host`` (the Graph cloud
-    host the executor is bound to) and ``path`` (A's ``build_path`` result, root
-    relative with a leading ``/``), the vendor headers, and the request body. It
-    attaches ``If-Match`` when the caller passes a version validator, and NOTHING
-    resembling a credential: per W01's contract the transport adds
-    ``Authorization`` itself, so a locator never touches a secret.
+    Reads ``request_args`` for ``method`` / ``path`` (A's ``build_path`` result,
+    root-relative) / optional ``if_match`` / optional ``body``. Assembles the
+    absolute ``https`` URL from ``endpoint_host`` (bound at composition) and the
+    path. Sets NO credential header: per W01's contract the transport adds
+    ``Authorization`` itself. ``endpoint_host`` is keyword-bound by the composer
+    (``functools.partial``); the other kwargs are what the transport passes.
     """
 
+    method = str(request_args.get(ARG_METHOD, "")).strip()
+    path = str(request_args.get(ARG_PATH, ""))
+    if not method:
+        raise ConcurrencyError("request_args['method'] is required")
+    if not path.startswith("/"):
+        raise ConcurrencyError("request_args['path'] must be a root-relative Graph path")
     host = endpoint_host.strip()
     if not host:
         raise ConcurrencyError("endpoint_host must be a non-empty Graph service host")
-    if not path.startswith("/"):
-        raise ConcurrencyError("path must be a root-relative Graph path (build_path result)")
     headers: dict[str, str] = {}
-    if extra_headers:
-        headers.update(extra_headers)
-    for banned in ("authorization", "proxy-authorization", "cookie"):
-        if any(k.lower() == banned for k in headers):
-            raise ConcurrencyError(
-                f"a locator must not set {banned!r}: the transport owns credentials"
-            )
+    if_match = request_args.get(ARG_IF_MATCH)
     if if_match is not None:
-        if not if_match.strip():
-            raise ConcurrencyError("If-Match value must be non-empty when provided")
-        headers["If-Match"] = if_match
-    url = f"https://{host}{path}"
-    return HttpRequest(method=method.upper(), url=url, headers=headers, body=body)
+        if not str(if_match).strip():
+            raise ConcurrencyError("if_match must be non-empty when provided")
+        headers["If-Match"] = str(if_match)
+    body = request_args.get(ARG_BODY)
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        if not isinstance(body, (bytes, bytearray)):
+            body = _json_bytes(body)
+    return HttpRequest(
+        method=method.upper(), url=f"https://{host}{path}", headers=headers, body=body
+    )
 
 
-def conditional_write_request(
-    *,
+def conditional_write_args(
     mode: ConcurrencyMode,
-    endpoint_host: str,
     path: str,
     version: Optional[VersionTag],
     intent: WriteIntent,
-    encode_body: "Any" = None,
-) -> HttpRequest:
-    """Build the version-safe conditional-write :class:`HttpRequest` for ``mode``.
+) -> Mapping[str, Any]:
+    """Build the ``request_args`` for a version-safe conditional PATCH.
 
-    * ``NONE_LAST_WRITE_WINS`` (Excel range): REFUSES -- no eTag mechanism.
-    * A conditional-write mode with a MISSING version: REFUSES (no blind write,
-      no empty ``If-Match``).
-    * A version whose KIND the endpoint does not accept: REFUSES (per-endpoint).
-    * Otherwise: a PATCH with ``If-Match: <version.value>`` and the intent's
-      merge body encoded by ``encode_body`` (defaults to compact JSON bytes).
+    Refuses Excel (no mechanism), a missing version (no blind write), and a
+    per-endpoint-unaccepted validator -- BEFORE any request is shaped.
     """
 
     if mode is ConcurrencyMode.NONE_LAST_WRITE_WINS:
@@ -306,8 +283,7 @@ def conditional_write_request(
     if version is None:
         raise ConcurrencyError(
             f"{mode.value} is a conditional-write endpoint but no version was "
-            "read; refusing to send an unconditional (blind) write with no "
-            "If-Match -- version safety must not silently degrade"
+            "read; refusing an unconditional (blind) write with no If-Match"
         )
     if not accepts_validator(mode, version.kind):
         accepted = ", ".join(sorted(k.value for k in _IF_MATCH_VALIDATORS[mode]))
@@ -315,65 +291,148 @@ def conditional_write_request(
             f"{mode.value} does not accept a {version.kind.value} as an If-Match "
             f"validator (accepts: {accepted}); this rule is per-endpoint"
         )
-    encoder = encode_body if encode_body is not None else _json_bytes
-    return graph_request_locator(
-        method="PATCH",
-        endpoint_host=endpoint_host,
-        path=path,
-        if_match=version.value,
-        body=encoder(intent.merge_patch_body()),
-        extra_headers={"Content-Type": "application/json"},
-    )
+    return {
+        ARG_METHOD: "PATCH",
+        ARG_PATH: path,
+        ARG_IF_MATCH: version.value,
+        ARG_BODY: intent.merge_patch_body(),
+    }
 
 
 # =============================================================================
-# SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult.
+# SEAT 2 -- ResultDecode: map a 2xx HttpReply to an OperationResult (rows kept).
 # =============================================================================
-def graph_result_decode(reply: HttpReply) -> OperationResult:
-    """Map a 2xx Graph :class:`HttpReply` to an :class:`OperationResult`.
+@dataclass(frozen=True)
+class DecodedPage:
+    """A decoded 2xx reply that KEEPS the page's rows.
 
-    Fills W01's ResultDecode seat, cursor-shaped: a collection body is read
-    through A's :func:`parse_collection`, and the presence of ``@odata.nextLink``
-    becomes ``status='partial'`` with the opaque link as ``next_cursor`` (more
-    pages remain), else ``status='ok'`` with ``next_cursor=None``. A body that is
-    not a Graph collection envelope (a single-item read, an empty write ack)
-    falls back to W01's :func:`neutral_decode`, which never guesses a cursor.
+    ``result`` -- the L01 ``{status, next_cursor}`` envelope the seat returns.
+    ``rows`` -- the collection's ``value`` items, PRESERVED (empty for a
+    non-collection reply). The L01 primitive has no room for rows, so the seat
+    returns only ``result``; a caller that needs the data calls :func:`decode_page`.
+    """
+
+    result: OperationResult
+    rows: List[Any]
+
+
+def decode_page(reply: HttpReply) -> DecodedPage:
+    """Decode a 2xx Graph reply, keeping rows. Cursor-shaped via A's paging.
+
+    A collection body is read through A's :func:`parse_collection`:
+    ``@odata.nextLink`` present -> ``partial`` + the opaque cursor and the page's
+    rows; absent -> ``ok`` + ``None`` and the rows. A non-collection reply defers
+    the envelope to W01's :func:`neutral_decode` and carries no rows.
     """
 
     parsed = _json_or_none(reply.body)
     if isinstance(parsed, Mapping) and "value" in parsed:
         page = parse_collection(parsed)
         if page.next_link is not None:
-            return {"status": "partial", "next_cursor": page.next_link}
-        return {"status": "ok", "next_cursor": None}
-    # Not a collection: defer to W01's neutral decode (204/empty/单项 body).
-    return neutral_decode(reply)
+            return DecodedPage(
+                result={"status": "partial", "next_cursor": page.next_link}, rows=list(page.value)
+            )
+        return DecodedPage(result={"status": "ok", "next_cursor": None}, rows=list(page.value))
+    return DecodedPage(result=neutral_decode(reply), rows=[])
+
+
+def graph_result_decode(reply: HttpReply) -> OperationResult:
+    """Fill W01's ResultDecode seat: the L01 envelope for a 2xx reply.
+
+    Delegates to :func:`decode_page` (which keeps the rows) and returns only the
+    ``OperationResult`` the seat is contracted to return; rows reach a caller via
+    :func:`decode_page`. Never guesses a cursor.
+    """
+
+    return decode_page(reply).result
 
 
 # =============================================================================
-# 412 recovery -- CONFLICT-FIRST, over the REAL reply the sender returned.
+# D9 -- vendor 500-unknown transport wrapper.
+# =============================================================================
+def graph_500_unknown_transport(inner: Transport) -> Transport:
+    """Wrap a composed :data:`Transport` so a 500 on a non-idempotent write is UNKNOWN.
+
+    W01 deliberately leaves HTTP 500 out of its ambiguous-transit set: whether a
+    500 is pre- or post-commit is PROVIDER knowledge, so it documents that "a
+    vendor owner that knows its API commits first must set ``write_outcome``
+    itself". Microsoft Graph does not guarantee a 500 is pre-commit for a write,
+    so a 500 on a non-idempotent effect is commit-AMBIGUOUS: this wrapper marks
+    it :data:`ATTEMPT_UNKNOWN`, so L07 refuses to blind-replay (a wrong "not
+    applied" would duplicate the write). It touches ONLY the 500 case and only
+    for a non-idempotent effect; every other response passes through unchanged.
+    """
+
+    def _wrapped(*, descriptor: OperationDescriptor, **kwargs: Any) -> TransportResponse:
+        response = inner(descriptor=descriptor, **kwargs)
+        if (
+            response.http_status == 500
+            and response.write_outcome is None
+            and is_non_idempotent_effect(descriptor["effect"])
+        ):
+            return TransportResponse(
+                http_status=response.http_status,
+                result=response.result,
+                preconditions=response.preconditions,
+                etag=response.etag,
+                retry_after_seconds=response.retry_after_seconds,
+                detail=response.detail,
+                write_outcome=ATTEMPT_UNKNOWN,
+            )
+        return response
+
+    return _wrapped
+
+
+# =============================================================================
+# 412 recovery + the pre-send baseline check -- CONFLICT-FIRST.
 # =============================================================================
 PRECONDITION_FAILED = 412
 
 
 @dataclass(frozen=True)
 class Conflict:
-    """A surfaced 412 conflict the caller must resolve; NOT auto-resent."""
+    """A surfaced conflict the caller must resolve; NOTHING is (re)sent."""
 
     moved_fields: tuple[str, ...]
     reason: str
 
 
-@dataclass(frozen=True)
-class RetryPlan:
-    """The outcome of a 412 recovery decision.
+def baseline_conflict(intent: WriteIntent, current_body: Mapping[str, Any]) -> Optional[Conflict]:
+    """Check the intent's baseline against a resource's CURRENT field values.
 
-    ``should_retry`` is True only when every intended field's fresh value still
-    equals its baseline; then ``fresh_version`` is the version to build the retry
-    ``If-Match`` from. Otherwise ``conflict`` holds the surfaced conflict and
-    nothing is resent.
+    Run BEFORE the conditional write, over the initial GET's body. If any
+    intended field's current value already differs from the baseline this write
+    assumed, that is a concurrent change: return a :class:`Conflict` so the write
+    is never sent (an ``If-Match`` on the already-moved version would MATCH and
+    clobber, which the 412 path cannot catch because no 412 fires). ``None`` when
+    every intended field still holds its baseline. Also verifies identity: a body
+    whose id is not the intent's target is a conflict.
     """
 
+    rid = extract_resource_id(current_body)
+    if rid is None or rid != intent.resource_id:
+        return Conflict(
+            moved_fields=(),
+            reason=f"initial read identity {rid!r} != target {intent.resource_id!r}",
+        )
+    moved = tuple(
+        name
+        for name, change in intent.changes.items()
+        if name not in current_body
+        or not _field_values_equal(change, change.baseline, current_body[name])
+    )
+    if moved:
+        return Conflict(
+            moved_fields=moved,
+            reason="initial read shows intended field(s) already moved off "
+            "baseline: " + ", ".join(moved),
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class RetryPlan:
     should_retry: bool
     reason: str
     fresh_version: Optional[VersionTag] = None
@@ -382,165 +441,121 @@ class RetryPlan:
 
 def recover_from_precondition_failed(
     mode: ConcurrencyMode,
-    reply: HttpReply,
     intent: WriteIntent,
-    re_read_reply: HttpReply,
+    re_read_body: Mapping[str, Any],
 ) -> RetryPlan:
-    """Plan the 412 recovery over the REAL replies the sender returned.
+    """Plan the 412 recovery over the fresh re-read body. CONFLICT-FIRST.
 
-    ``reply`` is the reply to the conditional write (its status is inspected for
-    412); ``re_read_reply`` is the reply to an INDEPENDENT re-GET the caller
-    issued after the 412 -- the sender-call relationship is what ties each reply
-    to its request, so this decision is about the answers to the requests
-    actually issued, not arbitrary bytes.
-
-    CONFLICT-FIRST: on a 412 for a conditional-write mode, retry ONLY when every
-    intended field's fresh value (from ``re_read_reply``'s body) still equals its
-    baseline. Any moved field -> :class:`Conflict`, resend nothing. A typed
-    column with no documented schema RAISES (refuse, never guess a false
-    "unmoved"). A non-412, or a mode with no 412 contract, does not retry here.
+    Retry ONLY when identity matches AND every intended field's fresh value still
+    equals its baseline. Any moved field, an identity mismatch, or no fresh
+    version -> :class:`Conflict`, resend nothing. A typed column with no
+    documented schema RAISES (never a false "unmoved").
     """
 
     if not has_412_contract(mode):
+        return RetryPlan(should_retry=False, reason="mode has no 412 contract")
+    conflict = baseline_conflict(intent, re_read_body)
+    if conflict is not None:
+        return RetryPlan(should_retry=False, reason=conflict.reason, conflict=conflict)
+    fresh = extract_version(re_read_body)
+    if fresh is None:
         return RetryPlan(
             should_retry=False,
-            reason="mode has no 412 contract; not handled by this layer",
-        )
-    if reply.status != PRECONDITION_FAILED:
-        return RetryPlan(should_retry=False, reason="not a 412 precondition failure")
-
-    fresh_body = _json_or_none(re_read_reply.body)
-    if not isinstance(fresh_body, Mapping):
-        return RetryPlan(
-            should_retry=False,
-            reason="412 conflict: the re-read reply has no readable body to "
-            "compare fresh field values against; surfacing the conflict",
-            conflict=Conflict(moved_fields=(), reason="re-read body unreadable"),
-        )
-
-    moved = tuple(
-        name
-        for name, change in intent.changes.items()
-        if name not in fresh_body
-        or not _field_values_equal(change, change.baseline, fresh_body[name])
-    )
-    if moved:
-        return RetryPlan(
-            should_retry=False,
-            reason="412 conflict: a concurrent writer changed intended field(s) "
-            + ", ".join(moved)
-            + "; refusing to overwrite -- surface the conflict for resolution",
-            conflict=Conflict(
-                moved_fields=moved,
-                reason="fresh value(s) differ from the baseline this write "
-                "assumed on: " + ", ".join(moved),
-            ),
-        )
-
-    fresh_version = extract_version(fresh_body)
-    if fresh_version is None:
-        return RetryPlan(
-            should_retry=False,
-            reason="412 conflict: the re-read carries no version to build a fresh "
-            "If-Match from; surfacing the conflict rather than a blind retry",
+            reason="412 conflict: re-read carries no version for a fresh If-Match",
             conflict=Conflict(moved_fields=(), reason="no fresh version in re-read"),
         )
     return RetryPlan(
         should_retry=True,
-        reason="412 resolved: no intended field moved off its baseline; retry "
-        "with the fresh version",
-        fresh_version=fresh_version,
+        reason="412 resolved: no intended field moved; retry with the fresh version",
+        fresh_version=fresh,
     )
 
 
 # =============================================================================
-# Read-back verification -- over the reply that answered the read request.
+# Read-back verification -- identity asserted, per typed column.
 # =============================================================================
 @dataclass(frozen=True)
 class ReadBackVerdict:
-    """The outcome of an independent read-back after a conditional write.
-
-    ``verified`` is True only when every intended field holds its intended value
-    in the read-back reply's body. ``mismatches`` names the fields that did not.
-    On success the claim is narrow: the target post-condition HOLDS on the
-    resource the read request addressed -- NOT that THIS write produced it.
-    """
-
     verified: bool
+    identity_ok: bool
     mismatches: tuple[str, ...]
     reason: str
 
 
-def verify_read_back(intent: WriteIntent, read_back_reply: HttpReply) -> ReadBackVerdict:
-    """Verify the target post-condition on the reply that answered the read-back.
+def verify_read_back(intent: WriteIntent, read_back_body: Mapping[str, Any]) -> ReadBackVerdict:
+    """Verify the target post-condition on the READ-BACK body, identity first.
 
-    ``read_back_reply`` is the :class:`HttpReply` the sender returned for the
-    read-back GET the caller issued -- the sender-call relationship is the tie
-    between this reply and that request, so the verdict is about the read this
-    write's caller performed, not stray bytes. It asserts every intended field
-    equals its intended value (per typed column; an undocumented typed column
-    RAISES). A moved version tag is not used. It never claims attribution.
+    Asserts the read-back is the intent's TARGET resource (its id), then that
+    every intended field holds its intended value (per typed column; an
+    undocumented typed column RAISES). A moved version tag is not used. On
+    success the claim is narrow: the post-condition HOLDS on the identified
+    resource -- NOT that this write produced it.
     """
 
-    body = _json_or_none(read_back_reply.body)
-    if not isinstance(body, Mapping):
+    rid = extract_resource_id(read_back_body)
+    if rid is None or rid != intent.resource_id:
         return ReadBackVerdict(
             verified=False,
-            mismatches=tuple(intent.changes),
-            reason="read-back reply has no readable body to verify against",
+            identity_ok=False,
+            mismatches=(),
+            reason=f"read-back identity {rid!r} != target {intent.resource_id!r}",
         )
     mismatches = tuple(
         name
         for name, change in intent.changes.items()
-        if name not in body or not _field_values_equal(change, change.intended, body[name])
+        if name not in read_back_body
+        or not _field_values_equal(change, change.intended, read_back_body[name])
     )
     if mismatches:
         return ReadBackVerdict(
             verified=False,
+            identity_ok=True,
             mismatches=mismatches,
-            reason="these intended fields do not hold their intended value: "
-            + ", ".join(mismatches),
+            reason="intended fields not holding their value: " + ", ".join(mismatches),
         )
     return ReadBackVerdict(
         verified=True,
+        identity_ok=True,
         mismatches=(),
-        reason="target post-condition holds on the read-back resource "
+        reason="target post-condition holds on the identified resource "
         "(not a claim that this write produced it)",
     )
 
 
 # =============================================================================
-# ORCHESTRATION -- the real version-safe write sequence.
+# ORCHESTRATION -- routed THROUGH W01's execute (custody + gates on every hop).
 # =============================================================================
-# This is NOT a new general-purpose runtime: it orchestrates ONE operation --
-# the Graph optimistic-concurrency version-safe write -- by composing the two
-# vendor seats above with W01's real sender. Every network hop goes through the
-# INJECTED ``send`` (W01's :func:`urllib_http_send` by default; a test injects a
-# sender bound to a controlled TLS loopback). This module NEVER implements
-# transport and NEVER sees a credential: on the production path the transport
-# W01's executor composes adds ``Authorization`` around this sequence's requests.
-# Correlation is the ACTUAL CALL RELATIONSHIP: each decision below consumes the
-# ``HttpReply`` that ``send`` RETURNED for the ``HttpRequest`` this sequence
-# built -- not a header echo, and request-id/client-request-id are never read.
+#: A dispatch is one authorized call: the caller binds it to W01's ``execute``
+#: (with the descriptor/handle/permitted/layers/governance/transport composed
+#: from the two seats), so every hop runs custody + gates + unknown-outcome. It
+#: takes the operation ``request_args`` (method/path/if_match/body) and returns
+#: BOTH the executor's :class:`ExecutionOutcome` and the raw reply body (needed
+#: for version/field comparison, which the L01 result envelope cannot carry).
+Dispatch = Callable[[Mapping[str, Any]], "DispatchResult"]
+
+
+@dataclass(frozen=True)
+class DispatchResult:
+    """What one authorized ``execute`` hop returns to the orchestrator.
+
+    ``outcome`` -- the executor's :class:`ExecutionOutcome` (result / error /
+    precondition / write_outcome). ``body`` -- the decoded reply body for a read
+    (the resource's fields), needed because the L01 result envelope carries no
+    rows; ``None`` for a hop that produced no readable body.
+    """
+
+    outcome: ExecutionOutcome
+    body: Optional[Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
 class WriteSequenceOutcome:
-    """The result of one version-safe write sequence.
-
-    Exactly one disposition is true. ``applied`` -- the conditional write landed
-    (2xx) and the independent read-back confirmed the intended fields on the
-    read-back resource. ``conflict`` -- a 412 whose re-read showed a concurrent
-    writer moved an intended field: nothing was re-sent. ``verified`` mirrors the
-    read-back verdict when ``applied``. ``final_version`` is the version observed
-    on the read-back (evidence), or ``None``. ``attempts`` counts conditional-
-    write sends actually issued (1 with no 412, 2 after a safe retry).
-    """
+    """The result of one version-safe write sequence routed through the executor."""
 
     applied: bool
     conflict: Optional[Conflict]
     verified: bool
-    final_version: Optional[VersionTag]
+    write_outcome: Optional[str]
     attempts: int
     reason: str
 
@@ -548,75 +563,88 @@ class WriteSequenceOutcome:
 def run_version_safe_write(
     *,
     mode: ConcurrencyMode,
-    endpoint_host: str,
     path: str,
     intent: WriteIntent,
-    send: HttpSend = urllib_http_send,
-    encode_body: "Any" = None,
+    dispatch: Dispatch,
     max_412_retries: int = 1,
 ) -> WriteSequenceOutcome:
-    """Drive GET -> conditional PATCH -> 412 -> fresh re-GET -> retry -> read-back.
+    """Drive GET -> baseline check -> conditional PATCH -> 412 -> fresh -> retry -> read-back.
 
-    A real call sequence over the injected ``send`` (W01's real sender by
-    default). Steps, each consuming the reply the send call returned:
+    Every hop goes through ``dispatch``, which the caller binds to W01's
+    ``execute`` -- so custody, the pre-send gates, the trusted-binding identity
+    and the unknown-outcome mapping run on every request. This function issues no
+    raw send and no credential; without the executor no ``Authorization`` is
+    attached at all.
 
-    1. GET the resource; read its version (``eTag``/``cTag``). No version is a
-       precondition failure (:func:`conditional_write_request` refuses a blind
-       write), surfaced as a conflict-shaped outcome rather than a silent send.
-    2. Build and send the conditional PATCH (``If-Match`` = that version).
-    3. On 2xx: read the resource back and verify the intended fields hold on the
-       READ-BACK resource. Done.
-    4. On 412: re-GET, and let :func:`recover_from_precondition_failed` decide
-       CONFLICT-FIRST over the real replies -- retry (bounded by
-       ``max_412_retries``) only when every intended field's baseline still
-       equals fresh; otherwise return the conflict and send nothing more.
-    5. Any other status is not this protocol's business -- returned as a
-       non-applied outcome for W01's typed boundary to classify; no retry.
-
-    ``excel.range.write`` never reaches a send: :func:`conditional_write_request`
-    refuses it before step 2. This function issues no credential and reads none.
+    ``excel.range.write`` (mode NONE) is refused by :func:`conditional_write_args`
+    before its PATCH is dispatched. NOTE: an initial GET is still dispatched
+    first; the refusal is of the WRITE, not of the whole sequence.
     """
 
-    # Step 1: GET + version.
-    get_reply = send(graph_request_locator(method="GET", endpoint_host=endpoint_host, path=path))
-    version = _reply_version(get_reply)
+    # Step 1: initial GET (authorized). Verify it succeeded before reading it.
+    get = dispatch({ARG_METHOD: "GET", ARG_PATH: path})
+    if get.outcome.error is not None or get.body is None:
+        return WriteSequenceOutcome(
+            applied=False,
+            conflict=None,
+            verified=False,
+            write_outcome=get.outcome.write_outcome,
+            attempts=0,
+            reason="initial GET did not return a readable body (authorization or "
+            "transport error); nothing sent",
+        )
 
+    # Step 1b (D7): baseline conflict on the INITIAL GET's actual values.
+    pre = baseline_conflict(intent, get.body)
+    if pre is not None:
+        return WriteSequenceOutcome(
+            applied=False,
+            conflict=pre,
+            verified=False,
+            write_outcome=None,
+            attempts=0,
+            reason=pre.reason,
+        )
+
+    version = extract_version(get.body)
     attempts = 0
     retries_left = max_412_retries
     while True:
-        # Step 2: conditional write (refuses Excel / missing / unaccepted here).
-        write_req = conditional_write_request(
-            mode=mode,
-            endpoint_host=endpoint_host,
-            path=path,
-            version=version,
-            intent=intent,
-            encode_body=encode_body,
-        )
-        write_reply = send(write_req)
+        # Step 2: conditional write (refuses Excel/missing/unaccepted here).
+        write = dispatch(conditional_write_args(mode, path, version, intent))
         attempts += 1
+        outcome = write.outcome
 
-        if 200 <= write_reply.status < 300:
-            # Step 3: independent read-back over the reply that answered it.
-            rb_reply = send(
-                graph_request_locator(method="GET", endpoint_host=endpoint_host, path=path)
+        if outcome.ok:
+            # Step 3: independent read-back; verify identity + fields.
+            rb = dispatch({ARG_METHOD: "GET", ARG_PATH: path})
+            verdict = (
+                verify_read_back(intent, rb.body)
+                if rb.body is not None
+                else ReadBackVerdict(False, False, tuple(intent.changes), "read-back unreadable")
             )
-            verdict = verify_read_back(intent, rb_reply)
             return WriteSequenceOutcome(
                 applied=True,
                 conflict=None,
                 verified=verdict.verified,
-                final_version=_reply_version(rb_reply),
+                write_outcome=outcome.write_outcome,
                 attempts=attempts,
                 reason=verdict.reason,
             )
 
-        if write_reply.status == PRECONDITION_FAILED:
-            # Step 4: re-GET, conflict-first recovery over the real replies.
-            re_read = send(
-                graph_request_locator(method="GET", endpoint_host=endpoint_host, path=path)
-            )
-            plan = recover_from_precondition_failed(mode, write_reply, intent, re_read)
+        if outcome.precondition is not None:
+            # Step 4: 412 -> re-GET -> conflict-first recovery.
+            re_read = dispatch({ARG_METHOD: "GET", ARG_PATH: path})
+            if re_read.body is None:
+                return WriteSequenceOutcome(
+                    applied=False,
+                    conflict=Conflict((), "re-read unreadable after 412"),
+                    verified=False,
+                    write_outcome=None,
+                    attempts=attempts,
+                    reason="re-read after 412 returned no body",
+                )
+            plan = recover_from_precondition_failed(mode, intent, re_read.body)
             if plan.should_retry and retries_left > 0:
                 version = plan.fresh_version
                 retries_left -= 1
@@ -625,40 +653,31 @@ def run_version_safe_write(
                 applied=False,
                 conflict=plan.conflict,
                 verified=False,
-                final_version=_reply_version(re_read),
+                write_outcome=None,
                 attempts=attempts,
-                reason=(
-                    plan.reason
-                    if plan.conflict is not None
-                    else "412 retry budget exhausted; not re-sending"
-                ),
+                reason=plan.reason if plan.conflict else "412 retry budget exhausted",
             )
 
-        # Step 5: any other status -> W01's typed boundary; not applied, no retry.
+        # Step 5 (D9): any other error -> carry the executor's write_outcome
+        # (unknown for a commit-ambiguous 500 on a non-idempotent write) so the
+        # caller does NOT record a wrong "not applied". Not applied, no retry.
         return WriteSequenceOutcome(
             applied=False,
             conflict=None,
             verified=False,
-            final_version=None,
+            write_outcome=outcome.write_outcome,
             attempts=attempts,
-            reason=f"non-2xx/non-412 status {write_reply.status}; "
-            "left to W01's typed error boundary",
+            reason="write failed (see executor error); "
+            + (
+                "outcome UNKNOWN — do not blind-replay"
+                if outcome.write_outcome == ATTEMPT_UNKNOWN
+                else "left to W01's typed error boundary"
+            ),
         )
-
-
-def _reply_version(reply: HttpReply) -> Optional[VersionTag]:
-    """Read a version from a reply body, or ``None`` when the body is not JSON."""
-
-    body = _json_or_none(reply.body)
-    if not isinstance(body, Mapping):
-        return None
-    return extract_version(body)
 
 
 # --- helpers ----------------------------------------------------------------
 def _field_values_equal(change: FieldChange, a: Any, b: Any) -> bool:
-    """Compare two values for one field PER TYPED COLUMN; refuse undocumented types."""
-
     if change.column_kind in _UNDOCUMENTED_COLUMN_KINDS:
         raise ConcurrencyError(
             f"cannot compare a {change.column_kind.value} column: the Graph "
@@ -693,8 +712,3 @@ def _optional_str(body: Mapping[str, Any], key: str) -> Optional[str]:
     if not isinstance(value, str) or not value.strip():
         raise ConcurrencyError(f"{key} must be a non-empty string when present")
     return value.strip()
-
-
-# ``ODATA_NEXT_LINK`` is A's paging constant, re-referenced so a reader sees the
-# cursor axis this decoder defers to; imported to keep the dependency explicit.
-_CURSOR_ANNOTATION = ODATA_NEXT_LINK

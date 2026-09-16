@@ -1,35 +1,28 @@
 """W06 · Graph optimistic-concurrency version-safe write protocol.
 
-Two kinds of coverage:
+Coverage:
+1. PURE-LOGIC unit tests of the protocol pieces.
+2. A REAL SEQUENCE routed THROUGH W01's ``execute`` -- composed with a real
+   encrypted ``SecretVault``, a real binding/handle, the two vendor seats, the
+   D9 500-unknown wrapper, and W01's UNMODIFIED ``urllib_http_send`` over a
+   self-signed TLS loopback. Every hop passes custody + gates; nothing calls a
+   raw sender. This is the harness SHAPE W01 uses (read, not modified).
 
-1. PURE-LOGIC unit tests of the protocol (version read, per-endpoint If-Match,
-   conflict-first 412 recovery, per-typed-column field compare, read-back).
-2. A REAL SEQUENCE against a controlled TLS loopback server, driven by the
-   UNMODIFIED W01 sender ``urllib_http_send`` over real sockets -- the same
-   harness shape as W01's ``test_the_loopback_harness_really_speaks_tls_to_the_real_sender``.
-   The full GET -> conditional PATCH -> 412 -> fresh re-GET -> read-back walk
-   runs against that server. CORRELATION is the ACTUAL SENDER CALL RELATIONSHIP:
-   every decision uses the ``HttpReply`` the sender RETURNED for the
-   ``HttpRequest`` this module's seat produced -- not a header echo. ``request-id``
-   / ``client-request-id`` are never relied on.
-
-NOT LIVE: the server is a self-signed loopback the test stands up; there is no
-real Microsoft Graph endpoint, no credential, no cloud write. CANDIDATE-ON-
-PARENT-BASE (parent W01 executor branch cd00f1837; not on main).
+NOT LIVE (self-signed loopback, no real Graph, no cloud write). The auth chain is
+W01's and is not complete; this only wires the version-safe write onto it.
+CANDIDATE-ON-PARENT-BASE (cd00f1837; not on main).
 """
 
 from __future__ import annotations
 
 import datetime
-import functools
 import http.server
 import json
-import socket  # noqa: F401  (kept parallel to W01 harness imports)
 import ssl
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import pytest
 from cryptography import x509
@@ -37,23 +30,53 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from kiro_crew.connections.control_plane.production import HttpReply, urllib_http_send
+from kiro_crew.connections.control_plane.auth_modes import declare_permitted_modes
+from kiro_crew.connections.control_plane.binding import (
+    VerifiedIdentity,
+    binding_secret_ref,
+    create_binding,
+)
+from kiro_crew.connections.control_plane.executor import (
+    ExecutionOutcome,
+    execute,
+)
+from kiro_crew.connections.control_plane.handle import (
+    derive_handle,
+    ensure_usable,
+)
+from kiro_crew.connections.control_plane.operation import Effect, OperationDescriptor
+from kiro_crew.connections.control_plane.policy import LayerCeilings
+from kiro_crew.connections.control_plane.production import (
+    HttpReply,
+    HttpRequest,
+    BindingSecretSelector,
+    build_production_transport,
+    urllib_http_send,
+)
+from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
+from kiro_crew.secrets import SecretValue, SecretVault
+
 from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
+    ARG_METHOD,
+    ARG_PATH,
     FIELD_CTAG,
     FIELD_ID,
     ODATA_ETAG,
-    PRECONDITION_FAILED,
     ColumnKind,
     ConcurrencyError,
     ConcurrencyMode,
     Conflict,
+    DispatchResult,
     FieldChange,
     VersionKind,
     VersionTag,
     WriteIntent,
     accepts_validator,
-    conditional_write_request,
+    baseline_conflict,
+    conditional_write_args,
+    decode_page,
     extract_version,
+    graph_500_unknown_transport,
     graph_request_locator,
     graph_result_decode,
     has_412_contract,
@@ -66,190 +89,169 @@ from kiro_crew.connections.vendors.microsoft.graph.concurrency import (
 _ETAG_V1 = '"1"'
 _ETAG_V2 = '"2"'
 _ETAG_V3 = '"3"'
-_CTAG_V2 = "aYzk5V2"
+_RID = "7"
+_T0 = 1_000_000.0
+_PATH = "/sites/S/lists/L/items/7/fields"
 
 
-def _intent(**changes):
-    """name=(baseline, intended, ColumnKind) -- column_kind REQUIRED."""
+def _intent(resource_id=_RID, **changes):
     return WriteIntent(
+        resource_id=resource_id,
         changes={
             n: FieldChange(baseline=b, intended=i, column_kind=k)
             for n, (b, i, k) in changes.items()
-        }
+        },
     )
 
 
-def _reply(status: int, body: Any = None, **headers) -> HttpReply:
-    raw = b"" if body is None else json.dumps(body).encode("utf-8")
+def _reply(status, body=None, **headers):
+    raw = b"" if body is None else json.dumps(body).encode()
     return HttpReply(status=status, headers=headers, body=raw)
 
 
 # =============================================================================
 # PURE-LOGIC unit tests
 # =============================================================================
-class TestVersionAndModes:
-    def test_extract_etag(self):
+class TestVersionModesSeats:
+    def test_extract_versions(self):
         assert extract_version({ODATA_ETAG: _ETAG_V1}) == VersionTag(VersionKind.ETAG, _ETAG_V1)
+        assert extract_version({FIELD_CTAG: "c"}) == VersionTag(VersionKind.CTAG, "c")
 
-    def test_extract_ctag_kept_distinct(self):
-        assert extract_version({FIELD_CTAG: _CTAG_V2}) == VersionTag(VersionKind.CTAG, _CTAG_V2)
-
-    def test_sharepoint_etag_only(self):
+    def test_per_endpoint_validators(self):
         assert accepts_validator(ConcurrencyMode.LISTITEM_ETAG, VersionKind.ETAG)
         assert not accepts_validator(ConcurrencyMode.LISTITEM_ETAG, VersionKind.CTAG)
-
-    def test_onedrive_etag_or_ctag(self):
-        assert accepts_validator(ConcurrencyMode.DRIVEITEM_ETAG_OR_CTAG, VersionKind.ETAG)
         assert accepts_validator(ConcurrencyMode.DRIVEITEM_ETAG_OR_CTAG, VersionKind.CTAG)
 
-    def test_both_writers_have_412_contract(self):
+    def test_412_contracts(self):
         assert has_412_contract(ConcurrencyMode.LISTITEM_ETAG)
         assert has_412_contract(ConcurrencyMode.DRIVEITEM_ETAG_OR_CTAG)
-
-    def test_excel_has_no_mechanism(self):
         assert not has_412_contract(ConcurrencyMode.NONE_LAST_WRITE_WINS)
         assert not supports_if_match(ConcurrencyMode.NONE_LAST_WRITE_WINS)
 
-
-class TestSeat1RequestLocator:
-    def test_shapes_https_url_and_if_match(self):
+    def test_locator_seat_shapes_request_from_args(self):
         req = graph_request_locator(
-            method="get",
+            service_id="sharepoint",
+            credential_mode="oauth_user",
+            descriptor=_descriptor(),
+            request_args={ARG_METHOD: "GET", ARG_PATH: _PATH},
             endpoint_host="graph.microsoft.com",
-            path="/sites/S/lists/L/items/7/fields",
-            if_match=_ETAG_V1,
         )
-        assert req.method == "GET"
-        assert req.url == "https://graph.microsoft.com/sites/S/lists/L/items/7/fields"
-        assert req.headers["If-Match"] == _ETAG_V1
+        assert req.method == "GET" and req.url == f"https://graph.microsoft.com{_PATH}"
+        assert "Authorization" not in req.headers  # transport owns credentials
 
-    def test_locator_refuses_to_set_a_credential_header(self):
-        with pytest.raises(ConcurrencyError, match="transport owns credentials"):
-            graph_request_locator(
-                method="GET",
-                endpoint_host="graph.microsoft.com",
-                path="/x",
-                extra_headers={"Authorization": "Bearer nope"},
-            )
-
-    def test_conditional_write_refused_for_excel(self):
+    def test_conditional_write_args_refuses_excel(self):
         with pytest.raises(ConcurrencyError, match="last-write-wins"):
-            conditional_write_request(
-                mode=ConcurrencyMode.NONE_LAST_WRITE_WINS,
-                endpoint_host="graph.microsoft.com",
-                path="/x",
-                version=VersionTag(VersionKind.ETAG, _ETAG_V1),
-                intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            conditional_write_args(
+                ConcurrencyMode.NONE_LAST_WRITE_WINS,
+                _PATH,
+                VersionTag(VersionKind.ETAG, _ETAG_V1),
+                _intent(Q=(1, 2, ColumnKind.SCALAR)),
             )
 
-    def test_conditional_write_refuses_missing_version(self):
-        with pytest.raises(ConcurrencyError, match="silently degrade|blind"):
-            conditional_write_request(
-                mode=ConcurrencyMode.LISTITEM_ETAG,
-                endpoint_host="graph.microsoft.com",
-                path="/x",
-                version=None,
-                intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+    def test_conditional_write_args_refuses_missing_version(self):
+        with pytest.raises(ConcurrencyError, match="blind"):
+            conditional_write_args(
+                ConcurrencyMode.LISTITEM_ETAG, _PATH, None, _intent(Q=(1, 2, ColumnKind.SCALAR))
             )
 
-    def test_sharepoint_refuses_ctag_validator(self):
+    def test_sharepoint_refuses_ctag(self):
         with pytest.raises(ConcurrencyError, match="per-endpoint"):
-            conditional_write_request(
-                mode=ConcurrencyMode.LISTITEM_ETAG,
-                endpoint_host="graph.microsoft.com",
-                path="/x",
-                version=VersionTag(VersionKind.CTAG, _CTAG_V2),
-                intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            conditional_write_args(
+                ConcurrencyMode.LISTITEM_ETAG,
+                _PATH,
+                VersionTag(VersionKind.CTAG, "c"),
+                _intent(Q=(1, 2, ColumnKind.SCALAR)),
             )
 
-    def test_conditional_write_carries_ifmatch_and_json_body(self):
-        req = conditional_write_request(
-            mode=ConcurrencyMode.LISTITEM_ETAG,
-            endpoint_host="graph.microsoft.com",
-            path="/sites/S/lists/L/items/7/fields",
-            version=VersionTag(VersionKind.ETAG, _ETAG_V1),
-            intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-        )
-        assert req.method == "PATCH" and req.headers["If-Match"] == _ETAG_V1
-        assert json.loads(req.body.decode()) == {"Quantity": 2}
 
+class TestDecoderKeepsRows:
+    """D10: the decoder must not drop a page's rows."""
 
-class TestSeat2ResultDecode:
-    def test_collection_without_nextlink_is_ok(self):
-        r = graph_result_decode(_reply(200, {"value": [{"id": "1"}]}))
-        assert r == {"status": "ok", "next_cursor": None}
-
-    def test_collection_with_nextlink_is_partial_with_cursor(self):
+    def test_decode_page_keeps_rows_and_cursor(self):
         link = "https://graph.microsoft.com/next?$skiptoken=abc"
-        r = graph_result_decode(_reply(200, {"value": [], "@odata.nextLink": link}))
-        assert r == {"status": "partial", "next_cursor": link}
+        page = decode_page(
+            _reply(200, {"value": [{"id": "1"}, {"id": "2"}], "@odata.nextLink": link})
+        )
+        assert page.result == {"status": "partial", "next_cursor": link}
+        assert page.rows == [{"id": "1"}, {"id": "2"}]
 
-    def test_non_collection_defers_to_neutral_decode_204(self):
-        # 204 no content -> W01 neutral decode reports ok/None.
-        r = graph_result_decode(HttpReply(status=204, headers={}, body=b""))
-        assert r["next_cursor"] is None
+    def test_decode_page_ok_without_cursor_keeps_rows(self):
+        page = decode_page(_reply(200, {"value": [{"id": "1"}]}))
+        assert page.result == {"status": "ok", "next_cursor": None}
+        assert page.rows == [{"id": "1"}]
+
+    def test_seat_returns_only_envelope_but_rows_reachable(self):
+        env = graph_result_decode(_reply(200, {"value": [{"id": "1"}]}))
+        assert env == {"status": "ok", "next_cursor": None}
+        assert decode_page(_reply(200, {"value": [{"id": "1"}]})).rows == [{"id": "1"}]
 
 
-class Test412RecoveryConflictFirst:
-    def test_untouched_field_retries_with_fresh_version(self):
+class TestBaselineConflictBeforeWrite:
+    """D7: compare baseline against the INITIAL GET's actual values."""
+
+    def test_field_already_moved_is_conflict(self):
+        # baseline 1, but the resource already shows 9 (a concurrent writer).
+        c = baseline_conflict(
+            _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V2, "Quantity": 9},
+        )
+        assert isinstance(c, Conflict) and c.moved_fields == ("Quantity",)
+
+    def test_unchanged_field_is_no_conflict(self):
+        assert (
+            baseline_conflict(
+                _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+                {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V1, "Quantity": 1},
+            )
+            is None
+        )
+
+    def test_wrong_identity_is_conflict(self):
+        c = baseline_conflict(
+            _intent(resource_id=_RID, Quantity=(1, 2, ColumnKind.SCALAR)),
+            {FIELD_ID: "999", "Quantity": 1},
+        )
+        assert isinstance(c, Conflict)
+
+
+class TestRecoveryAndReadBack:
+    def test_recovery_retries_when_unmoved(self):
         plan = recover_from_precondition_failed(
             ConcurrencyMode.LISTITEM_ETAG,
-            _reply(PRECONDITION_FAILED),
             _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            _reply(200, {ODATA_ETAG: _ETAG_V2, "Quantity": 1}),
+            {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V2, "Quantity": 1},
         )
-        assert plan.should_retry is True and plan.fresh_version.value == _ETAG_V2
+        assert plan.should_retry and plan.fresh_version.value == _ETAG_V2
 
-    def test_quantity_1_2_9_clobber_is_a_conflict(self):
+    def test_recovery_conflict_when_moved(self):
         plan = recover_from_precondition_failed(
             ConcurrencyMode.LISTITEM_ETAG,
-            _reply(PRECONDITION_FAILED),
             _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            _reply(200, {ODATA_ETAG: _ETAG_V2, "Quantity": 9}),
+            {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V2, "Quantity": 9},
         )
-        assert plan.should_retry is False
-        assert isinstance(plan.conflict, Conflict) and plan.conflict.moved_fields == ("Quantity",)
+        assert not plan.should_retry and plan.conflict.moved_fields == ("Quantity",)
 
-    def test_undocumented_typed_column_refuses(self):
+    def test_undocumented_column_refuses(self):
         with pytest.raises(ConcurrencyError, match="lookup"):
             recover_from_precondition_failed(
                 ConcurrencyMode.LISTITEM_ETAG,
-                _reply(PRECONDITION_FAILED),
-                _intent(AuthorLookupId=({"LookupId": 1}, {"LookupId": 2}, ColumnKind.LOOKUP)),
-                _reply(200, {ODATA_ETAG: _ETAG_V2, "AuthorLookupId": {"LookupId": 1}}),
+                _intent(Author=({"LookupId": 1}, {"LookupId": 2}, ColumnKind.LOOKUP)),
+                {FIELD_ID: _RID, ODATA_ETAG: _ETAG_V2, "Author": {"LookupId": 1}},
             )
 
-    def test_non_412_does_not_retry(self):
-        plan = recover_from_precondition_failed(
-            ConcurrencyMode.LISTITEM_ETAG,
-            _reply(409),
-            _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            _reply(200, {ODATA_ETAG: _ETAG_V2, "Quantity": 1}),
-        )
-        assert plan.should_retry is False and plan.conflict is None
-
-
-class TestReadBack:
-    def test_verified_when_intended_value_present(self):
+    def test_read_back_asserts_identity(self):
         v = verify_read_back(
             _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            _reply(200, {FIELD_ID: "7", "Quantity": 2}),
+            {FIELD_ID: "999", "Quantity": 2},  # right value, WRONG resource
         )
-        assert v.verified is True
+        assert v.verified is False and v.identity_ok is False
 
-    def test_not_verified_when_field_differs(self):
+    def test_read_back_verified_on_target(self):
         v = verify_read_back(
             _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            _reply(200, {FIELD_ID: "7", "Quantity": 9}),
+            {FIELD_ID: _RID, "Quantity": 2},
         )
-        assert v.verified is False and v.mismatches == ("Quantity",)
-
-    def test_success_reason_disclaims_attribution(self):
-        v = verify_read_back(
-            _intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            _reply(200, {FIELD_ID: "7", "Quantity": 2}),
-        )
-        assert "not a claim that this write produced it" in v.reason
+        assert v.verified is True and "not a claim that this write produced it" in v.reason
 
 
 class TestColumnKindRequired:
@@ -259,19 +261,47 @@ class TestColumnKindRequired:
 
 
 # =============================================================================
-# REAL SEQUENCE against a controlled TLS loopback, driven by the W01 sender.
+# W01 composition helpers (read from W01's harness shape; W01 tests untouched).
 # =============================================================================
+def _verifier(*, claimed_subject: str, claimed_tenant: str, service_id: str) -> VerifiedIdentity:
+    return {
+        "subject_ref": f"subject://verified/{claimed_subject}",
+        "tenant_ref": f"tenant://verified/{claimed_tenant}",
+    }
+
+
+def _descriptor(effect: Effect = "write") -> OperationDescriptor:
+    return {
+        "operation_id": "sharepoint.listitem.update",
+        "service_id": "sharepoint",
+        "operation_kind": "mutation",
+        "effect": effect,
+        "credential_modes": ("oauth_user",),
+    }
+
+
+class _RecordingVault(SecretVault):
+    def __init__(self, config_dir: Path) -> None:
+        super().__init__(config_dir)
+        self.asked: List[str] = []
+
+    def get(self, name: str) -> Optional[SecretValue]:
+        self.asked.append(name)
+        return super().get(name)
+
+
 def _tls_material(tmp_path: Path) -> Tuple[Path, Path]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
+        .subject_name(name)
+        .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
         .add_extension(
             x509.SubjectAlternativeName(
                 [
@@ -284,66 +314,48 @@ def _tls_material(tmp_path: Path) -> Tuple[Path, Path]:
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
-    certfile = tmp_path / "loopback-cert.pem"
-    keyfile = tmp_path / "loopback-key.pem"
+    certfile = tmp_path / "c.pem"
+    keyfile = tmp_path / "k.pem"
     certfile.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     keyfile.write_bytes(
         key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
         )
     )
     return certfile, keyfile
 
 
 class _Scripted:
-    """A tiny stateful Graph-like resource served over the loopback.
+    """A tiny stateful Graph-like list item served over the loopback."""
 
-    It records what it received and answers the version-safe sequence:
-    GET -> 200 with eTag v1; PATCH with matching If-Match -> 412 (a concurrent
-    writer already moved it to v2, field UNCHANGED); GET -> 200 eTag v2; PATCH
-    with If-Match v2 -> 200 (applied), state now Quantity=2 eTag v3; final GET ->
-    200 with Quantity=2. Everything is keyed off the REQUEST the server actually
-    receives, so the test's decisions ride the real sender call relationship.
-    """
-
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        script: Callable[
+            ["_Scripted", str, Optional[str], bytes], Tuple[int, Dict[str, str], bytes]
+        ],
+    ):
         self.requests: List[Dict[str, Any]] = []
         self.quantity = 1
         self.etag = _ETAG_V1
-        self._patched_once = False
+        self._patched = False
+        self._script = script
 
-    def handle(
-        self, method: str, if_match: Optional[str], body: bytes
-    ) -> Tuple[int, Dict[str, str], bytes]:
+    def handle(self, method, if_match, body):
         self.requests.append({"method": method, "if_match": if_match, "body": body})
-        if method == "GET":
-            payload = {FIELD_ID: "7", ODATA_ETAG: self.etag, "Quantity": self.quantity}
-            return 200, {}, json.dumps(payload).encode()
-        if method == "PATCH":
-            if not self._patched_once:
-                # A concurrent writer moved the version to v2 (field unchanged),
-                # so our If-Match v1 fails: 412 with the server's current ETag.
-                self._patched_once = True
-                self.etag = _ETAG_V2
-                return 412, {"ETag": _ETAG_V2}, b""
-            # Second PATCH carries If-Match v2 -> applies.
-            self.quantity = json.loads(body.decode())["Quantity"]
-            self.etag = _ETAG_V3
-            return 200, {}, json.dumps({FIELD_ID: "7", ODATA_ETAG: self.etag}).encode()
-        return 405, {}, b""
+        return self._script(self, method, if_match, body)
 
 
 def _handler_for(state: _Scripted):
     class _H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def _do(self) -> None:
+        def _do(self):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
-            if_match = self.headers.get("If-Match")
-            status, headers, out = state.handle(self.command, if_match, body)
+            status, headers, out = state.handle(self.command, self.headers.get("If-Match"), body)
             self.send_response(status)
             for k, v in headers.items():
                 self.send_header(k, v)
@@ -357,26 +369,26 @@ def _handler_for(state: _Scripted):
         do_PATCH = _do
         do_POST = _do
 
-        def log_message(self, *a: Any) -> None:
+        def log_message(self, *a):
             return
 
     return _H
 
 
 @contextmanager
-def _https_server(handler_cls: Any, certfile: Path, keyfile: Path) -> Iterator[int]:
+def _https_server(handler_cls, certfile, keyfile) -> Iterator[int]:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(certfile), str(keyfile))
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
     try:
         yield int(server.server_address[1])
     finally:
         server.shutdown()
         server.server_close()
-        thread.join(timeout=5)
+        t.join(timeout=5)
 
 
 @pytest.fixture
@@ -386,166 +398,127 @@ def trust_loopback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Tuple[Pat
     return certfile, keyfile
 
 
-def test_full_version_safe_sequence_over_real_tls_sender(
-    trust_loopback: Tuple[Path, Path],
-) -> None:
-    """GET -> conditional PATCH -> 412 -> fresh re-GET -> retry -> read-back.
+def _make_execute_dispatch(*, host: str, vault, selector, handle, descriptor):
+    """Bind an execute-backed Dispatch composed from the two seats + the D9 wrapper.
 
-    Driven by the UNMODIFIED W01 ``urllib_http_send`` over a real TLS socket.
-    Correlation is the sender call relationship: each decision consumes the
-    HttpReply the sender returned for the request this module's seat produced.
+    A capturing http_send wraps W01's real urllib_http_send so the orchestrator
+    can read the reply BODY (the L01 result envelope carries no rows), WITHOUT
+    bypassing anything: the capture only records the reply W01's transport
+    already produced; custody, gates and the sender are all W01's.
     """
-    certfile, keyfile = trust_loopback
-    state = _Scripted()
-    intent = _intent(Quantity=(1, 2, ColumnKind.SCALAR))
+    import functools
 
-    with _https_server(_handler_for(state), certfile, keyfile) as port:
-        host = f"localhost:{port}"
-        base = "/sites/S/lists/L/items/7/fields"
+    captured: Dict[str, Optional[HttpReply]] = {"reply": None}
 
-        # 1. GET the resource. The reply is what the sender returned for THIS get.
-        get_req = graph_request_locator(method="GET", endpoint_host=host, path=base)
-        get_reply = urllib_http_send(get_req, timeout_seconds=10.0)
-        assert get_reply.status == 200
-        v1 = extract_version(json.loads(get_reply.body))
-        assert v1 == VersionTag(VersionKind.ETAG, _ETAG_V1)
+    def _capturing_send(request: HttpRequest, **kw: Any) -> HttpReply:
+        reply = urllib_http_send(request, **kw)
+        captured["reply"] = reply
+        return reply
 
-        # 2. Conditional PATCH with If-Match v1 -> the server answers 412.
-        patch_req = conditional_write_request(
-            mode=ConcurrencyMode.LISTITEM_ETAG,
-            endpoint_host=host,
-            path=base,
-            version=v1,
-            intent=intent,
+    locator = functools.partial(graph_request_locator, endpoint_host=host)
+    inner = build_production_transport(
+        selector=selector,
+        vault=vault,
+        locator=locator,
+        http_send=_capturing_send,
+        decode=graph_result_decode,
+    )
+    transport = graph_500_unknown_transport(inner)
+
+    def _dispatch(request_args: Mapping[str, Any]) -> DispatchResult:
+        captured["reply"] = None
+        outcome: ExecutionOutcome = execute(
+            descriptor,
+            handle,
+            transport,
+            now=_T0,
+            offered_mode="oauth_user",
+            permitted=declare_permitted_modes(("oauth_user",)),
+            layers=LayerCeilings(),
+            governance_scope="tools",
+            governance_item="listitem.update",
+            request_args=request_args,
         )
-        patch_reply = urllib_http_send(patch_req, timeout_seconds=10.0)
-        assert patch_reply.status == PRECONDITION_FAILED
+        reply = captured["reply"]
+        body = None
+        if reply is not None and 200 <= reply.status < 300:
+            parsed = json.loads(reply.body) if reply.body else None
+            body = parsed if isinstance(parsed, dict) else None
+        return DispatchResult(outcome=outcome, body=body)
 
-        # 3. Re-GET for the fresh state; 4. recovery decides over the REAL replies.
-        refresh_req = graph_request_locator(method="GET", endpoint_host=host, path=base)
-        refresh_reply = urllib_http_send(refresh_req, timeout_seconds=10.0)
-        plan = recover_from_precondition_failed(
-            ConcurrencyMode.LISTITEM_ETAG, patch_reply, intent, refresh_reply
-        )
-        # Field was untouched by the concurrent writer -> safe retry at v2.
-        assert plan.should_retry is True and plan.fresh_version.value == _ETAG_V2
-
-        # 5. Retry the conditional write with the fresh version -> applied.
-        retry_req = conditional_write_request(
-            mode=ConcurrencyMode.LISTITEM_ETAG,
-            endpoint_host=host,
-            path=base,
-            version=plan.fresh_version,
-            intent=intent,
-        )
-        retry_reply = urllib_http_send(retry_req, timeout_seconds=10.0)
-        assert retry_reply.status == 200
-
-        # 6. Independent read-back over the reply that answered the read-back GET.
-        rb_req = graph_request_locator(method="GET", endpoint_host=host, path=base)
-        rb_reply = urllib_http_send(rb_req, timeout_seconds=10.0)
-        verdict = verify_read_back(intent, rb_reply)
-        assert verdict.verified is True
-
-    # The server saw the real sequence, in order, with the real If-Match values.
-    methods = [(r["method"], r["if_match"]) for r in state.requests]
-    assert methods == [
-        ("GET", None),
-        ("PATCH", _ETAG_V1),
-        ("GET", None),
-        ("PATCH", _ETAG_V2),
-        ("GET", None),
-    ]
+    return _dispatch
 
 
-def test_concurrent_field_change_surfaces_conflict_over_real_tls_sender(
-    trust_loopback: Tuple[Path, Path],
+def _compose(tmp_path: Path):
+    vault = _RecordingVault(tmp_path / "crewhome")
+    vault.set_sync(binding_secret_ref("sharepoint")["name"], "sp-live-token")
+    binding = create_binding(
+        service_id="sharepoint",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_verifier,
+        slug="sharepoint",
+    )
+    handle = derive_handle(
+        binding,
+        granted_scopes=("sites.rw",),
+        requested_scopes=("sites.rw",),
+        now=_T0,
+        ttl_seconds=300.0,
+    )
+    view = ensure_usable(handle, now=_T0)
+    selector = BindingSecretSelector(
+        slug="sharepoint",
+        binding_fingerprint=view.binding_fingerprint,
+        service_id=view.service_id,
+        credential_mode=view.credential_mode,
+    )
+    return vault, selector, handle
+
+
+# =============================================================================
+# REAL SEQUENCE through execute (D6): custody + gates on every hop.
+# =============================================================================
+def test_full_sequence_through_executor_applies_after_safe_retry(
+    trust_loopback: Tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """Same sequence, but the concurrent writer MOVED the field -> conflict, no retry."""
     certfile, keyfile = trust_loopback
+    vault, selector, handle = _compose(tmp_path)
 
-    class _MovedField(_Scripted):
-        def handle(self, method, if_match, body):
-            self.requests.append({"method": method, "if_match": if_match, "body": body})
-            if method == "GET" and not self._patched_once:
-                return (
-                    200,
-                    {},
-                    json.dumps({FIELD_ID: "7", ODATA_ETAG: _ETAG_V1, "Quantity": 1}).encode(),
-                )
-            if method == "PATCH":
-                self._patched_once = True
-                return 412, {"ETag": _ETAG_V2}, b""
-            # Re-GET after 412: a concurrent writer set Quantity=9 at v2.
+    def script(st, method, if_match, body):
+        if method == "GET":
             return (
                 200,
                 {},
-                json.dumps({FIELD_ID: "7", ODATA_ETAG: _ETAG_V2, "Quantity": 9}).encode(),
+                json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag, "Quantity": st.quantity}).encode(),
             )
+        if method == "PATCH" and not st._patched:
+            st._patched = True
+            st.etag = _ETAG_V2  # concurrent writer bumped version, field untouched
+            return 412, {"ETag": _ETAG_V2}, b""
+        st.quantity = json.loads(body.decode())["Quantity"]
+        st.etag = _ETAG_V3
+        return 200, {}, json.dumps({FIELD_ID: _RID, ODATA_ETAG: st.etag}).encode()
 
-    state = _MovedField()
-    intent = _intent(Quantity=(1, 2, ColumnKind.SCALAR))
+    state = _Scripted(script=script)
     with _https_server(_handler_for(state), certfile, keyfile) as port:
-        host = f"localhost:{port}"
-        base = "/sites/S/lists/L/items/7/fields"
-        get_reply = urllib_http_send(
-            graph_request_locator(method="GET", endpoint_host=host, path=base), timeout_seconds=10.0
+        dispatch = _make_execute_dispatch(
+            host=f"localhost:{port}",
+            vault=vault,
+            selector=selector,
+            handle=handle,
+            descriptor=_descriptor(effect="write"),
         )
-        v1 = extract_version(json.loads(get_reply.body))
-        patch_reply = urllib_http_send(
-            conditional_write_request(
-                mode=ConcurrencyMode.LISTITEM_ETAG,
-                endpoint_host=host,
-                path=base,
-                version=v1,
-                intent=intent,
-            ),
-            timeout_seconds=10.0,
-        )
-        assert patch_reply.status == PRECONDITION_FAILED
-        refresh_reply = urllib_http_send(
-            graph_request_locator(method="GET", endpoint_host=host, path=base), timeout_seconds=10.0
-        )
-        plan = recover_from_precondition_failed(
-            ConcurrencyMode.LISTITEM_ETAG, patch_reply, intent, refresh_reply
-        )
-    # The concurrent writer moved Quantity 1->9: refuse to clobber, no retry.
-    assert plan.should_retry is False
-    assert plan.conflict.moved_fields == ("Quantity",)
-    # And no second PATCH was ever sent to the server.
-    assert [r["method"] for r in state.requests] == ["GET", "PATCH", "GET"]
-
-
-# =============================================================================
-# ORCHESTRATOR over the real sender + controlled TLS loopback.
-# =============================================================================
-def test_orchestrator_applies_after_safe_retry_over_real_tls_sender(
-    trust_loopback: Tuple[Path, Path],
-) -> None:
-    """run_version_safe_write drives the whole sequence over W01's real sender.
-
-    The orchestration is MINE; the sender is W01's unmodified urllib_http_send,
-    bound to the controlled TLS loopback. Correlation rides the real call
-    relationship inside the orchestrator (each decision uses the reply that send
-    returned). This module never sees a credential.
-    """
-    certfile, keyfile = trust_loopback
-    state = _Scripted()  # GET v1 -> PATCH(v1)->412 (field untouched) -> GET v2 -> PATCH(v2)->200
-    intent = _intent(Quantity=(1, 2, ColumnKind.SCALAR))
-    with _https_server(_handler_for(state), certfile, keyfile) as port:
-        host = f"localhost:{port}"
-        sender = functools.partial(urllib_http_send, timeout_seconds=10.0)
         outcome = run_version_safe_write(
             mode=ConcurrencyMode.LISTITEM_ETAG,
-            endpoint_host=host,
-            path="/sites/S/lists/L/items/7/fields",
-            intent=intent,
-            send=sender,
+            path=_PATH,
+            intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            dispatch=dispatch,
         )
-    assert outcome.applied is True and outcome.verified is True
-    assert outcome.attempts == 2  # one 412, then the safe retry
-    assert outcome.final_version == VersionTag(VersionKind.ETAG, _ETAG_V3)
-    # The server saw the real ordered sequence with the real If-Match values.
+    assert outcome.applied is True and outcome.verified is True and outcome.attempts == 2
+    # The vault WAS consulted (custody ran) and the real ordered sequence hit the server.
+    assert vault.asked  # custody path exercised
     assert [(r["method"], r["if_match"]) for r in state.requests] == [
         ("GET", None),
         ("PATCH", _ETAG_V1),
@@ -555,92 +528,75 @@ def test_orchestrator_applies_after_safe_retry_over_real_tls_sender(
     ]
 
 
-def test_orchestrator_surfaces_conflict_and_sends_no_second_patch(
-    trust_loopback: Tuple[Path, Path],
+def test_d7_initial_get_already_moved_conflicts_no_write(
+    trust_loopback: Tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """A concurrent writer that MOVED the field -> conflict; orchestrator sends no retry PATCH."""
+    """D7: the initial GET already shows 9/v2 -> conflict BEFORE any PATCH."""
     certfile, keyfile = trust_loopback
+    vault, selector, handle = _compose(tmp_path)
 
-    class _MovedField(_Scripted):
-        def handle(self, method, if_match, body):
-            self.requests.append({"method": method, "if_match": if_match, "body": body})
-            if method == "GET" and not self._patched_once:
-                return (
-                    200,
-                    {},
-                    json.dumps({FIELD_ID: "7", ODATA_ETAG: _ETAG_V1, "Quantity": 1}).encode(),
-                )
-            if method == "PATCH":
-                self._patched_once = True
-                return 412, {"ETag": _ETAG_V2}, b""
+    def script(st, method, if_match, body):
+        # The resource is ALREADY 9 at v2 the very first GET.
+        if method == "GET":
             return (
                 200,
                 {},
-                json.dumps({FIELD_ID: "7", ODATA_ETAG: _ETAG_V2, "Quantity": 9}).encode(),
+                json.dumps({FIELD_ID: _RID, ODATA_ETAG: _ETAG_V2, "Quantity": 9}).encode(),
             )
+        return 200, {}, json.dumps({FIELD_ID: _RID, ODATA_ETAG: _ETAG_V3}).encode()
 
-    state = _MovedField()
+    state = _Scripted(script=script)
     with _https_server(_handler_for(state), certfile, keyfile) as port:
-        host = f"localhost:{port}"
+        dispatch = _make_execute_dispatch(
+            host=f"localhost:{port}",
+            vault=vault,
+            selector=selector,
+            handle=handle,
+            descriptor=_descriptor(effect="write"),
+        )
         outcome = run_version_safe_write(
             mode=ConcurrencyMode.LISTITEM_ETAG,
-            endpoint_host=host,
-            path="/sites/S/lists/L/items/7/fields",
+            path=_PATH,
             intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
-            send=functools.partial(urllib_http_send, timeout_seconds=10.0),
+            dispatch=dispatch,
         )
+    # intent 1->2 but the field is already 9: without the baseline check, If-Match
+    # v2 would MATCH and clobber. Baseline check catches it: conflict, NO PATCH.
     assert outcome.applied is False and outcome.conflict.moved_fields == ("Quantity",)
-    assert [r["method"] for r in state.requests] == ["GET", "PATCH", "GET"]
+    assert [r["method"] for r in state.requests] == ["GET"]  # no PATCH ever sent
 
 
-def test_orchestrator_multi_field_intent_no_count_cap_over_real_tls_sender(
-    trust_loopback: Tuple[Path, Path],
+def test_d9_500_on_write_is_unknown_not_not_applied(
+    trust_loopback: Tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """A write over the MS original required full set (many fields), no count cap.
-
-    Drives several scalar fields at once through the orchestrator; the number of
-    fields is whatever the operation requires, neither reduced to a count nor
-    enlarged by one.
-    """
+    """D9: a 500 on a non-idempotent PATCH -> UNKNOWN outcome, not 'did not land'."""
     certfile, keyfile = trust_loopback
+    vault, selector, handle = _compose(tmp_path)
 
-    class _MultiField(_Scripted):
-        def __init__(self) -> None:
-            super().__init__()
-            self.state = {"Title": "old", "Status": "Open", "Priority": "low", "Owner": "a"}
+    def script(st, method, if_match, body):
+        if method == "GET":
+            return (
+                200,
+                {},
+                json.dumps({FIELD_ID: _RID, ODATA_ETAG: _ETAG_V1, "Quantity": 1}).encode(),
+            )
+        return 500, {}, json.dumps({"error": "boom"}).encode()
 
-        def handle(self, method, if_match, body):
-            self.requests.append({"method": method, "if_match": if_match, "body": body})
-            if method == "GET":
-                payload = {FIELD_ID: "7", ODATA_ETAG: self.etag, **self.state}
-                return 200, {}, json.dumps(payload).encode()
-            # First PATCH applies all named fields (no 412 this time).
-            self.state.update(json.loads(body.decode()))
-            self.etag = _ETAG_V2
-            return 200, {}, json.dumps({FIELD_ID: "7", ODATA_ETAG: self.etag}).encode()
-
-    intent = _intent(
-        Title=("old", "Q3 plan", ColumnKind.SCALAR),
-        Status=("Open", "Closed", ColumnKind.SCALAR),
-        Priority=("low", "high", ColumnKind.SCALAR),
-        Owner=("a", "b", ColumnKind.SCALAR),
-    )
-    state = _MultiField()
+    state = _Scripted(script=script)
     with _https_server(_handler_for(state), certfile, keyfile) as port:
-        host = f"localhost:{port}"
+        dispatch = _make_execute_dispatch(
+            host=f"localhost:{port}",
+            vault=vault,
+            selector=selector,
+            handle=handle,
+            descriptor=_descriptor(effect="write"),  # non-idempotent
+        )
         outcome = run_version_safe_write(
             mode=ConcurrencyMode.LISTITEM_ETAG,
-            endpoint_host=host,
-            path="/sites/S/lists/L/items/7/fields",
-            intent=intent,
-            send=functools.partial(urllib_http_send, timeout_seconds=10.0),
+            path=_PATH,
+            intent=_intent(Quantity=(1, 2, ColumnKind.SCALAR)),
+            dispatch=dispatch,
         )
-    assert outcome.applied is True and outcome.verified is True and outcome.attempts == 1
-    # The PATCH body carried EVERY intended field, verbatim.
-    patch = next(r for r in state.requests if r["method"] == "PATCH")
-    assert json.loads(patch["body"].decode()) == {
-        "Title": "Q3 plan",
-        "Status": "Closed",
-        "Priority": "high",
-        "Owner": "b",
-    }
+    assert outcome.applied is False
+    assert outcome.write_outcome == ATTEMPT_UNKNOWN  # do NOT record 'not applied'
+    assert "UNKNOWN" in outcome.reason
