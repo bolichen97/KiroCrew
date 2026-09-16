@@ -74,12 +74,12 @@ from cryptography.x509.oid import NameOID  # noqa: E402
 from kiro_crew.connections.control_plane.auth_modes import declare_permitted_modes  # noqa: E402
 from kiro_crew.connections.control_plane.binding import (  # noqa: E402
     VerifiedIdentity,
-    binding_secret_ref,
     create_binding,
 )
 from kiro_crew.connections.control_plane.handle import derive_handle, ensure_usable  # noqa: E402
+from kiro_crew.connections.control_plane.lifecycle import BindingStore  # noqa: E402
 from kiro_crew.connections.control_plane.policy import LayerCeilings  # noqa: E402
-from kiro_crew.connections.control_plane.production import BindingSecretSelector  # noqa: E402
+from kiro_crew.connections.control_plane.production import BindingCustodyGate  # noqa: E402
 from kiro_crew.secrets import SecretValue, SecretVault  # noqa: E402
 
 # The sibling W06 graph seam — imported HARD (used transitively via this leaf's
@@ -337,7 +337,6 @@ def trust_loopback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Tuple[Pat
 
 def _compose(tmp_path: Path, service_id: str):
     vault = _RecordingVault(tmp_path / f"crewhome-{service_id}")
-    vault.set_sync(binding_secret_ref(service_id)["name"], f"{service_id}-live-token")
     binding = create_binding(
         service_id=service_id,
         claimed_subject="alice",
@@ -346,6 +345,9 @@ def _compose(tmp_path: Path, service_id: str):
         verifier=_verifier,
         slug=service_id,
     )
+    # The store's select_secret reads secret_ref["name"] from the binding's OWN
+    # record (never a slug-collapsed name); create_binding stamped that ref.
+    vault.set_sync(binding["secret_ref"]["name"], f"{service_id}-live-token")
     handle = derive_handle(
         binding,
         granted_scopes=("files.rw",),
@@ -354,13 +356,19 @@ def _compose(tmp_path: Path, service_id: str):
         ttl_seconds=300.0,
     )
     view = ensure_usable(handle, now=_T0)
-    selector = BindingSecretSelector(
-        slug=service_id,
-        binding_fingerprint=view.binding_fingerprint,
-        service_id=view.service_id,
-        credential_mode=view.credential_mode,
+    # PRODUCTION_SCHEMA_VERSION 4 custody: a BindingCustodyGate keyed on the
+    # trusted view's fingerprint (selects no secret, derives no vault name) plus a
+    # live on-disk L04 BindingStore holding the binding (the trusted source the
+    # transport's select_secret fences against and reads the ref from). This is
+    # the real seam that replaced the old BindingSecretSelector.
+    gate = BindingCustodyGate(binding=binding, binding_fingerprint=view.binding_fingerprint)
+    store = BindingStore(tmp_path / f"connections-{service_id}" / "control_plane_bindings.json")
+    store.insert(
+        binding,
+        deployment_id=f"deployment://test/{service_id}/0",
+        kiro_principal="kiro://test/owner",
     )
-    return vault, selector, handle
+    return vault, gate, store, handle
 
 
 def _dispatch_for(*, host: str, service_id: str, tmp_path: Path):
@@ -369,14 +377,16 @@ def _dispatch_for(*, host: str, service_id: str, tmp_path: Path):
     The factory binds W06's ``build_graph_write_dispatch`` itself, so what the
     tests exercise is the shipped composition — not a Dispatch assembled in the
     test. The W01 auth-chain seats come from ``_compose`` (a real encrypted
-    vault, a real binding/handle/selector); the factory does the
+    vault, a real binding/handle, and W01's PRODUCTION_SCHEMA_VERSION 4 custody:
+    a live ``BindingStore`` + ``BindingCustodyGate``); the factory does the
     descriptor + ``build_graph_write_dispatch`` wiring.
     """
-    vault, selector, handle = _compose(tmp_path, service_id)
+    vault, gate, store, handle = _compose(tmp_path, service_id)
     return build_office_cloud_dispatch(
         endpoint_host=host,
         handle=handle,
-        selector=selector,
+        gate=gate,
+        store=store,
         vault=vault,
         permitted=declare_permitted_modes(("oauth_user",)),
         layers=LayerCeilings(),
@@ -566,27 +576,33 @@ def test_put_landed_then_connection_dropped_is_unknown_not_not_committed(
     WriteStatus.UNKNOWN — never a determinate not-committed, which would license
     a duplicate retry of a write that already landed.
 
-    THIS TEST IS RED TODAY, ON PURPOSE — it is NOT xfail, because a strict-xfail
-    would file a known, required contract under "expected" and show a green suite
-    while the contract is unproven. The committed-then-disconnect contract is NOT
-    yet proven end-to-end. It is blocked by a W01 transport gap I must NOT edit
-    (owner-crossing) and must NOT paper over by wrapping/patching/substituting the
-    sender:
+    NOW GREEN, because the real upstream defect is FIXED — not by any wrap, shim
+    or sender substitution here, and not by editing W01. W01's transport
+    (PRODUCTION_SCHEMA_VERSION 4) now catches the drop with:
 
-        production.py:1277 catches only
-        `(urllib.error.URLError, TimeoutError, TransportDeadlineExceededError)`.
-        A connection dropped AFTER the request was sent but BEFORE a response —
-        urllib's getresponse() raises http.client.RemoteDisconnected, whose MRO is
-        RemoteDisconnected -> ConnectionResetError -> ConnectionError -> OSError
-        -> BadStatusLine -> HTTPException. It is NOT a URLError and NOT a
-        TimeoutError, so it escapes that clause UNCAUGHT and never maps to
-        write_outcome=UNKNOWN.
+        except (
+            urllib.error.URLError,
+            ConnectionError,
+            http.client.HTTPException,
+            TimeoutError,
+            TransportDeadlineExceededError,
+        ):
 
-    The fix is a one-line widen of production.py:1277 to ALSO catch
-    ConnectionError (the transport docstring already says a dropped connection
-    and a timeout are treated identically for a non-idempotent write). That hunk
-    belongs to W01; when it lands, this test goes green with no change here.
-    Negative (b) (500->UNKNOWN via the shipped graph_500_unknown_transport)
+    which is BROADER than the one-line `ConnectionError` widen first proposed:
+    urllib's getresponse() raises http.client.RemoteDisconnected, whose MRO is
+    RemoteDisconnected -> ConnectionResetError -> ConnectionError -> OSError ->
+    BadStatusLine -> HTTPException. It is neither a URLError nor a TimeoutError,
+    so it escaped the old clause until BOTH `ConnectionError` (covers
+    RemoteDisconnected/ConnectionResetError) and `http.client.HTTPException`
+    (also covers IncompleteRead/BadStatusLine) were named. The drop now maps to
+    write_outcome=UNKNOWN and this leaf's UNCHANGED U1 handling surfaces it as
+    WriteStatus.UNKNOWN.
+
+    CANDIDATE ON AN UNMERGED W01 BASE: this passes against W01 #11286 at
+    2381df1bf (still OPEN; the committed-then-disconnect hunk is unchanged at
+    #11286's newer head 2caa5150f, so this is a real answer about THIS contract).
+    It is NOT evidence about #11286's newer scoped-refs / metadata / isolation
+    fixes. Negative (b) (500->UNKNOWN via the shipped graph_500_unknown_transport)
     proves the 500 path, NOT this drop path — the two are different failures."""
     certfile, keyfile = trust_loopback
     original, media_type, edit, check = _fixture_for(OfficeFormat.DOCX)

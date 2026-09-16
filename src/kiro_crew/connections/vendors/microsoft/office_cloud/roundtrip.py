@@ -340,7 +340,8 @@ def build_office_cloud_dispatch(
     *,
     endpoint_host: str,
     handle: Any,
-    selector: Any,
+    gate: Any,
+    store: Any,
     vault: Any,
     permitted: Any,
     layers: Any,
@@ -379,11 +380,15 @@ def build_office_cloud_dispatch(
     binds ONE descriptor per Dispatch; the GET hops ride the same dispatch, which
     is correct because a GET applies no effect for the write-gate to act on.
 
-    ``handle`` / ``selector`` / ``vault`` / ``permitted`` / ``layers`` /
+    ``handle`` / ``gate`` / ``store`` / ``vault`` / ``permitted`` / ``layers`` /
     ``offered_mode`` are W01 types the composing caller owns (kept ``Any`` here so
     this vendor module does not re-import W01's whole type surface, mirroring
-    ``build_graph_write_dispatch``'s own signature). ``now`` is for a
-    deterministic test only.
+    ``build_graph_write_dispatch``'s own signature). ``gate`` is W01's
+    :class:`BindingCustodyGate` and ``store`` its live
+    :class:`~kiro_crew.connections.control_plane.lifecycle.BindingStore` — the
+    PRODUCTION_SCHEMA_VERSION 4 custody seam that replaced the old ``selector``;
+    they are passed straight through to W06's dispatch, resolved per call from the
+    trusted binding identity. ``now`` is for a deterministic test only.
 
     NOTE: W01's auth chain (L03 auth-code, L04 rotation fencing,
     principal->binding) is NOT complete and carries reported gaps, and W01's own
@@ -402,7 +407,8 @@ def build_office_cloud_dispatch(
         descriptor=descriptor,
         handle=handle,
         endpoint_host=endpoint_host,
-        selector=selector,
+        gate=gate,
+        store=store,
         vault=vault,
         offered_mode=offered_mode,
         permitted=permitted,
