@@ -605,6 +605,35 @@ class TestStructuralTerminalGuard:
         assert loop.cycle_count == before
 
     @pytest.mark.asyncio
+    async def test_quiescing_loop_none_verdict_is_not_dispatched(self) -> None:
+        """update() returns None when the loop is quiescing/removed under
+        maintenance (``_acquire_mutation_lock`` returns None), NOT only when the
+        generation fence refuses. None must be treated as 'not a live target' --
+        return without dispatching -- exactly like the sibling
+        ``_stop_message_loop_if_structural_terminal`` seam, rather than falling
+        through and re-firing the doomed context on a loop being torn down.
+        """
+        orch = _orchestrator()
+        loop = _loop()
+        before = loop.cycle_count
+        # The mutation was refused because the loop is quiescing: update -> None.
+        orch.autonudge_svc.update = AsyncMock(return_value=None)
+        slot = _slot()
+        slot._last_turn_structural_terminal = True
+        slot._last_turn_structural_terminal_loop_id = loop.id
+        slot._last_turn_structural_terminal_loop_gen = loop.config_generation
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+        ):
+            # bool path (message loop) -> False: nothing dispatched.
+            assert await orch._fire_dashboard_nudge(loop) is False
+        assert spawn.calls == [], "a quiescing loop was wrongly dispatched"
+        assert loop.cycle_count == before
+
+    @pytest.mark.asyncio
     async def test_stale_verdict_from_a_different_loop_does_not_stop_this_one(self) -> None:
         """The verdict is loop-scoped: a stale flag left by a STOPPED malformed
         loop must not deactivate a DIFFERENT loop armed later on the same slot.

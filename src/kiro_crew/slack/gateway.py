@@ -7021,15 +7021,25 @@ class GatewayOrchestrator:
                 stopped_reason=STRUCTURAL_TERMINAL_REASON,
                 expected_generation=_expected_gen,
             )
-            # The fence answers: inactive == stopped (verdict applied); still
-            # active == refused because the config generation advanced under the
-            # turn (stale completion) -- fall through and dispatch the new config.
-            if stopped_loop is not None and not stopped_loop.active:
+            # The fence answers three cases, and only ONE may dispatch:
+            #   * inactive loop  -> stopped (verdict applied): return UNAVAILABLE.
+            #   * None            -> update refused the mutation because the loop
+            #     is quiescing/removed under maintenance (``_acquire_mutation_lock``
+            #     returns None), NOT a live target: return UNAVAILABLE, matching
+            #     the sibling ``_stop_message_loop_if_structural_terminal`` seam,
+            #     which treats None as not-a-live-loop.
+            #   * still-active loop -> the fence refused because the config
+            #     generation advanced under the turn (stale completion): fall
+            #     through and dispatch the reconfigured loop.
+            # So dispatch happens ONLY for a non-None ACTIVE loop; a None must not
+            # be conflated with "refused, still firing".
+            if stopped_loop is None or not stopped_loop.active:
                 logger.warning(
-                    "AutoNudge: loop %s on slot %s stopped — its last delivered "
-                    "turn was rejected as structurally malformed, so re-firing "
-                    "the same context cannot help; the loop stays inactive and a "
-                    "later directive (after a fresh conversation) may re-arm it",
+                    "AutoNudge: loop %s on slot %s not dispatched — its last "
+                    "delivered turn was rejected as structurally malformed and "
+                    "the loop is stopped or is not a live target; re-firing "
+                    "the same context cannot help, and a later directive (after "
+                    "a fresh conversation) may re-arm it",
                     loop.id,
                     loop.slot_key,
                 )
