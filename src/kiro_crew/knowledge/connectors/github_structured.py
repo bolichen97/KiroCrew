@@ -621,7 +621,23 @@ class GithubStructuredConnector(BaseConnector):
     live read; and :meth:`validate_config` refuses source *creation* for the same
     reason. The pure conversion/diff/checkpoint surface is what is verified in
     this PR (it is not on ``main`` yet).
+
+    The shared registrar injects a per-source ``transport_provider`` factory when
+    the host has installed one (``knowledge_connector_runners["github"]``). We
+    accept and store it so the registrar's injected construction does not raise —
+    but PR-2 does **not** consume it: every live read still refuses. Wiring the
+    stored provider into a real fetch is PR-3's job; storing it here changes no
+    behaviour and adds no transport, switch, or mock.
     """
+
+    def __init__(self, transport_provider=None) -> None:
+        # Optional per-source runner factory injected by the shared registrar
+        # (``_LazyConnector`` builds us as ``GithubStructuredConnector(
+        # transport_provider=<factory>)`` when the host installed one). Accept
+        # and retain it so that injected construction does not raise TypeError
+        # (which the registrar would swallow into a permanent silent-fail state);
+        # it is NOT read anywhere in PR-2 — fetch/detect_changes still refuse.
+        self._transport_provider = transport_provider
 
     def source_type(self) -> str:
         return SOURCE_TYPE

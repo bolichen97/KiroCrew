@@ -222,6 +222,21 @@ class TestParkedLivePaths(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             asyncio.run(self.c.detect_changes({"repo_full_name": REPO}))
 
+    def test_injected_transport_provider_is_accepted_but_still_refuses(self):
+        # The shared registrar builds us as
+        # GithubStructuredConnector(transport_provider=<factory>) when the host
+        # installed a runner factory. Construction must NOT raise (a swallowed
+        # TypeError would leave the connector permanently silent-failed), the
+        # value is stored, and PR-2 still refuses every live read — the injected
+        # provider is not consumed yet.
+        sentinel = object()
+        c = GithubStructuredConnector(transport_provider=sentinel)
+        self.assertIs(c._transport_provider, sentinel)
+        with self.assertRaises(NotImplementedError):
+            asyncio.run(c.fetch({"repo_full_name": REPO}))
+        with self.assertRaises(NotImplementedError):
+            asyncio.run(c.detect_changes({"repo_full_name": REPO}))
+
 
 if __name__ == "__main__":
     unittest.main()

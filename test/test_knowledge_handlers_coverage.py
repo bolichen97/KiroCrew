@@ -1305,7 +1305,7 @@ class TestSearchForContext:
         async def _direct(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
-        def _retriever(_store, embedder=None, *, embed_sig=None):
+        def _retriever(_store, embedder=None, *, embed_sig=None, revalidator=None, binding_resolver=None):
             seen["embedder"] = embedder
             seen["embed_sig"] = embed_sig
             return MagicMock(search=MagicMock(return_value=[]))
@@ -1329,7 +1329,7 @@ class TestSearchForContext:
         async def _direct(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
-        def _retriever(_store, embedder=None, *, embed_sig=None):
+        def _retriever(_store, embedder=None, *, embed_sig=None, revalidator=None, binding_resolver=None):
             seen["embedder"] = embedder
             seen["embed_sig"] = embed_sig
             return MagicMock(search=MagicMock(return_value=[]))
@@ -1812,12 +1812,17 @@ class TestSetupKnowledgeRoutes:
             # them and the Default contributes nothing.
             assert sync.get_connector("local_folder") is not None
             assert sync.get_connector("obsidian_vault") is not None
-            # The GitHub structured connector resolves through the real factory
-            # path (fresh KnowledgeStore, clean config_dir, real SyncScheduler) —
-            # not a hand-built map.
+            # The GitHub structured source resolves through the real factory
+            # path (fresh KnowledgeStore, clean config_dir, real SyncScheduler)
+            # via the shared DEFERRED registrar — a boot-cheap _LazyConnector, so
+            # no vendor import/construction runs on the boot path. Discoverability
+            # is preserved: it resolves and answers source_type "github", and the
+            # lazy proxy builds our real GithubStructuredConnector on first use.
             gh_connector = sync.get_connector("github")
-            assert isinstance(gh_connector, GithubStructuredConnector)
+            assert gh_connector is not None
             assert gh_connector.source_type() == "github"
+            assert isinstance(gh_connector, kh._LazyConnector)
+            assert isinstance(gh_connector._load(), GithubStructuredConnector)
             assert sync.get_connector("nope") is None
             # Both startup hooks are registered (watcher + artifact ingest).
             # aiohttp seeds on_startup with its own cleanup-ctx hook, so compare
@@ -1843,7 +1848,9 @@ class TestSetupKnowledgeRoutes:
 
         Drives the real factory (no pre-set pipeline, so the connector-assembly
         block actually runs). First asserts the built-in map resolves 'github'
-        to GithubStructuredConnector. Then, with a KnowledgeProvider whose
+        through the shared DEFERRED registrar (a _LazyConnector answering
+        source_type 'github'; its lazy load builds our real
+        GithubStructuredConnector). Then, with a KnowledgeProvider whose
         extra_connectors contributes its own 'github', asserts the edition entry
         WINS — proving the built-ins are set BEFORE the edition merge, so the
         seam is neither shadowed nor overridden by the core entry.
@@ -1867,13 +1874,15 @@ class TestSetupKnowledgeRoutes:
             for callback in list(app.on_cleanup):
                 await callback(app)
 
-        # 1) Built-in composition: the real factory resolves 'github'.
+        # 1) Built-in composition: the real factory resolves 'github' via the
+        #    deferred registrar (a _LazyConnector; its load builds our connector).
         app = _fresh_app()
         kh.setup_knowledge_routes(app)
         try:
-            assert isinstance(
-                app["knowledge_sync"].get_connector("github"),
-                GithubStructuredConnector)
+            gh = app["knowledge_sync"].get_connector("github")
+            assert isinstance(gh, kh._LazyConnector)
+            assert gh.source_type() == "github"
+            assert isinstance(gh._load(), GithubStructuredConnector)
         finally:
             await _cleanup(app)
 
