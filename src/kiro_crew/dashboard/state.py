@@ -2152,6 +2152,9 @@ class _ChatSlot:
         "_refusal_replay_stop_gen",
         "_refusal_replay_session_stop_gen",
         "_posttoken_retry_used",
+        "_last_turn_structural_terminal",
+        "_last_turn_structural_terminal_loop_id",
+        "_last_turn_structural_terminal_loop_gen",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_empty_response_retries",
@@ -2665,6 +2668,24 @@ class _ChatSlot:
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
         # completed turn alongside _transient_5xx_retries.
         self._posttoken_retry_used: bool = False
+        # True after the slot's LAST turn ended on a STRUCTURAL terminal error
+        # (a malformed-request rejection: the backend refused the payload's
+        # SHAPE, so re-sending the identical context reproduces it). Read by the
+        # auto-nudge fire path to STOP a self-prompting loop instead of firing
+        # the same doomed context every interval; cleared at the start of every
+        # genuine new turn (see chat_runner) so a human /clear-then-message, or
+        # any turn with different context, re-arms the loop. Not persisted: a
+        # gateway restart re-derives it from the next turn's outcome, and a loop
+        # reloaded active simply fires once and re-learns the verdict.
+        self._last_turn_structural_terminal: bool = False
+        # The id of the loop whose delivered wake set the flag above, so the fire
+        # guard scopes the verdict to that loop and cannot deactivate a DIFFERENT
+        # loop armed later on the same slot. Empty when the flag is False.
+        self._last_turn_structural_terminal_loop_id: str = ""
+        # The loop's config generation the malformed turn fired under; the fire
+        # guard passes it to AutoNudgeService.update(expected_generation=...) so
+        # the stop is applied under an atomic (id, generation) fence.
+        self._last_turn_structural_terminal_loop_gen: int = 0
         # Poisoned-conversation escalation (cross-cycle). A cycle that EXHAUSTS
         # the transient-5xx ladder with ZERO output counts one pre-stream
         # exhaustion; consecutive exhausted cycles indicate the backend is

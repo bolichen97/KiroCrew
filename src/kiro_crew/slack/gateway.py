@@ -57,6 +57,7 @@ from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     MONITOR_TERMINAL_REASON,
+    STRUCTURAL_TERMINAL_REASON,
     AutoNudgeService,
     NudgeLoop,
 )
@@ -6360,12 +6361,19 @@ class GatewayOrchestrator:
                 await self.autonudge_svc.remove(loop.id)
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         if wake_message is None:
-            msg_body = await compose_nudge_body(
-                loop.message, loop.stop_sentinel_path, loop.slot_key
-            )
+            # Snapshot message, sentinel AND config generation TOGETHER, before
+            # the compose_nudge_body() await, so a concurrent PATCH during that
+            # suspension cannot pair the old message with a new generation (which
+            # would make the malformed verdict match the reconfigured loop and
+            # wrongly stop it). The fence below compares this captured generation.
+            _fired_message = loop.message
+            _fired_sentinel = loop.stop_sentinel_path
+            _fired_generation = loop.config_generation
+            msg_body = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         else:
             tagged = wake_message
+            _fired_generation = loop.config_generation
         # Fail closed: an unattended turn MUST run under the HookManager
         # PreToolUse governance gate (mirrors cron's default approval path).
         # Without ctx_builder there are no hooks to enforce the gate — skip.
@@ -6569,8 +6577,11 @@ class GatewayOrchestrator:
             if _driver_completion_hook is not None and _driver_completion_hook.accepted:
                 return MonitorDispatchResult.DISPATCHED
             return MonitorDispatchResult.BUSY
-        except Exception:
+        except Exception as exc:
             logger.exception("AutoNudge: slack nudge turn failed for %s (loop %s)", key, loop.id)
+            await self._stop_message_loop_if_structural_terminal(
+                loop, exc, wake_message, _fired_generation
+            )
             if (
                 wake_message is not None
                 and _driver_completion_hook is not None
@@ -6835,6 +6846,72 @@ class GatewayOrchestrator:
             logger.exception("AutoNudge: webex nudge failed (loop %s)", loop.id)
             return False
 
+    async def _stop_message_loop_if_structural_terminal(
+        self,
+        loop: NudgeLoop,
+        exc: BaseException,
+        wake_message: str | None,
+        fired_generation: int,
+    ) -> bool:
+        """Stop a MESSAGE loop whose fired turn raised a structural rejection.
+
+        A malformed-request rejection ("Improperly formed request") is
+        deterministic in the payload's SHAPE, so re-firing the identical nudge
+        context can only reproduce it -- an undelivered cycle that the service
+        would otherwise re-arm with backoff, forever, since undelivered cycles
+        never reach ``max_cycles``. This is the CHANNEL-adapter counterpart to
+        the dashboard fire path's pre-dispatch guard: a channel adapter runs its
+        turn inline and holds the exception directly, so it reads the verdict off
+        the exception (``AcpError.structural_terminal``) rather than through the
+        slot flag the dashboard path relays. Scoped to message loops
+        (``wake_message is None``): a structured monitor wake carries its own
+        actionable context, not this repeated prompt, and keeps its own dispatch
+        contract. Returns True when it stopped the loop. getattr-guarded: only
+        AcpError carries the attribute.
+
+        ``fired_generation`` is ``loop.config_generation`` captured at fire time.
+        The stop is applied through ``AutoNudgeService.update(expected_generation
+        =...)``, which compares it against the loop's CURRENT generation UNDER
+        THE SERVICE LOCK: an inline channel turn can be slow, and a concurrent
+        ``PATCH /api/autonudge/{id}`` can change the instruction (advancing the
+        generation) WHILE the turn runs -- possibly back to the same text
+        (A->B->A). The atomic fence refuses the stale stop with no TOCTOU window;
+        a value compare on ``message`` could not tell a re-committed A apart.
+        """
+        if wake_message is not None:
+            return False
+        if not getattr(exc, "structural_terminal", False):
+            return False
+        if self.autonudge_svc is None:
+            return False
+        stopped_loop = await self.autonudge_svc.update(
+            loop.id,
+            active=False,
+            stopped_reason=STRUCTURAL_TERMINAL_REASON,
+            expected_generation=fired_generation,
+        )
+        if stopped_loop is None or stopped_loop.active:
+            # The fence refused: the loop's config generation advanced under the
+            # in-flight turn, so this malformed verdict belongs to an OLD
+            # instruction and must not deactivate the reconfigured loop.
+            logger.info(
+                "AutoNudge: loop %s on %s not stopped — its config generation "
+                "advanced while the malformed turn ran, so the rejection does "
+                "not apply to the current instruction",
+                loop.id,
+                loop.slot_key,
+            )
+            return False
+        logger.warning(
+            "AutoNudge: loop %s on %s stopped — its delivered turn was rejected "
+            "as structurally malformed, so re-firing the same context cannot "
+            "help; the loop stays inactive and a later directive (after a fresh "
+            "conversation) may re-arm it",
+            loop.id,
+            loop.slot_key,
+        )
+        return True
+
     async def _fire_dashboard_nudge(
         self, loop: NudgeLoop, wake_message: str | None = None
     ) -> bool | MonitorDispatchResult:
@@ -6910,8 +6987,70 @@ class GatewayOrchestrator:
                 loop.slot_key,
                 loop.id,
             )
+        # STRUCTURAL-TERMINAL GUARD (message loops only). If the slot's LAST
+        # delivered turn ended on a malformed-request rejection, the backend
+        # refused the payload's SHAPE, deterministically -- re-injecting the same
+        # nudge context can only reproduce it. Firing again would spend cycle
+        # after cycle (the reported cycles 13, 14, ...) on an identical doomed
+        # turn, so STOP the loop instead. The verdict is scoped to the loop id
+        # (``_last_turn_structural_terminal_loop_id``) AND applied under an ATOMIC
+        # (id, generation) fence in AutoNudgeService.update(expected_generation=):
+        # the loop's config generation captured at fire time
+        # (``_last_turn_structural_terminal_loop_gen``) must still match under the
+        # service lock, or the completion is a STALE result of an OLD instruction
+        # (the A->B->A race) and the stop is refused there with no TOCTOU window.
+        # The loop stays INACTIVE when stopped; the stop is REPLACEABLE
+        # (STRUCTURAL_TERMINAL_REASON), which does not re-arm on its own -- it
+        # only PERMITS a later directive to re-arm the loop, and any such re-arm
+        # advances the generation so this verdict cannot follow it. The slot's
+        # verdict is cleared at the start of every genuine new turn (chat_runner).
+        # A structured monitor WAKE (``wake_message is not None``) carries its own
+        # actionable context and is out of scope here. Tested with ``is True``
+        # (not truthiness) so a bare MagicMock slot's truthy attribute cannot
+        # trip it; getattr keeps minimal slot doubles safe.
+        if (
+            wake_message is None
+            and getattr(slot, "_last_turn_structural_terminal", False) is True
+            and getattr(slot, "_last_turn_structural_terminal_loop_id", "") == loop.id
+            and self.autonudge_svc is not None
+        ):
+            _expected_gen = int(getattr(slot, "_last_turn_structural_terminal_loop_gen", 0) or 0)
+            stopped_loop = await self.autonudge_svc.update(  # type: ignore[union-attr]
+                loop.id,
+                active=False,
+                stopped_reason=STRUCTURAL_TERMINAL_REASON,
+                expected_generation=_expected_gen,
+            )
+            # The fence answers: inactive == stopped (verdict applied); still
+            # active == refused because the config generation advanced under the
+            # turn (stale completion) -- fall through and dispatch the new config.
+            if stopped_loop is not None and not stopped_loop.active:
+                logger.warning(
+                    "AutoNudge: loop %s on slot %s stopped — its last delivered "
+                    "turn was rejected as structurally malformed, so re-firing "
+                    "the same context cannot help; the loop stays inactive and a "
+                    "later directive (after a fresh conversation) may re-arm it",
+                    loop.id,
+                    loop.slot_key,
+                )
+                return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
+            logger.info(
+                "AutoNudge: loop %s structural stop skipped — config generation "
+                "advanced under the fired turn, so the verdict is stale",
+                loop.id,
+            )
         if wake_message is None:
-            msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+            # Snapshot message, sentinel AND config generation TOGETHER, before
+            # the compose_nudge_body() await: a concurrent PATCH during that
+            # suspension could otherwise pair the OLD message with the NEW
+            # generation, so the malformed verdict would match the reconfigured
+            # loop's generation and wrongly stop it. The generation recorded with
+            # the verdict must be the one that goes with the message the turn
+            # actually runs.
+            _fired_message = loop.message
+            _fired_sentinel = loop.stop_sentinel_path
+            _fired_generation = loop.config_generation
+            msg = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
         else:
             tagged = wake_message
@@ -7092,6 +7231,13 @@ class GatewayOrchestrator:
         # carries this mark. On a crew/member slot the wake only exists because
         # ``_dashboard_mode_admits`` already proved the loop self-armed.
         run_kwargs["_directive_self_wake"] = True
+        # Scope the structural-terminal verdict this turn may record to THIS loop
+        # and the CONFIG GENERATION it fires under (the snapshot captured with the
+        # message above, before compose_nudge_body's await), so the stop is
+        # applied via an atomic (id, generation) fence and a stale completion
+        # cannot deactivate a loop whose config advanced under the turn.
+        run_kwargs["_directive_loop_id"] = loop.id
+        run_kwargs["_directive_loop_gen"] = _fired_generation if wake_message is None else 0
         if completion_hook is not None:
             run_kwargs["monitor_completion"] = completion_hook
             # Structured monitor turns own a single durable budgeted turn.

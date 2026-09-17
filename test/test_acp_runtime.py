@@ -3725,6 +3725,49 @@ async def test_wait_for_compaction_cached_result_applies_post_compaction_metadat
 
 
 @pytest.mark.asyncio
+async def test_wait_for_compaction_timeout_restores_a_concurrent_frame():
+    """RECOVERY contract for a compaction that never reports terminal.
+
+    ``wait_for_compaction`` returning ``{"type": "timeout"}`` means only that
+    THIS reader did not observe a completed/failed status inside its window --
+    NOT that the provider never sent one. A live turn can be draining the same
+    session queue concurrently; the wait must therefore not SWALLOW the frames
+    it pulls while looking for the status, or the next legal turn (or the live
+    turn's own dispatch loop) is stranded -- the exact "stuck after a timed-out
+    /compact" shape. This pins that a non-compaction frame observed during a
+    wait that then times out is RESTORED to the queue, so the following reader
+    still sees it. (It does not, and cannot, prove the historical incident was
+    this race -- only that the reader does not drop a concurrent frame on the
+    timeout path.)
+    """
+    from kiro_crew.acp.types import AcpPromptStats, JsonRpcMessage
+
+    rt, _reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.last_prompt_stats = AcpPromptStats(
+        context_pct=50.0,
+        context_used_tokens=100_000,
+        context_window_tokens=200_000,
+        context_tokens_from_usage=True,
+    )
+    # A frame belonging to a concurrent live turn, and NO compaction status
+    # behind it: the status the provider may have sent was consumed elsewhere
+    # (or never arrived within the window). The wait must time out AND hand the
+    # live-turn frame back.
+    live_frame = JsonRpcMessage(
+        method="session/update", params={"sessionId": "sA", "update": {"live": True}}
+    )
+    q["sA"].put_nowait(live_frame)
+
+    result = await handle.wait_for_compaction(timeout=0.3)
+
+    assert result == {"type": "timeout"}
+    # The concurrent frame is back on the queue for the next reader, not dropped.
+    assert q["sA"].get_nowait() is live_frame
+
+
+@pytest.mark.asyncio
 async def test_dispatch_agent_switched():
     """Agent switched notification yields EVENT_AGENT_SWITCHED."""
     from kiro_crew.acp.types import EVENT_AGENT_SWITCHED, METHOD_AGENT_SWITCHED

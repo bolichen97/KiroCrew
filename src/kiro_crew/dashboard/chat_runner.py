@@ -7160,6 +7160,20 @@ async def _run_chat(
     # issues from inside that wake is its own act. Cron, app and sub-agent
     # injections never set it.
     _directive_self_wake: bool = False,
+    # The id of the nudge/monitor loop whose delivered wake this turn is (set only
+    # by ``_fire_dashboard_nudge`` alongside ``_directive_self_wake``). SCOPES the
+    # structural-terminal slot verdict to the exact loop that produced
+    # it: a slot outlives any single loop (stop one, arm another on the same
+    # slot), so a slot-wide flag would let a stopped malformed loop's verdict
+    # deactivate a DIFFERENT loop armed later on that slot. Empty for every
+    # non-self-wake turn.
+    _directive_loop_id: str = "",
+    # The loop's CONFIG GENERATION at fire time (``loop.config_generation``),
+    # recorded with the verdict so the structural stop is applied under an ATOMIC
+    # (id, generation) fence: a stale completion of an OLD instruction cannot
+    # deactivate a loop whose config advanced since (the A->B->A race that a
+    # message-value key could not tell apart). Captured by the fire path.
+    _directive_loop_gen: int = 0,
     _directive_channel_origin: bool = False,
     # Who caused this turn, from the dispatch that knows -- a consumed queue
     # entry's enqueue-time ``kind`` tag, or an injector calling this runner
@@ -7758,6 +7772,17 @@ async def _run_chat(
     # this reset is a no-op for them and a later real turn can still recover.
     if message not in _SYNTHETIC_RECOVERY_MSGS:
         slot._posttoken_retry_used = False
+        # Clear the last turn's structural-terminal verdict at the START of a
+        # GENUINE new turn. The auto-nudge fire path reads this to refuse
+        # re-firing an identical context the backend rejected for its shape;
+        # a real new turn (a human /clear then a fresh message, or any turn
+        # whose context differs) is exactly the event that should let the loop
+        # re-arm, so the flag must not outlive it. A SYNTHETIC recovery turn
+        # re-runs the SAME message on a reset session, so it deliberately does
+        # NOT clear the flag -- the context that tripped the parser is unchanged.
+        slot._last_turn_structural_terminal = False
+        slot._last_turn_structural_terminal_loop_id = ""
+        slot._last_turn_structural_terminal_loop_gen = 0
     # A queued refusal retry (agent.refusal_fallback_model) replays the user's
     # OWN words, so it can never be recognized by membership in the fixed
     # synthetic-recovery texts above -- and not by TEXT at all: the drain
@@ -15131,6 +15156,32 @@ async def _run_chat(
                     "msg msg-err",
                     meta=_unentitled_meta,
                 )
+                # Record a STRUCTURAL terminal outcome for this slot's last turn,
+                # but ONLY for a self-driven nudge fire (``_directive_self_wake``).
+                # A malformed-request rejection is deterministic in the payload's
+                # SHAPE: re-sending the identical context reproduces it, so the
+                # auto-nudge loop must stop re-firing rather than spend cycle
+                # after cycle on the same rejection. The flag is read by the fire
+                # path to STOP the loop, so it must reflect the LOOP's OWN cycle:
+                # a HUMAN turn that happens to be malformed on a slot that also
+                # carries an active loop must NOT set it, or the next fire would
+                # stop an unrelated loop the human never drove. The nudge turn is
+                # the only producer marked ``_directive_self_wake`` (gateway sets
+                # it on the fire path), so gating here is exactly that scope.
+                # Cleared at the start of every genuine new turn so a human
+                # /clear-then-message re-arms the loop. getattr-guarded: only
+                # AcpError carries the attribute, and this branch also catches
+                # plain errors.
+                if _directive_self_wake and getattr(exc, "structural_terminal", False):
+                    slot._last_turn_structural_terminal = True
+                    # Scope the verdict to the loop id AND the config generation
+                    # it fired under. The fire guard applies the stop through an
+                    # ATOMIC (id, generation) fence in AutoNudgeService, so a
+                    # stale completion of an old instruction cannot stop a loop
+                    # whose config advanced (A->B->A). loop id is still recorded
+                    # because a generation is per-loop, not globally unique.
+                    slot._last_turn_structural_terminal_loop_id = _directive_loop_id
+                    slot._last_turn_structural_terminal_loop_gen = _directive_loop_gen
                 # This branch ENDS the retry cycle: the error is terminal and
                 # nothing is re-queued. Refresh the transient-5xx budget now so the
                 # NEXT cycle — the Continue press this very error message invites

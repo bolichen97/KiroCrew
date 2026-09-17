@@ -2444,6 +2444,18 @@ class AcpError(Exception):
         # is a session-expiry / rejected-credential answer, so the dashboard's
         # error row can offer the Kiro sign-in card instead of a retry.
         self.auth_required: bool = False
+        # Structural-rejection tag, set by :func:`_raise_acp_error` when the raw
+        # frame is a malformed-request answer ("Improperly formed request"). A
+        # DETERMINISTIC rejection of the payload's SHAPE: unlike a transient
+        # backend fault, re-sending the identical context reproduces it exactly.
+        # ``transient`` already carries the retry-layer verdict for the SAME
+        # frame (both False here); this is the narrower fact that the failure is
+        # a structural rejection specifically, so a self-driving caller (the
+        # auto-nudge loop) can stop re-firing the same context rather than
+        # merely declining an in-turn retry. Only structural terminality sets
+        # it — a spent usage limit or an unentitled model are also terminal but
+        # a NEW context can succeed, so they are not this fact.
+        self.structural_terminal: bool = False
 
 
 class AcpTimeoutError(AcpError):
@@ -3756,6 +3768,17 @@ def _raise_acp_error(
     if _PROMPT_BUSY_RE.search(raw_data):
         raise AcpPromptBusy(formatted)
     err = AcpError(formatted, transient=_is_transient_raw_error(error, available_models))
+    # Tag a STRUCTURAL rejection ("Improperly formed request") so a self-driving
+    # caller can stop re-sending the same context rather than merely decline an
+    # in-turn retry. Scoped to the provider `data` field only -- exactly the
+    # scope `_is_transient_raw_error` and `_format_acp_error` use for this
+    # pattern -- so a phrase echo carried only by the JSON-RPC `message` cannot
+    # flip an unrelated error into a structural verdict. The frame is already
+    # terminal via `transient=False`; this narrows WHY (shape, not a momentary
+    # fault), which is the fact the auto-nudge storm fix reads.
+    raw_data_field = str(error.get("data", "") or "") if isinstance(error, dict) else ""
+    if _RE_MALFORMED_REQUEST.search(raw_data_field):
+        err.structural_terminal = True
     # Tag a model-rejection so the SUBSTITUTE (background) retry layer can pick a
     # served model; harmless on every other error (attributes just stay unset).
     rejected = _rejected_model_from_error(error)
