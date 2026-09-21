@@ -1172,7 +1172,11 @@ class AgentConfig:
             "when many MCP servers are configured. kiro-cli backend only. "
             "Deferral only starts once the specs cross tool_search_min_pct or "
             "tool_search_min_tokens; disabling reverts to sending full tool "
-            "specs. No effect on an alternate ACP backend.",
+            "specs. Kiro Crew's OWN servers are exempt and always send full "
+            "specs, whatever this is set to: loading one mid-turn would change "
+            "the tools list a thinking block's signature is bound to and the "
+            "provider would reject the conversation. No effect on an alternate "
+            "ACP backend.",
         ),
     )
     tool_search_min_pct: int = field(

@@ -1144,6 +1144,31 @@ def emission_eligible_mcp_servers() -> frozenset[str]:
     )
 
 
+def crew_owned_mcp_servers() -> frozenset[str]:
+    """Every MCP server name Crew owns, whether or not a rebuild would emit it.
+
+    Deliberately NOT :func:`emission_eligible_mcp_servers`. That set answers
+    "would a rebuild re-add this", so it drops every ``opt_in`` entry — and an
+    ``opt_in`` server the user DID grant is in their spec, serving tools, which is
+    exactly a server a caller asking this question needs named. Asking the
+    eligible set instead would silently omit the granted ones
+    (``kirocrew-dashboard``, ``kirocrew-work``, ``kirocrew-crew-log``).
+
+    The inverse error is harmless, which is why this errs wide: a consumer matches
+    these names against the servers a spec actually carries, so a name for a
+    server that is absent matches nothing. Naming one costs nothing; missing one
+    is the defect.
+
+    The edition seam's extras are included, and that is not an accident: they come
+    from ``_extra_mcp_servers()``, an edition ADAPTER, not from user config, so they
+    are host-owned in exactly the sense the managed map is. Whatever an edition
+    contributes there is Crew's own server and belongs in this set; a user's own
+    ``mcp.json`` entry can never reach it. The names are not constrained to a
+    ``kirocrew-`` prefix, so no caller may assume one.
+    """
+    return frozenset((*_MANAGED_MCP_SERVERS, *_extra_mcp_servers()))
+
+
 def _gated_off_servers() -> frozenset[str]:
     """Managed servers whose ``spec_gate`` is CLOSED right now.
 
