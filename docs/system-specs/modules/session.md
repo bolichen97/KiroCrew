@@ -292,7 +292,8 @@ prevent.
 Two conditions displace the cached `_bg_runtime`: a **backend switch** and
 **staleness** (`AcpRuntime._is_stale()` → `"age"` past 6h, or `"rss"` past
 500 MiB across the descendant tree). The displacement policy has ONE
-implementation, `_detach_bg_runtime_locked(runtime, cause)`: the runtime is
+implementation, `_detach_bg_runtime_locked(runtime, cause, *, park_only=False)`:
+the runtime is
 killed if idle, and **parked on `_draining_bg_runtimes` if it has live or
 initializing handles** — parked runtimes never receive a new session (only
 `_bg_runtime` is offered to callers), their in-flight work finishes untouched
@@ -326,9 +327,34 @@ Parked runtimes stay shielded from the orphan-PID sweep
 (`_companion_runtime_pids`), block the account-identity sweep's completeness
 (`_retire_kiro_bg_runtime`) while they drain, and are reaped by a periodic
 watchdog hook (`bg_drain_reap`) as the backstop for an idle gateway where no
-other trigger runs. `close_all()` detaches both holders atomically under
+other trigger runs.
+
+That same hook carries the **idle-staleness sweep**,
+`reap_idle_stale_bg_runtime()`, and it is not housekeeping. Both displacement
+triggers above live on the REUSE path in `get_bg_session()`, and the shared
+runtime's pid is sweep-shielded for its whole life, so a runtime that stops being
+reused is never asked `_is_stale()` again and is reaped by nothing else: it lives
+until the gateway restarts. Measured on an operator host: 11 agent runtimes
+holding 6.0 GB, six of them 14.5 h old and five of those over the 500 MiB
+ceiling, against 4 live slots. The sweep asks the question off the reuse path,
+under `_bg_runtime_lock`, and retires only a runtime with NO active or
+initializing session.
+
+It PARKS rather than kills, through `_detach_bg_runtime_locked(..., park_only=True)`,
+and that flag exists for one reason: `get_bg_session()` pins the runtime under
+the lock, RELEASES the lock, and only then calls `create_session`, which is where
+`_session_inits_in_flight` rises. A kill inside that window surfaces as
+`AcpRuntimeDead` on a caller that did nothing wrong; parking cannot, because the
+drain reaper re-probes on a later tick, by which time the pinned start has either
+registered (busy — it stays parked) or failed. The slot is re-read after the
+awaited staleness probe, so a concurrent displacement that replaced it is never
+acted on with the old reading. Both probes fail toward PRESERVING the runtime: a
+session or staleness probe that raises retires nothing.
+
+`close_all()` detaches both holders atomically under
 `_bg_runtime_lock` and kills the detached snapshot; its counterpart `_closing`
-gate in `get_bg_session()` refuses to spawn or park once shutdown has started.
+gate in `get_bg_session()` — and in the idle-staleness sweep — refuses to spawn
+or park once shutdown has started.
 Note there is currently no dashboard edit surface for
 `agent.acp_backend`, but a file or CLI edit does not wait for the next gateway
 start: the config watcher dispatches it as a `_FACTORY_CONFIG_PATHS` change, so
@@ -2670,6 +2696,27 @@ a trust root on its own; publication therefore also writes a
   it would trade a disk saving against the read-then-unlink window in which a
   new owner's `publish_session_pid` can land, and losing a live mapping costs
   that session its identity until its next turn republishes.
+- **Legacy per-pid member-memory bindings**
+  (`SessionCleanup._sweep_member_pid_bindings` →
+  `member_memory_auth.prune_legacy_member_pid_bindings`):
+  `<crew home>/member-memory-bindings/pids/<pid>.json` and
+  `<pid>.namespace.json` are records a routing path this version no longer
+  carries wrote one of per agent process. Nothing deleted them and no sweep
+  collected them, so they accumulate for the install's life — measured on an
+  operator host at 165,975 files spanning nine days and 24 MB of directory
+  inode, of which 165,816 named no live process. The same periodic tick that
+  retracts session-pid mappings now collects them, on the maintenance executor
+  for the same `no-blocking-call-on-event-loop` reason (the directory is same-uid
+  agent-writable). A record goes only when it is BOTH older than
+  `_LEGACY_PID_BINDING_MIN_AGE_SECS` (24 h) AND its pid names no live process:
+  age alone would race a record just written, and a dead-pid test alone would
+  delete a record whose number has been recycled away from a still-running owner,
+  so requiring both is what makes the prune safe against pid reuse in either
+  direction. Symlinks are neither followed nor removed, unrecognised names are
+  left alone (this sweep owns exactly the shape it can attribute to a pid), and
+  each pass is capped at `_LEGACY_PID_BINDING_PRUNE_BUDGET` (2000) so a
+  six-figure backlog drains over passes instead of monopolising one maintenance
+  task.
 - **Member execution routing**: the ordinary session/run owner record carries
   the immutable member/store snapshot. Strict MCP caller identity still uses
   the existing transport token and signed `session_pid` publication. No separate

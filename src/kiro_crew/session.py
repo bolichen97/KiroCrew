@@ -145,6 +145,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
+from kiro_crew.member_memory_auth import prune_legacy_member_pid_bindings
 from kiro_crew.messaging.link import (
     UNBIND_REASON_SESSION_DESTROYED,
     UNBIND_REASON_UNSPECIFIED,
@@ -1270,6 +1271,7 @@ class SessionManager:
                 data_home=data_home
             ),
             prune_session_pid_mappings=lambda: _prune_stale_session_pid_files(),
+            prune_member_pid_bindings=lambda: prune_legacy_member_pid_bindings(),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -2043,6 +2045,10 @@ class SessionManager:
     async def _retire_stale_backend_bg_runtime(self) -> None:
         """Delegate stale-backend runtime retirement."""
         await self._background_runtime._retire_stale_backend_bg_runtime()
+
+    async def _reap_idle_stale_bg_runtime(self) -> bool:
+        """Delegate the periodic idle-and-stale retirement of the shared runtime."""
+        return await self._background_runtime.reap_idle_stale_bg_runtime()
 
     async def _provider_backed_bg_session(self) -> "_ProviderBgSession":
         """Return the serialized provider-backed background adapter."""

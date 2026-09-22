@@ -1345,8 +1345,29 @@ session-start timeout's progress and hide the servers that never reported for it
 Both holders are bounded (`_INIT_NOTIFICATION_BUFFER_LIMIT`) and claim by the
 session id inside the frame, so no frame can reach two sessions.
 
+**One permit is reserved for a start that has not gone out.** A collector holding
+its permit is the intended back-pressure — the backend really is still working on
+that request — but at `session_start_concurrency = 2` two collectors hold the
+WHOLE gate for up to 300 s, and every `session/new` gateway-wide then queues
+behind requests whose callers already gave up. The failures those queued starts
+produce time out too and create more collectors, so the gate self-locks.
+Measured on an operator host: one member slot spent 15 consecutive auto-nudge
+cycles on `session/new timed out after 90s (0/10 MCP server(s) reported)` while
+no new agent process was ever spawned — every attempt was in this queue.
+
+So the hand-off is now conditional. `StartPermit.hold_for_collector()` claims one
+of at most `limit - _COLLECTOR_PERMIT_HEADROOM` (1) collector holds
+(`SessionStartGate.collector_holds`, ceiling `collector_hold_ceiling`); denied,
+`_collect_late_start` releases the permit itself, logs
+`outcome=gate_permit_returned` with the counts, and gives the collector `None`.
+A collector without a permit is unchanged in every other respect: it still owns
+the request id and still adopts or tears down the late session. At `limit == 1`
+the ceiling is 0, which is the only reading of "always keep one free" a
+single-permit gate admits. A refusal is logged with both counts rather than tallied: the log line is what an operator reads when a start queues, and a counter no runtime reader consults is dead weight.
+
 Every path releases the permit exactly once (`StartPermit.release()` is
-idempotent; `SessionStartGate.releases` counts real releases) and unregisters
+idempotent; `SessionStartGate.releases` counts real releases, and a release
+returns the collector hold so the ceiling recovers) and unregisters
 the collector (`AcpRuntime.start_collectors()` lists live ones). A caller
 never re-issues `session/new` for the same attempt while a collector owns it,
 and never starts a dedicated process in its place: congestion is answered by

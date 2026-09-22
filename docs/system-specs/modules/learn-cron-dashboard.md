@@ -3432,7 +3432,8 @@ retained record, active or stopped, preserving inspection evidence. The two
 session-directive arms additionally opt into `replace_stopped`, which narrows
 their refusal to records that still occupy the session — an ACTIVE automation,
 or a retained stop that is evidence. Only system-imposed stops are re-armable:
-`approval_stalled`, `cycle_cap`, `runtime_budget`, `structural_terminal`, and
+`approval_stalled`, `cycle_cap`, `runtime_budget`, `structural_terminal`,
+`session_start_failures`, and
 terminal-subject records
 (a merged or blocked watched subject, including structured `BUDGET`, `SUCCESS`
 and `BLOCKED` outcomes). A `structural_terminal` stop is imposed when a fired
@@ -3440,7 +3441,32 @@ turn is rejected as structurally malformed (a deterministic "Improperly formed
 request" answer): re-firing the identical context reproduces it, so the loop is
 stopped rather than re-armed, and the remedy is a NEW conversation — which the
 genuine-turn reset in `chat_runner` clears the slot's verdict for — so a later
-directive re-arm may displace it. Consumer-recorded stops are preserved on every path —
+directive re-arm may displace it.
+
+A `session_start_failures` stop is imposed when the loop's cycles stop getting a
+model session at all. A delivered cycle whose turn dies on
+`session/new timed out` spends a turn and produces nothing, and the loop used to
+re-arm on its plain interval and do it again: measured on an operator host as 15
+consecutive cycles all ending in
+`session/new timed out after 90s (0/10 MCP server(s) reported)`, stopped only by
+`max_cycles` running out. Evidence-driven like the approval stall, through the
+same shape: `notify_cycle_start_failed(slot_key)` — called from `chat_runner`'s
+terminal-error branch when the failure carries the `session_start_failed` tag
+(set at the ACP session-start timeout raise sites on both exception families) AND
+the turn was this loop's own `_directive_self_wake` cycle — raises the persisted
+`consecutive_start_failures`, and `notify_cycle_landed(slot_key)` zeroes it on
+ANY landed turn, a human's included, since a turn that completed proves the
+session can start. `_timer` reads the streak with the other terminal bounds: at
+`_START_FAILURE_BACKOFF_AFTER` (3) the wake is DEFERRED with the standard
+`_REARM_BACKOFF_SECS` escalation capped by the loop's own `idle_secs`, so a
+briefly-loaded host slows the loop to a poll rather than having it add its own
+retries to the contention; at `_START_FAILURE_STANDDOWN_AFTER` (5) the loop
+deactivates and emits `expired` so the notifier tells the user. The cap and the
+budget still outrank it. The remedy is host-side (pressure easing, a starved
+session-start gate recovering — see
+[acp-client](acp-client.md)), which is why the stop is system-imposed and
+re-armable, and every revival clears the streak so stale evidence cannot stand a
+recovered loop down on its first wake. Consumer-recorded stops are preserved on every path —
 a manual pause, a structured `USER_STOP` or `SESSION_CLOSE` record, and the
 auto_research `autonudge_stop` tombstone its watchdog consumes — and an unknown
 stop reason fails closed to preserved. A future-version record is never

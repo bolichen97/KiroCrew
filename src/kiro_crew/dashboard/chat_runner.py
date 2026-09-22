@@ -5205,6 +5205,37 @@ def _model_unentitled_meta(exc: BaseException) -> dict[str, object] | None:
     return {"kind": MODEL_UNENTITLED_KIND}
 
 
+def _note_cycle_start_failure(slot_key: str, exc: BaseException, *, self_wake: bool) -> None:
+    """Report a cycle that never obtained a model session to its nudge loop.
+
+    ``self_wake`` is the fire path's own marker: only the loop's OWN cycle may
+    spend its stand-down budget, or a human turn that happened to be starved on a
+    slot that also carries a loop would stop one the human never drove.
+
+    The tag is read with ``getattr`` because the two ACP exception families carry
+    it independently and share no base -- which is also why this is a helper
+    rather than one inline block: a session start on the shared runtime raises an
+    ``AcpRuntimeError`` subclass and lands in a different terminal branch from an
+    ``AcpError``, and a report present in only one of them misses whichever
+    population the other serves.
+
+    Best-effort: a monitoring convenience never changes how this turn's failure is
+    reported.
+    """
+    if not self_wake or getattr(exc, "session_start_failed", False) is not True:
+        return
+    try:
+        from kiro_crew.autonudge import (
+            get_instance as _autonudge_start_fail_get,  # circular: autonudge -> dashboard.chat -> chat_runner
+        )
+
+        svc = _autonudge_start_fail_get()
+        if svc is not None:
+            svc.notify_cycle_start_failed(slot_key)
+    except Exception:
+        logger.debug("autonudge.notify_cycle_start_failed failed", exc_info=True)
+
+
 def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     """Row-level kind for a terminal ACP error, or None for a plain error row.
 
@@ -16071,6 +16102,21 @@ async def _run_chat(
             slot._tool_stall_exhausted_emitted = False
             slot._transient_5xx_retries = 0
             slot._infra_retries = 0
+            # A turn that LANDED proves this session can start, so clear any
+            # start-failure streak a monitoring loop bound to this slot recorded.
+            # Any landed turn counts, a human's as much as a cycle's: the streak
+            # only ever slows or stops a loop, so clearing it on the broader
+            # evidence can only keep a working loop running.
+            try:
+                from kiro_crew.autonudge import (
+                    get_instance as _autonudge_landed_get,  # circular: autonudge -> dashboard.chat -> chat_runner
+                )
+
+                _landed_svc = _autonudge_landed_get()
+                if _landed_svc is not None:
+                    _landed_svc.notify_cycle_landed(slot.key)
+            except Exception:
+                logger.debug("autonudge.notify_cycle_landed failed", exc_info=True)
             # Per-cycle fallback-chain walk state resets with the budgets; the
             # sticky _active_fallback_model / _fallback_primary_model pair
             # deliberately survives a landed turn — the session stays on the
@@ -17621,6 +17667,15 @@ async def _run_chat(
                     # because a generation is per-loop, not globally unique.
                     slot._last_turn_structural_terminal_loop_id = _directive_loop_id
                     slot._last_turn_structural_terminal_loop_gen = _directive_loop_gen
+                # A cycle that never obtained a model session. Same scope rule as
+                # the structural verdict above -- only a self-driven nudge fire
+                # counts, or a human turn that happened to be starved would spend
+                # an unrelated loop's stand-down budget. The streak itself lives on
+                # the loop (``notify_cycle_start_failed``), which backs the loop off
+                # and eventually stands it down instead of firing cycle after cycle
+                # that can only fail the same way. Read with getattr: the two ACP
+                # exception families tag this fact independently and share no base.
+                _note_cycle_start_failure(slot.key, exc, self_wake=_directive_self_wake)
                 # This branch ENDS the retry cycle: the error is terminal and
                 # nothing is re-queued. Refresh the transient-5xx budget now so the
                 # NEXT cycle — the Continue press this very error message invites
@@ -17689,6 +17744,13 @@ async def _run_chat(
         if isinstance(exc, (_MemoryUnavailable, UnknownMemoryStore)):
             _err_meta = {"code": "memory_unavailable"}
         slot.append("error", _err_text, "msg msg-err", meta=_err_meta)
+        # The SIBLING of the tagged-start report in the AcpError branch above.
+        # A session start on the SHARED runtime raises AcpRequestTimeout /
+        # AcpSessionStartTimeout, which descend from AcpRuntimeError and not from
+        # AcpError, so they land here -- and a member slot is exactly the
+        # population that runs there. Reporting only in the AcpError branch would
+        # leave the loops this bound exists for never backing off.
+        _note_cycle_start_failure(slot.key, exc, self_wake=_directive_self_wake)
         if not (isinstance(exc, MemoryStartupUnavailable) and not _memory_preparation_admitted):
             await state.sessions.record_failure(session_key)
     finally:

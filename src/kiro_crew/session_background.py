@@ -350,6 +350,8 @@ class BackgroundSessionRuntime:
         self,
         runtime: _BackgroundRuntime,
         cause: str,
+        *,
+        park_only: bool = False,
     ) -> None:
         """Free the ``_bg`` slot, killing or parking ``runtime`` per its load.
 
@@ -358,13 +360,22 @@ class BackgroundSessionRuntime:
         until its handles drain. ``cause`` is the operator-facing attribution and
         is logged with every outcome: a staleness recycle and a backend flap have
         different remedies, so the two must never read alike.
+
+        ``park_only`` parks even an idle runtime instead of killing it here. The
+        periodic sweep uses it, because that caller's idle reading can be one
+        statement stale: ``get_bg_session`` pins the runtime under this lock,
+        RELEASES the lock, and only then calls ``create_session`` -- which is
+        where ``_session_inits_in_flight`` is raised. Killing inside that window
+        would surface as ``AcpRuntimeDead`` on a caller that did nothing wrong.
+        Parking cannot: the reaper re-probes on a later tick, by which time the
+        pinned start has either registered (busy -- it stays parked) or failed.
         """
         logger = self._deps.logger
         try:
             busy = runtime.has_active_or_initializing_sessions()
         except Exception:
             busy = True
-        if busy:
+        if busy or park_only:
             logger.info(
                 "Parking the _bg runtime (PID %s) to drain — %s",
                 runtime.pid,
@@ -416,6 +427,64 @@ class BackgroundSessionRuntime:
             if configured is None or cached_backend == configured:
                 return
             await self._owner._displace_bg_runtime_locked(runtime, cached_backend, configured)
+
+    async def reap_idle_stale_bg_runtime(self) -> bool:
+        """Retire the shared background runtime once it is idle AND stale.
+
+        The staleness ceilings (``_DEFAULT_MAX_AGE_SECS`` 6 h,
+        ``_DEFAULT_MAX_RSS_MB`` 500 MiB) were only ever evaluated on the REUSE
+        path in :meth:`get_bg_session`, and the shared runtime's pid is shielded
+        from the orphan sweep for its whole life. A runtime that stops being
+        reused is therefore never asked the question again and never reaped by
+        anything else: it lives until the gateway restarts. Observed on an
+        operator host: 11 agent runtimes holding 6.0 GB, six of them 14.5 h old
+        and five of those over the 500 MiB ceiling, against 4 live slots.
+
+        This is the periodic caller that asks the question off the reuse path, so
+        a runtime nobody is calling is still bounded. It only ever retires a
+        runtime with NO active or initializing session, and it PARKS rather than
+        kills (see ``park_only`` on :meth:`_detach_bg_runtime_locked`), so a
+        co-tenant session can never be dropped by it. Returns True when the slot
+        was freed.
+        """
+        logger = self._deps.logger
+        async with self._bg_runtime_lock:
+            if self._owner._closing:
+                # Same gate as every other park: a shutdown has already swept
+                # past, so parking now would strand a shielded process.
+                return False
+            runtime = self._bg_runtime
+            if runtime is None or not runtime.is_alive():
+                return False
+            try:
+                if runtime.has_active_or_initializing_sessions():
+                    return False
+            except Exception:
+                # Fail toward preserving work: a probe that cannot answer must
+                # not retire a runtime whose handles may be live.
+                logger.debug("idle-stale sweep: session probe failed", exc_info=True)
+                return False
+            try:
+                stale_reason = await runtime._is_stale()
+            except Exception:
+                logger.debug("idle-stale sweep: staleness probe failed", exc_info=True)
+                return False
+            if not stale_reason:
+                return False
+            # Re-read the slot: the awaited staleness probe releases the event
+            # loop, and a concurrent displacement may have replaced or cleared it
+            # while we were off it. Retiring on the stale reading of a runtime
+            # other than the one in the slot would park somebody else's live
+            # process.
+            if self._bg_runtime is not runtime:
+                return False
+            # ``_detach_bg_runtime_locked`` clears the slot itself on every path.
+            await self._detach_bg_runtime_locked(
+                runtime,
+                f"idle and stale by {stale_reason} (periodic sweep)",
+                park_only=True,
+            )
+            return True
 
     async def _provider_backed_bg_session(self) -> object:
         """Return the shared provider-backed background-session adapter."""

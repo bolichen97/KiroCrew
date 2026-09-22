@@ -2697,6 +2697,13 @@ class AcpError(Exception):
         # it — a spent usage limit or an unentitled model are also terminal but
         # a NEW context can succeed, so they are not this fact.
         self.structural_terminal: bool = False
+        # Whether this error happened while STARTING a session rather than on a
+        # prompt or another request. The twin of
+        # ``AcpRequestTimeout.session_start_failed`` on the runtime path: the two
+        # exception families share no base, so a self-driving caller reads the
+        # fact with ``getattr`` and both halves must spell it the same way. Only
+        # the raise sites that know the method set it True.
+        self.session_start_failed: bool = False
 
 
 class AcpTimeoutError(AcpError):
@@ -9877,6 +9884,13 @@ class AcpClient:
             progress = self._mcp_timeout_progress(expected_mcp)
             if progress:
                 message += f" ({progress})"
+            err = AcpTimeoutError(message=message)
+            # A start that never answered, tagged for the self-driving callers
+            # that count consecutive start failures (see
+            # ``AcpError.session_start_failed``). Set only in this branch: the
+            # other awaited requests are not session starts.
+            err.session_start_failed = True
+            raise err
         raise AcpTimeoutError(message=message)
 
     def _mcp_timeout_progress(self, expected: object) -> str:

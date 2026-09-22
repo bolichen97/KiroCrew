@@ -356,6 +356,29 @@ def _cold_start_counts() -> tuple[int, int]:
 _SESSION_START_CONCURRENCY_DEFAULT = 2
 _SESSION_START_CONCURRENCY_FLOOR = 1
 
+# How many of the gate's permits are RESERVED for a ``session/new`` that has not
+# gone out yet, expressed as a shortfall from the limit: a
+# :class:`StartCollector` may hold at most ``limit - this`` permits.
+#
+# Without the reservation the gate starves. A timed-out start does not release
+# its permit -- it hands it to a collector that keeps it for
+# ``agent.start_collect_timeout_secs`` (default 300 s) -- so at the default
+# limit of 2, two slow starts park BOTH permits for five minutes and every
+# session/new on the whole gateway queues behind them, including the retries
+# those failures produce, whose own timeouts create more collectors. Observed on
+# an operator host: one member slot spent 15 consecutive auto-nudge cycles on
+# ``session/new timed out after 90s (0/10 MCP server(s) reported)`` while no new
+# agent process was ever spawned -- every attempt was waiting in this queue.
+#
+# Reserving one permit bounds what the collecting population can claim instead
+# of letting it become the whole gate. A collector denied the hand-off still
+# runs and still owns its request (the session it may yet receive is still
+# adopted or torn down); it simply does not hold back-pressure it cannot
+# release. At ``limit == 1`` the ceiling is 0, so no collector holds a permit --
+# which is the only reading of "always keep one free" that a single-permit gate
+# admits.
+_COLLECTOR_PERMIT_HEADROOM = 1
+
 
 def _resolve_session_start_concurrency() -> int:
     """Snapshot ``agent.session_start_concurrency`` from config (off-loop caller)."""
@@ -409,6 +432,15 @@ class SessionStartGate:
         self.active = 0
         self.queued = 0
         self.releases = 0
+        # Permits currently held by a StartCollector rather than by a live
+        # ``session/new``. Bounded by ``collector_hold_ceiling`` so a fresh start
+        # always has somewhere to go -- see _COLLECTOR_PERMIT_HEADROOM.
+        self.collector_holds = 0
+
+    @property
+    def collector_hold_ceiling(self) -> int:
+        """How many permits :class:`StartCollector` instances may hold at once."""
+        return max(0, self.limit - _COLLECTOR_PERMIT_HEADROOM)
 
     async def acquire(self) -> "StartPermit":
         started = time.monotonic()
@@ -420,7 +452,16 @@ class SessionStartGate:
         self.active += 1
         return StartPermit(self, (time.monotonic() - started) * 1000.0)
 
-    def _release(self) -> None:
+    def _reserve_collector_hold(self) -> bool:
+        """Claim one collector hold, or refuse when the ceiling is reached."""
+        if self.collector_holds >= self.collector_hold_ceiling:
+            return False
+        self.collector_holds += 1
+        return True
+
+    def _release(self, *, collector_held: bool = False) -> None:
+        if collector_held:
+            self.collector_holds = max(0, self.collector_holds - 1)
         self.active = max(0, self.active - 1)
         self.releases += 1
         self._semaphore.release()
@@ -433,12 +474,31 @@ class StartPermit:
         self._gate = gate
         self.queue_wait_ms = queue_wait_ms
         self.released = False
+        # True once a StartCollector owns this permit for the rest of its life,
+        # which is what the gate counts against ``collector_hold_ceiling``.
+        self.collector_held = False
+
+    def hold_for_collector(self) -> bool:
+        """Let a :class:`StartCollector` keep this permit, if the gate allows it.
+
+        False when the permit is already released or already collector-held, or
+        when collectors hold the gate's whole collector budget. The caller then
+        releases the permit itself and gives the collector none: the collector is
+        still created and still owns its request, but a start that has not gone
+        out yet is never made to queue behind one that already gave up.
+        """
+        if self.released or self.collector_held:
+            return False
+        if not self._gate._reserve_collector_hold():
+            return False
+        self.collector_held = True
+        return True
 
     def release(self) -> bool:
         if self.released:
             return False
         self.released = True
-        self._gate._release()
+        self._gate._release(collector_held=self.collector_held)
         return True
 
 
@@ -534,6 +594,9 @@ class AcpSessionStartTimeout(AcpRequestTimeout):
     def __init__(self, message: str, *, collector: "StartCollector | None") -> None:
         super().__init__(message)
         self.collector = collector
+        # Every instance of this type is by definition a session start that did
+        # not answer in time; see AcpRequestTimeout.session_start_failed.
+        self.session_start_failed = True
 
 
 # Bounds every init-frame holder below. A frame is staged only while the session
@@ -4791,9 +4854,16 @@ class AcpRuntime:
         """
         progress = self._mcp_init_progress(expected)
         logger.warning("%s stalled: %s", method, progress or "no MCP reports staged")
+        # Tag the exception the caller will raise as a SESSION-START failure,
+        # whichever of the two it is: both reach a self-driving caller as "the
+        # cycle never got a session", and the tag is how that caller counts the
+        # streak without reading the message text.
+        exc.session_start_failed = True
         if not progress:
             return exc
-        return AcpRequestTimeout(f"{exc} ({progress})")
+        replacement = AcpRequestTimeout(f"{exc} ({progress})")
+        replacement.session_start_failed = True
+        return replacement
 
     def _stage_init_frame(self, msg: JsonRpcMessage) -> None:
         """Hold one MCP-init frame until the session id that claims it is known.
@@ -5799,6 +5869,25 @@ class AcpRuntime:
         future = getattr(exc, "adopted_future", None)
         if req_id is None or future is None:
             return None
+        # Hand the permit over only while the gate still has a reserved slot for
+        # a start that has not gone out. Denied, the permit is released here and
+        # the collector gets none -- it keeps owning the request either way, so
+        # the late session is still adopted or torn down; what it stops doing is
+        # holding a permit for up to ``start_collect_timeout_secs`` that a fresh
+        # session/new is queued behind (see _COLLECTOR_PERMIT_HEADROOM).
+        collector_permit: StartPermit | None = permit
+        if not permit.hold_for_collector():
+            permit.release()
+            collector_permit = None
+            logger.warning(
+                "acp_startup_stage stage=session_new outcome=gate_permit_returned "
+                "req_id=%d collector_holds=%d ceiling=%d -- the collecting "
+                "population already holds the gate's collector budget, so this "
+                "permit is released instead of parked",
+                int(req_id),
+                permit._gate.collector_holds,
+                permit._gate.collector_hold_ceiling,
+            )
         timeout = getattr(self, "_start_collect_timeout", None)
         if timeout is None:
             snap = live.snapshot()
@@ -5814,7 +5903,7 @@ class AcpRuntime:
             self,
             int(req_id),
             future,
-            permit=permit,
+            permit=collector_permit,
             timeout=timeout,
             context={"agent": agent or "", "crew_agent": crew_agent or ""},
             memory_mode=memory_mode,

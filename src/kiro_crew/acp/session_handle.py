@@ -663,6 +663,16 @@ class AcpRequestTimeout(AcpRuntimeError):
 
     transient = True
 
+    # Whether this timeout happened while STARTING a session (``session/new`` /
+    # ``session/load`` / ``session/resume``) rather than on any other
+    # control-plane request. Carried on the type, and mirrored by
+    # ``AcpError.session_start_failed`` on the dedicated-client path, so a
+    # self-driving caller can count "my cycle never got a session" without
+    # matching on message wording. Read structurally with ``getattr``: the two
+    # exception families do not share a base, and only the raise sites that know
+    # the method set it True.
+    session_start_failed = False
+
 
 class AcpRuntimeProtocol(Protocol):
     """Minimal interface that AcpSessionHandle needs from AcpRuntime."""
