@@ -59,6 +59,21 @@ run = sdk.get(run_id); time.sleep(0.02)
 run = await asyncio.to_thread(sdk.get, run_id); await asyncio.sleep(0.02)
 ```
 
+A test that drives code to `RecursionError` on purpose must hold the cyclic
+collector off for the walk. Its innermost frames have no headroom, and a gen0
+sweep lands wherever the allocation counter says -- sometimes there. Whatever
+cyclic garbage the worker is carrying then runs its finalizers at that depth; a
+pending Task leaked by an EARLIER test reports itself through `logger.error` on
+`__del__`, the report overflows, the interpreter hands the escaped exception to
+`sys.unraisablehook`, and pytest's hook overflows too -- surfacing as
+`RuntimeError: Failed to process unraisable exception` against the recursing test,
+on any platform (`test_mcp_preflight`, 3 heads, Linux and Windows). Reproduce by
+planting one such cycle per recursion level under `gc.set_threshold(1, 1, 1)`:
+every run. Fix: `gc.collect()` once at depth zero so inherited garbage pays its
+finalizers where there is stack, `gc.disable()` around the walk, re-enable and
+collect in `finally` (`no_cyclic_gc_at_the_recursion_limit`). Reference counting
+still frees the walk's own objects; only cycles wait for teardown.
+
 ### Mocking kiro-cli
 Never spawn real `kiro-cli` in tests. Mock the subprocess:
 ```python
