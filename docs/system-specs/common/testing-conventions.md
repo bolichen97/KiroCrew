@@ -1861,6 +1861,33 @@ And two the census of duration and RSS added:
   payload characters: exactly 8.0x for the linear walk, 64x for the unbounded-join
   mutant, on every host. Measure the work the algorithm does, in units the algorithm
   defines.
+- **A keepalive cadence racing a silence window is the same ratio, one layer down.**
+  `test_queued_frames_extend_a_queue_aware_wait` had a scripted daemon send `queued`
+  every 0.05 s under a 0.12 s silence window, both on ONE event loop. The window is an
+  `asyncio.wait_for` timer, so it runs on `loop.time()`; a 150 ms stall of the loop
+  thread between two frames -- a loaded Windows worker -- reads as silence and the wait
+  returns `timeout` (four unrelated heads, green on rerun; reproduced on Linux by
+  `time.sleep(0.15)` before each frame, every run). Widening the ratio only moves the
+  stall that flips it. Move the clock instead: `monkeypatch.setattr(loop, "time", ...)`
+  to a value the test owns, and charge the "silence" at the read -- a `_read_frame`
+  wrapper that advances the clock 0.1 s before each frame lands -- while the daemon
+  writes its frames back to back. The timer and the cadence are then measured on the
+  same clock and nothing else moves it, so the test also asserts the wait outlived a
+  fixed 0.12 s deadline (`clock - started == 0.7`), which a fixed-deadline mutant fails.
+  Pass the same clock as `now=` so the total budget rides the same time. A frozen loop
+  clock also freezes the test's own `wait_for(..., timeout=10)` net, so a read that
+  never resolved would hang the worker instead of failing: pair the freeze with a
+  REAL-clock watchdog -- a `threading.Timer` that, after ten seconds, jumps the loop
+  clock past every armed deadline via `call_soon_threadsafe` -- and prove it once by
+  running the test against a daemon that never sends and never closes (red at 10.00 s,
+  not a hang). The cleanup must end on its own too: close the client writer, then
+  CANCEL and await the daemon's handler task so its `finally` closes the server-side
+  writer -- on POSIX `server.wait_closed()` waits for that connection, and a `script`
+  that never returned would hold it forever -- and only then drain the server and
+  cancel the watchdog. Arm the watchdog before the first await that can fail and
+  cancel it in the same `finally`, so a failed bind cannot leave a Timer thread to
+  fire on a closed loop. The freeze is NOT safe around `asyncio.sleep(x > 0)` or a
+  connect with its own timer either -- check the path first.
 
 ### What a sixth five-run pass found (Windows host, ten workers, ~98k tests per run)
 
