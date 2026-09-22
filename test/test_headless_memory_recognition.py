@@ -126,6 +126,7 @@ async def test_registered_child_member_memory_and_teardown(env, tmp_path, monkey
             assert foreign.status == 200
             assert "child private lesson" not in foreign.text
         finally:
+            manager.close()
             await sessions.close_all()
 
 
@@ -218,6 +219,7 @@ async def test_shared_handle_recognition_ends_at_unregister(tmp_path):
         assert response is not None and response.status == 400
     finally:
         runtime.unregister_session("native-child")
+        manager.close()
         await sessions.close_all()
 
 
@@ -368,6 +370,7 @@ async def test_live_child_checks_origin_privacy_without_child_markers(env, mode,
                 assert response is None
     finally:
         sessions.release(key, cleanup=False)
+        manager.close()
         await sessions.close_all()
 
 
@@ -407,6 +410,7 @@ async def test_headless_birth_authority_survives_origin_loss(env, origin_state):
             assert json.loads(response.text)["code"] == "restricted_session"
     finally:
         sessions.release(key, cleanup=False)
+        manager.close()
         await sessions.close_all()
 
 
@@ -484,4 +488,5 @@ async def test_gateway_spawn_freezes_mode_and_enforces_it_after_parent_change(
         await asyncio.wait_for(
             asyncio.gather(*manager._tasks.values(), return_exceptions=True), timeout=5
         )
+        manager.close()
         await sessions.close_all()
