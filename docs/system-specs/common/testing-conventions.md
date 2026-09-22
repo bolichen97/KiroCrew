@@ -2759,6 +2759,23 @@ More shapes this class hides, all Windows-only and all green on every Linux run:
   the failing shard's own teardown warning read `0 append(s) buffered, batch in
   flight=True`.
 
+- **A PRODUCTION write budget sitting on the assertion's path.** `tool_risk._record_outcome`
+  bounds its off-loop append with `asyncio.wait_for(to_thread(_log.append, row), 0.05)` and
+  returns `None` -- no badge -- when the budget expires; that is the product's contract, and
+  it is deliberate. But a test that asserts `record is not None` and reads the row back is
+  then ALSO asserting that a new-file `CreateFile` + lock + write beats 50 ms on the host.
+  It does on a warm Linux host (0.4 ms measured); on the Windows shard the same five tests
+  (`test_decisions_tool_risk`, `..._end_to_end`) came in `None` on 26 unrelated heads in two
+  days, green on every rerun. Reproduced on Linux by pricing `_log.append` at 60 ms alone
+  (8 of 40 fail, every run). The fix is in the FIXTURE, not the constant: lift the budget
+  to a lost-run ceiling under the module's `--timeout` (20 s) for every test whose subject
+  is the record -- raised, never removed, so a wedged writer still fails by name -- and pin
+  the budget's own branch with the value set to `0`, which expires before the append is
+  even dispatched and so carries no clock. The e2e file's `_generous_append_deadline`
+  fixture is the shape: it lifts all three budgets on that path (`_APPEND_TIMEOUT_SECONDS`,
+  `gate._LOG_BUDGET_SECS`, `tool_risk.LOG_BUDGET_SECS`), because lifting one leaves the
+  assertion racing the next.
+
 **Guess-the-latency sleeps are this class too.** `asyncio.sleep(0.05)` "to let the
 first prompt register" is a bet that two awaits and a `to_thread` hop finish inside
 50ms; on a loaded runner they did not, the guard the test exists to exercise was never

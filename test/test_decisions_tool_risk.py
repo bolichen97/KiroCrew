@@ -28,11 +28,32 @@ from kiro_crew.decisions.points import skills_select as sel
 from kiro_crew.decisions.points import tool_risk as tr
 from kiro_crew.decisions.types import Answer
 
+#: The append ceiling these tests run under, in place of the production
+#: :data:`tr.LOG_BUDGET_SECS` (0.05 s). The tests here assert on the RECORD, and a
+#: record is refused whenever the off-loop append does not finish inside that
+#: budget -- so with the production value every one of them also asserts that a
+#: new-file ``CreateFile`` plus lock plus write beats 50 ms on the host. It does
+#: not on the Windows shard: the same tests came in ``None`` on 12 unrelated heads
+#: in two days (0.4 ms measured on a warm Linux host; reproduced here by pricing
+#: ``_log.append`` at 60 ms, which fails 8 of them every run). Raised, not removed:
+#: a writer that genuinely wedges still returns ``None`` and fails the assertion
+#: by name, 20 s in -- well under the suite's ``--timeout=120`` so it is a
+#: readable failure rather than a killed worker. The budget's OWN contract is
+#: pinned by ``TestRefusals.test_an_outcome_row_that_outlives_its_write_budget_...``
+#: with the budget set to 0, which reaches the branch with no clock at all.
+GENEROUS_LOG_BUDGET_SECS = 20.0
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """A private ``config_dir`` so the log writes under the test's own tree."""
+    """A private ``config_dir`` so the log writes under the test's own tree.
+
+    Also lifts the append budget to :data:`GENEROUS_LOG_BUDGET_SECS`: the row on
+    disk is what these tests read back, so the host's write latency must not be
+    able to decide the verdict.
+    """
     monkeypatch.setattr(_log, "log_dir", lambda: tmp_path / "decisions")
+    monkeypatch.setattr(tr, "LOG_BUDGET_SECS", GENEROUS_LOG_BUDGET_SECS)
     return tmp_path
 
 
@@ -345,6 +366,22 @@ class TestRefusals:
                 )
                 is None
             )
+
+    @pytest.mark.asyncio
+    async def test_an_outcome_row_that_outlives_its_write_budget_earns_no_badge(self, home):
+        """The badge must not outlive the row a verdict would be filed against.
+
+        The budget is set to ZERO, not to a small number: ``wait_for`` expires
+        before the append is even dispatched, so the branch is reached identically
+        on every host and the test carries no clock. A small positive value would
+        be a bet on the write losing a race it wins on a warm machine.
+        """
+        with _answering(tr.TIER_RISKY), patch.object(tr, "LOG_BUDGET_SECS", 0):
+            record = await tr.risk_record(
+                tool="bash", arguments="ls", policy="trust", session_key="chat-1"
+            )
+
+        assert record is None, "a row the caller stopped waiting for cannot back a badge"
 
     def test_read_answer_refuses_a_boolean_probability(self):
         """``True`` is not a probability, and ``isinstance(True, int)`` is True."""
