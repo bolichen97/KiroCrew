@@ -99,6 +99,22 @@ before cancelling, not infer entry from a short sleep. Keep the worker's wait
 bounded, release it in `finally`, and await the cancelled task's write drain;
 assertions must still prove the lock stays held and the real write completes.
 
+The same handshake applies when the cancel comes from a PRODUCTION deadline rather
+than the test. `run_with_recall_deadline` arms its timer the moment it is awaited;
+`run_in_embed_pool` hands the job to a thread the OS still has to schedule. A test
+that shrinks `RECALL_TIMEOUT_SECS` to 100 ms and asserts on the RUNNING worker is
+therefore racing the scheduler: on a loaded runner the timer won, `future.cancel()`
+succeeded on an unclaimed job, and `entered.wait` read `False`
+(`test_memv2_audit_c_runtime`, two tests, Linux and Windows). Reproduced on an idle
+host by pricing the worker's pickup at 150 ms: every run. Fix the ORDER, not the
+constant: give the test a recall pool whose `submit` returns only once the worker has
+marked the future running (`entered_recall_pool`), so entry precedes the first point
+the timer can fire; the 100 ms then only decides how soon the deadline arrives, which
+nothing races. Likewise a budget the subject carries itself (`_EMBED_WAIT_SECS` on
+the owner of a coalesced embed) is expired by the test through `work.cancelled.set()`
+once the native call is provably in flight -- `expired()` honours it -- never by
+sleeping past a shortened deadline that also has to outlast a thread start.
+
 A mock subprocess handed to a real kill path must not carry a pid a live process
 can own. The kill helpers' only handle on their target is the integer `pid`:
 they resolve it against the runner's real process table and signal whatever owns
