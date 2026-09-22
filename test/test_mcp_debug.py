@@ -1067,14 +1067,27 @@ class TestTheRouteAuthorizationMatrix:
         assert _live_slot(state, "dashboard:") is None
         assert _live_slot(object(), self.OWNER) is None
 
-    def test_the_three_diag_routes_relay_501_until_diag_lands(self) -> None:
-        """The contract string the MCP relay matches on, plus its error code."""
+    def test_the_three_diag_routes_relay_501_when_the_diag_module_is_absent(self) -> None:
+        """The contract string the MCP relay matches on, plus its error code.
+
+        Pinned through ``_diag_module``, the seam each route reads to decide whether
+        this build has the answer: with it returning ``None`` every route must answer
+        501 and the contract code, whichever ``kiro_crew.diag`` submodules the checkout
+        actually ships. Asserting the bare route instead would make the test a reading
+        of the build's contents -- green until a diag submodule lands, red the moment
+        one does, with no line of this file touched.
+        """
         from kiro_crew.dashboard.handlers import debug as mod
 
-        for handler in (mod.api_debug_threads, mod.api_debug_processes, mod.api_debug_snapshots):
-            got = self._run(handler, self._request("/api/debug/x", self._state(self._slot())))
-            assert got.status == 501, handler.__name__
-            assert b"diag_unavailable" in got.body, handler.__name__
+        with patch.object(mod, "_diag_module", lambda name: None):
+            for handler in (
+                mod.api_debug_threads,
+                mod.api_debug_processes,
+                mod.api_debug_snapshots,
+            ):
+                got = self._run(handler, self._request("/api/debug/x", self._state(self._slot())))
+                assert got.status == 501, handler.__name__
+                assert b"diag_unavailable" in got.body, handler.__name__
 
 
 class TestTheRouteAuthorizationShape:
