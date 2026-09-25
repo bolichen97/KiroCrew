@@ -84,16 +84,24 @@ time-to-first-token: `build_session_context` stamps `_mark(...)` per group
 ### What memory contributes at session start
 
 `build_session_context` calls `MemoryStore.get_context` with
-`include_activity=False`. That is narrower than it reads:
+`include_activity=False` for the protected half, then
+`MemoryStore.get_activity_context` for the background half:
 
 - **Preferences** — injected **complete**, not capped, while the protected set
   stays under the model-safe ceiling.
-- **Semantic memory** — only the eligible `pref.*` records
-  (`get_preferences_context`), not a query-ranked search.
-- **Projects, daily history, episodic fragments** — **not injected**. `activity_index()`
-  lands instead: a bounded index of project headings and the last three days'
-  titles (the `cap` default of `activity_index`),
-  plus a `[Memory tools]` line pointing at `memory_recall` for the bodies.
+- **Semantic memory** — the eligible `pref.*` records
+  (`get_preferences_context`) are protected; task facts arrive in the activity
+  block below, query-ranked and with the `pref.*` rows dropped
+  (`get_semantic_context(facts_only=True)`) so nothing ships twice.
+- **`activity_index()`** — protected: a bounded index of project headings and
+  the last three days' titles (the `cap` default of `activity_index`), plus a
+  `[Memory tools]` line pointing at `memory_recall` for the bodies.
+- **Projects, daily history, task facts, episodic fragments** — the
+  `[Memory activity]` block, one **ordinary background part** under the section
+  caps (`projects`, `memory_history`, `semantic`, `_EPISODIC_INJECT_CAP`). The
+  admission loop admits it whole or drops it whole, so a long history can never
+  displace preferences or lessons. `memory.inject_activity: false` withholds
+  it and the `[Memory tools]` line then says so.
 
 Lessons (`learn_add`) are separate and injected for **every** agent, custom
 included. A lesson with no `repo_scope` applies everywhere; a scoped one reaches

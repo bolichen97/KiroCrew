@@ -459,3 +459,52 @@ class TestNonUtf8Tolerance:
         assert "CLEAN_ENTRY" in out
         assert "proj" not in out  # the corrupt projects section is skipped
         assert "good line" not in out  # the corrupt preferences file is skipped
+
+
+class TestUnreadableActivityTolerance:
+    def test_activity_context_skips_unreadable_history(self, tmp_path):
+        """An unreadable history day does not suppress stable memory context."""
+        from datetime import date, timedelta
+
+        import pytest
+
+        store = MemoryStore(workspace=tmp_path)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.write_projects("PROJECT_SENTINEL")
+        store.append_history("VALID_HISTORY_SENTINEL")
+        unreadable_day = (date.today() - timedelta(days=1)).isoformat()
+        (store._history_dir / f"{unreadable_day}.md").mkdir()
+
+        with pytest.raises(OSError):
+            store.read_recent_history(days=14)
+
+        activity = store.get_activity_context()
+        context = store.get_context(include_activity=True)
+        assert "PROJECT_SENTINEL" in activity
+        assert "PREF_SENTINEL" in context
+        assert "PROJECT_SENTINEL" in context
+        assert "## Recent History" not in activity
+        assert "## Recent History" not in context
+
+    def test_context_skips_unreadable_projects(self, tmp_path):
+        """An unreadable projects file does not suppress preferences or history."""
+        import pytest
+
+        store = MemoryStore(workspace=tmp_path)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.append_history("HISTORY_SENTINEL")
+        store._projects_file.unlink()
+        store._projects_file.mkdir()
+
+        with pytest.raises(OSError):
+            store.read_projects()
+
+        activity = store.get_activity_context()
+        context = store.get_context(include_activity=True)
+        assert "HISTORY_SENTINEL" in activity
+        assert "PREF_SENTINEL" in context
+        assert "HISTORY_SENTINEL" in context
+        assert "## Active Projects" not in activity
+        assert "## Active Projects" not in context

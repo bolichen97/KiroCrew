@@ -2338,6 +2338,17 @@ class MemoryConfig:
             "Inject the learned-corrections and user-profile blocks into " "new-session context.",
         ),
     )
+    inject_activity: bool = field(
+        default=True,
+        metadata=_meta(
+            "Inject Memory Activity",
+            "Inject the recent activity block (active projects, recent daily history, "
+            "task facts and relevant past episodes) into new-session context as a "
+            "budgeted background block. Off: only preferences and the activity index "
+            "ship at session start and older material is read through memory_recall. "
+            "Requires inject_memory.",
+        ),
+    )
     migrated: bool = field(
         default=False,
         metadata=_meta("Migrated", "Whether memory has been migrated to vector store."),

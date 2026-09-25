@@ -1700,6 +1700,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1716,6 +1717,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
         vector_store.get_semantic_context.return_value = ""
 
@@ -1793,7 +1795,8 @@ class TestAsyncCallSitesUseToThread:
 
 
 class TestMemoryGetContextQueryWiring:
-    """Startup passes the request but disables activity; explicit readers retain it."""
+    """Startup reads preferences protected (activity off) and the activity block
+    as budgeted background; explicit readers retain the combined read."""
 
     def _builder(self, tmp_path):
         return ContextBuilder(
@@ -1809,6 +1812,7 @@ class TestMemoryGetContextQueryWiring:
         fake_memory = MagicMock()
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         fake_memory.vector_store = None
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1831,7 +1835,7 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
@@ -1852,7 +1856,7 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
@@ -1897,13 +1901,16 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         msg, _ = builder.build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" not in msg
+        # The protected preferences read (include_activity=False) never builds
+        # episodes; the budgeted activity block does, exactly once.
+        assert msg.count("[EPISODIC-SENTINEL]") == 1
+        assert "[EPISODIC-SENTINEL]" not in store.get_context(query="q", include_activity=False)
         assert store.get_context(query="q").count("[EPISODIC-SENTINEL]") == 1
 
     def test_episodic_query_is_the_user_message(self, tmp_path):
@@ -1919,15 +1926,35 @@ class TestMemoryGetContextQueryWiring:
 
         store._vector_store = SimpleNamespace(
             get_episodic_context=_episodic,
-            get_semantic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         builder.build_message("find my tokyo notes", True, "s2")
-        assert seen == []
-        store.get_context(query="find my tokyo notes")
         assert seen == ["find my tokyo notes"]
+        store.get_context(query="find my tokyo notes")
+        assert seen == ["find my tokyo notes", "find my tokyo notes"]
+
+    def test_activity_block_is_background_not_protected(self, tmp_path):
+        # A long history must be droppable by the admission loop, so it enters
+        # the discretionary pool and never the protected set.
+        from types import SimpleNamespace
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store._vector_store = SimpleNamespace(
+            get_episodic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            has_any_lesson=lambda: True,
+        )
+        huge = "ACTIVITY-FILLER " * 10_000
+        with patch.object(type(store), "get_activity_context", return_value=huge):
+            msg, _ = builder.build_message("q", True, "s3")
+        assert "ACTIVITY-FILLER" not in msg
+        assert "omitted background context" in msg
 
 
 class TestDurableModelVersionLessonContext:
@@ -1967,7 +1994,7 @@ class TestDurableModelVersionLessonContext:
         memory = builder.get_memory_for(None)
         memory._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
