@@ -560,6 +560,15 @@ _BOUNDARY_CANCELLATION_SCOPE_CAP_REASON = "pending_scope_cap"
 # state beats unbounded shutdown.
 _STATE_DRAIN_TIMEOUT = 5.0
 _STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn with no runtime before the startup watchdog reaps it
+# The startup watchdog's deadline is pressure-aware: every OTHER agent that is
+# concurrently in startup (see ``SubagentManager._in_startup``) adds this
+# fraction of the base deadline, up to the ceiling factor. Starts contend for
+# the same session-start gate and the same provider handshake, so a start that
+# is one of N is legitimately slower than a start that is alone; the ceiling
+# keeps a truly wedged agent reapable in a few minutes regardless of the crowd.
+# With one agent in startup the effective deadline IS the base.
+_STARTUP_DEADLINE_PEER_FRACTION = 0.125  # base/8 per concurrent peer (15s at the 120s default)
+_STARTUP_DEADLINE_CEILING_FACTOR = 3.0  # never more than 3x the base (360s at the default)
 _ON_DONE_TIMEOUT = 1200.0  # outer cap: max total seconds for semaphore wait + injection
 
 # Continuation prompt sent when a transient backend error interrupted a turn
@@ -1836,6 +1845,13 @@ class SubagentInfo:
     # that is merely waiting for approval. None until execution starts.
     _exec_started: float | None = None
     _first_stream_started: float | None = None
+    # The startup deadline that actually fired, written by the reaper the
+    # moment ``_is_startup_stalled`` answered True and read by ``_force_reap``'s
+    # error synthesis. The deadline is pressure-aware (``_startup_deadline_for``)
+    # and the population it depends on keeps moving through the reap's own
+    # awaits, so the record names the value the decision was made on, not a
+    # later reading. 0.0 = no startup reap decided for this run.
+    _startup_deadline_fired: float = 0.0
     # Learned-cost high-water marks (dynamic-subagent-sizing.md §4.1), sampled
     # periodically by the reaper loop and folded into the cost store at exit.
     peak_rss_gb: float = 0.0
@@ -2704,6 +2720,24 @@ class SubagentManager:
             )
         except Exception:
             self._spawn_stagger_secs = 0.25
+        # In-startup bound (dynamic-subagent-sizing.md, Configuration). The
+        # stagger bounds the RATE of starts and ``_max_concurrent`` the RUNNING
+        # population; this bounds how many admitted agents may be between
+        # execution start and their first runtime/stream/turn at once. ``0``
+        # derives it in :meth:`_startup_cap`. ``session_start_concurrency`` is
+        # boot-only (``restart=True``), so it is captured here and never
+        # re-read by ``apply_limits``: the SessionStartGate it sizes is fixed
+        # for the loop's lifetime, and the derived bound must track the gate
+        # that exists, not a value nothing is serving yet.
+        try:
+            _agent_cfg = KiroCrewConfig.load().agent
+            self._max_concurrent_startups_setting = max(
+                0, int(_agent_cfg.subagent_max_concurrent_startups)
+            )
+            self._session_start_concurrency = max(1, int(_agent_cfg.session_start_concurrency))
+        except Exception:
+            self._max_concurrent_startups_setting = 0
+            self._session_start_concurrency = 2
 
         # Every limit captured above is a copy of config.json. The live watcher
         # pushes a rewrite at this object through ``reconfigure`` so a write from
@@ -2860,6 +2894,7 @@ class SubagentManager:
         "agent.subagent_timeout_secs",
         "agent.subagent_stall_idle_secs",
         "agent.subagent_spawn_stagger_secs",
+        "agent.subagent_max_concurrent_startups",
         "agent.subagent_result_ttl_secs",
         "agent.completion_keep",
         "agent.completion_keep_chars",
@@ -2970,6 +3005,12 @@ class SubagentManager:
         except (TypeError, ValueError):
             pass
         try:
+            self._max_concurrent_startups_setting = max(
+                0, int(agent.subagent_max_concurrent_startups)
+            )
+        except (TypeError, ValueError):
+            pass
+        try:
             self._result_ttl_secs = int(agent.subagent_result_ttl_secs)
         except (TypeError, ValueError):
             pass
@@ -2981,13 +3022,14 @@ class SubagentManager:
         self.update_completion_keep(agent.completion_keep, int(agent.completion_keep_chars))
         logger.info(
             "SubagentManager reconfigured: max_concurrent=%d (was %d), turn_limit=%d, "
-            "timeout=%ds, stall_idle=%ds, stagger=%.1fs, result_ttl=%ds",
+            "timeout=%ds, stall_idle=%ds, stagger=%.1fs, max_startups=%d, result_ttl=%ds",
             self._max_concurrent,
             old_cap,
             self._default_turn_limit,
             self._default_timeout,
             self._stall_idle_secs,
             self._spawn_stagger_secs,
+            self._startup_cap(),
             self._result_ttl_secs,
         )
         if self._max_concurrent > old_cap:
@@ -3731,6 +3773,107 @@ class SubagentManager:
         if self._adaptive_cap is None:
             return self._user_max_concurrent
         return max(0, min(self._user_max_concurrent, int(self._adaptive_cap)))
+
+    # ── In-startup population ──────────────────────────────────────────────
+    #
+    # Three different things bound a fan-out, and only the first two existed
+    # before this section: ``_spawn_stagger_secs`` bounds the RATE of starts,
+    # ``_max_concurrent`` bounds the RUNNING population, and ``_startup_cap``
+    # bounds how many admitted agents may be IN STARTUP at once. Without the
+    # third, one start is admitted every stagger interval however long each
+    # takes, and when starts are slow (a dedicated process per model override,
+    # a queue at the session-start gate, a throttled provider handshake) dozens
+    # sit in startup together, every one of them contending for the same gate
+    # and every one of them running down the same fixed startup deadline.
+    # Measured on a 623-item fan-out: waves of 24-45 lost ~2%, a wave of 120
+    # lost ~50%, every loss a healthy start the watchdog reaped as
+    # "Failed to start within 120s".
+
+    @staticmethod
+    def _in_startup(info: SubagentInfo) -> bool:
+        """True while *info* has entered execution but has nothing to show yet.
+
+        The same shape the startup watchdog reaps on (:meth:`_is_startup_stalled`),
+        minus the clock: past ``_run_inner``'s first statement (``_exec_started``
+        set -- a queued or approval-parked agent is NOT in startup, exactly as it
+        is invisible to the watchdog), no runtime PID, no first provider stream,
+        no turn, and not already ending. One predicate for the admission bound
+        and the watchdog's pressure term, so the two can never count different
+        populations.
+        """
+        return (
+            not info.done
+            and not info._reap_started
+            and info._exec_started is not None
+            and info.turns == 0
+            and info._pid is None
+            and info._first_stream_started is None
+        )
+
+    def _startup_population(self, *, exclude: SubagentInfo | None = None) -> int:
+        """How many registered agents are in startup right now (see :meth:`_in_startup`)."""
+        return sum(
+            1 for info in self._agents.values() if info is not exclude and self._in_startup(info)
+        )
+
+    def _startup_cap(self) -> int:
+        """The in-startup bound in force: the configured value, or the derived one.
+
+        ``agent.subagent_max_concurrent_startups > 0`` is taken as given.
+        ``0`` derives ``max(2 x session_start_concurrency, ceil(cap / 4))``:
+        twice the session-start gate's width keeps a full next round already
+        admitted and waiting at the gate, so the gate never idles between
+        admissions; a quarter of the running cap keeps the startup burst -- the
+        phase where a dedicated process is spawned and its MCP servers
+        initialised -- to a quarter of the steady-state footprint the cap was
+        sized for. Never above the effective running cap (a larger value could
+        not bind) and never below 1 (the running cap, not this one, is what
+        pauses admission at ``0``).
+        """
+        cap = max(0, int(self._max_concurrent))
+        setting = int(self._max_concurrent_startups_setting)
+        if setting > 0:
+            bound = setting
+        else:
+            bound = max(2 * int(self._session_start_concurrency), -(-cap // 4))
+        return max(1, min(bound, cap))
+
+    def _startup_deadline_for(self, info: SubagentInfo) -> float:
+        """The startup watchdog's deadline for *info*, pressure-aware.
+
+        ``base + others x base x _STARTUP_DEADLINE_PEER_FRACTION``, capped at
+        ``base x _STARTUP_DEADLINE_CEILING_FACTOR``, where *others* is every
+        OTHER agent currently in startup (:meth:`_startup_population`). Alone
+        in startup, the deadline is exactly ``_startup_deadline``: the fixed
+        single-agent behaviour is unchanged, and a lone wedged agent is reaped
+        when it always was. Under pressure a legitimately slow start earns
+        proportionally more time, but a wedged one still cannot outlive the
+        ceiling however large the crowd around it.
+        """
+        base = float(self._startup_deadline)
+        others = self._startup_population(exclude=info)
+        return min(
+            base * _STARTUP_DEADLINE_CEILING_FACTOR,
+            base + others * base * _STARTUP_DEADLINE_PEER_FRACTION,
+        )
+
+    def _note_startup_progress(self, info: SubagentInfo) -> None:
+        """Wake the spawn queue when *info* leaves startup without ending.
+
+        A runtime PID or a first provider stream takes *info* out of the
+        in-startup population, which may open a slot under :meth:`_startup_cap`
+        that no other edge announces: the slot-release drain fires only on a
+        terminal, and the pump does not poll. Called from ``_run_inner`` at
+        those two transitions -- at most twice per start -- and the pump
+        returns at once when nothing waits and re-checks every gate itself, so
+        a call that opens nothing is cheap. A pump failure is logged, never
+        raised: the run that just progressed is not the one at fault, and the
+        next terminal or arrival pumps again.
+        """
+        try:
+            self._drain_queue()
+        except Exception:
+            logger.debug("startup-progress queue pump failed for %s", info.id, exc_info=True)
 
     def set_cap_raise_listener(self, listener: Callable[[], object] | None) -> None:
         """Register the ONE hook a cap raise rings, or ``None`` to drop it.
@@ -4577,6 +4720,9 @@ class SubagentManager:
         self, info: SubagentInfo, session_key: str, agent: str
     ) -> "LLMProvider":
         return await self._run_events._create_shared_session_impl(info, session_key, agent)
+
+    def _gate_exit_reset(self, info: SubagentInfo) -> Callable[[float], None]:
+        return self._run_events._gate_exit_reset_impl(info)
 
     # Facades for the session-start gate's late-adoption path;
     # implementations live in run.py.

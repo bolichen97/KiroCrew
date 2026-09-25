@@ -1751,6 +1751,23 @@ class AgentConfig:
             "interval rather than the memory guard.",
         ),
     )
+    subagent_max_concurrent_startups: int = field(
+        default=0,
+        metadata=_meta(
+            "SubAgent Max Concurrent Startups",
+            "How many subagents may be IN STARTUP at once: admitted and "
+            "executing, but with no runtime process, no first provider stream "
+            "and no turn yet. Further spawns wait in the ordinary spawn queue "
+            "until one of them starts, finishes or is reaped. The spawn "
+            "stagger bounds only the RATE of starts and max_subagents only the "
+            "RUNNING population, so when each start is slow (a dedicated "
+            "process per model override, a busy session-start gate) a wide "
+            "fan-out otherwise piles dozens of agents into startup at once and "
+            "the startup watchdog reaps healthy ones as failed. 0 = derive from "
+            "the running cap: max(2 x session_start_concurrency, ceil(cap / 4)), "
+            "never above the cap itself.",
+        ),
+    )
     subagent_max_turns: int = field(
         default=_DEFAULT_SUBAGENT_MAX_TURNS,
         metadata=_meta("SubAgent Max Turns", "Default tool-call budget per subagent."),

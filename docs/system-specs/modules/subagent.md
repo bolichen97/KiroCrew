@@ -277,6 +277,7 @@ ALL of them from the new config, whichever writer produced it (dashboard,
 | `agent.subagent_timeout_secs` | `_default_timeout` | `0` keeps `_TIMEOUT_SECS` |
 | `agent.subagent_stall_idle_secs` | `_stall_idle_secs` | `0` keeps `_STALL_IDLE_SECS` |
 | `agent.subagent_spawn_stagger_secs` | `_spawn_stagger_secs` | floored at `0.0` |
+| `agent.subagent_max_concurrent_startups` | `_max_concurrent_startups_setting` (read through `_startup_cap()`) | floored at `0`; `0` derives `max(2 × session_start_concurrency, ceil(cap / 4))`, never above `_max_concurrent` |
 | `agent.subagent_result_ttl_secs` | `_result_ttl_secs` | `int` |
 | `agent.completion_keep`, `agent.completion_keep_chars` | `_completion_keep`, `_completion_keep_chars` | via `update_completion_keep` |
 
@@ -324,6 +325,28 @@ invariants:
   wait ended) is granted before the stagger check and does not bump
   `_last_spawn_ts`: the run is already resident, so there is no process burst
   to smooth, and an in-place recovery no longer pays the stagger interval.
+- **The in-startup population is bounded separately from both the cap and the
+  stagger.** The cap bounds how many RUN, the stagger bounds the RATE of
+  starts, and neither bounds how many admitted agents are still STARTING:
+  one start was admitted per interval however long each took, so under slow
+  starts (a dedicated process per `model` / `reasoning_effort` override, a
+  queue at the `SessionStartGate`, a throttled handshake) a wide fan-out piled
+  dozens of agents into startup at once and the fixed 120s startup watchdog
+  reaped healthy ones as `Failed to start within 120s` (measured ~50% loss on a
+  120-item wave against ~2% at 24-45). `_should_stagger_queue_impl` therefore
+  has a third clause: `_startup_population() >= _startup_cap()` queues the
+  spawn like a full cap does, and `_drain_queue_sync_impl` holds its pick under
+  the same test (after the resume grants -- a resume is not a start). The
+  population is `_in_startup`: `_exec_started` set, `turns == 0`, no `_pid`, no
+  `_first_stream_started`, not done or reaping -- the watchdog's own shape, one
+  predicate for both readers. The bound is `agent.subagent_max_concurrent_startups`,
+  or when `0` the derived `max(2 × session_start_concurrency, ceil(cap / 4))`
+  clamped to `[1, _max_concurrent]`. No second queue and no timer: a held drain
+  arms nothing, because every edge that frees a startup slot already pumps --
+  `_note_startup_progress` from `_run_inner` at the PID record and the first
+  stream, and the slot-release drain on every terminal, including the
+  watchdog's reap of a wedged start, so a wedged population cannot hold the
+  queue past its reap. Pinned by `test_subagent_startup_pressure.py`.
 - **Lowering the cap cancels nothing.** In-flight runs keep going; the gate
   simply admits no new spawn until `_running_count` drains below the new cap on
   its own.
@@ -875,6 +898,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - **taskq pump** (`OrphanStallMonitor.taskq_pump`, facade `_taskq_pump`): `start_reaper` runs it once after `taskq_boot_dispatch` (building the manager's `DependencyCoordinator` from `agent.dependency_*` over the admission store, `capacity = _max_concurrent`, and running `coordinator.rebuild()` after `open_default_store` ran `WaitLedger.rebuild()`), every sweep re-runs it as the backstop, and every run that parks on a wait calls it. One pass = `admission.taskq_expire_waits()` (wait deadlines) + `coordinator.tick()` (due scopes) + a one-shot `loop.call_later` re-armed at `coordinator.next_deadline()`, so a scope is woken when it is due, not on the next 60s sweep. The coordinator is registered process-wide (`taskq.dependency.register_coordinator`) for the main chat's read of scope schedules. Terminal runs call `coordinator.forget(id)` from `_run`'s finally (a finished probe is the scope's recovery signal) and withdraw any pending resume entry.
 - `_force_reap`: reset with 30s timeout → SIGKILL fallback → mark done → fire `subagent_done` WS event
 - **Startup-stall admission ends when the first provider stream begins.** A provider may create its child process lazily from `stream()`, so a missing PID before the first response is not proof that execution never started. The marker resets for every recovery execution; the startup watchdog may reap only a subagent with no first stream, no runtime PID, and no completed turn. The ordinary wall-clock deadline remains unchanged.
+- **The startup deadline is pressure-aware, with a ceiling.** `_is_startup_stalled` compares against `_startup_deadline_for(info)`, not the bare `_startup_deadline`: `base + others × base × _STARTUP_DEADLINE_PEER_FRACTION` (one eighth of the base per OTHER agent concurrently `_in_startup`), capped at `base × _STARTUP_DEADLINE_CEILING_FACTOR` (three times). Alone in startup the deadline IS the base, so the single-agent contract every earlier watchdog test pins is unchanged and a lone wedged agent is reaped when it always was; a start that shares the session-start gate and the provider handshake with N peers is legitimately slower and earns proportionally more; and a truly wedged agent still cannot outlive the ceiling however large the crowd. The reaper writes the deadline it decided on to `info._startup_deadline_fired` BEFORE the reap's awaits, and `_force_reap`'s `startup_timeout` error names that value, since the population the deadline depends on keeps moving through the teardown. Pinned by `test_subagent_startup_pressure.py`.
 - **Terminal completion is arbitrated by FOUR separate guards, not by `reaped` alone.** Two paths can finish a subagent — `_force_reap` and `_run`'s `finally` — and between them there are four distinct one-time concerns. Earlier revisions tried to arbitrate them with `reaped` plus `done` and every attempt satisfied two while breaking a third (duplicate delivery when the marker was set late; a lost outcome when it was set early and the reaper was cancelled; a lost outcome when the claim was handed back to a run that had already exited; and finally **no reporter at all plus a leaked concurrency slot** when the report claim was gated on `not info.done`). The guards are now:
   1. **`info.reaped` — classification.** Was this a deliberate reap? The cancel-recovery scheduler reads it, and the marker MUST precede the intentional cancel (see the intentional-cancel rule above) or an unexpected-cancel respawn fires on the run being killed. Unchanged.
   2. **`if not info.done` — the terminal RECORD.** Error synthesis, failure stat, tombstone, cost. First-arrival-wins, so it is never written twice (pinned by `test_subagent.py::TestOnDoneTimeout::test_force_reap_skips_tombstone_when_already_done`).

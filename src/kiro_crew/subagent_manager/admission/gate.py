@@ -890,10 +890,12 @@ class _GateMixin(ManagerComponent):
             ):
                 self._manager._queue.append(queue_params)
             logger.info(
-                "Subagent queued (%d running, %d queued, slot_free=%s)",
+                "Subagent queued (%d running, %d queued, slot_free=%s, in_startup=%d/%d)",
                 self._manager._running_count,
                 len(self._manager._queue),
                 slot_free,
+                self._manager._startup_population(),
+                self._manager._startup_cap(),
             )
             # Advisory UI signal: tell the chip how many agents are now waiting
             # to start for this parent so it can appear immediately and show a

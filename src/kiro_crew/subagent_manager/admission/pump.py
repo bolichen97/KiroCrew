@@ -45,10 +45,17 @@ class _PumpMixin(ManagerComponent):
     def _should_stagger_queue_impl(self, now: float) -> tuple[bool, bool]:
         """Decide whether a spawn arriving at *now* must be queued.
 
-        Returns ``(should_queue, slot_free)``. A spawn is queued when either no
-        slot is free (at capacity) OR a spawn started within the stagger window
-        (``subagent_spawn_stagger_secs``) — so the initial fill never bursts and
-        no two agents start within the interval (dynamic-subagent-sizing.md §5.3).
+        Returns ``(should_queue, slot_free)``. A spawn is queued when any of
+        three holds: no slot is free (at capacity); a spawn started within the
+        stagger window (``subagent_spawn_stagger_secs``) -- so the initial fill
+        never bursts and no two agents start within the interval
+        (dynamic-subagent-sizing.md §5.3); or as many agents are already in
+        startup as ``_startup_cap`` allows (``subagent_max_concurrent_startups``)
+        -- so a slow-start regime cannot pile the whole cap into startup at
+        once. The three bound different things: the RUNNING population, the
+        RATE of starts, and the IN-STARTUP population. ``slot_free`` reports
+        only the first, so the caller can tell a hold that a running agent's
+        exit will release from one that needs the pump re-armed.
         """
         # The cap as the fairness dispatcher reads it: the effective cap, lifted
         # for the child reserve while a parent waits under an adaptive squeeze
@@ -56,7 +63,8 @@ class _PumpMixin(ManagerComponent):
         # the caller, which knows whether the spawn is nested.
         slot_free = self._manager._admission.capacity_view().any_slot
         too_soon = (now - self._manager._last_spawn_ts) < self._manager._spawn_stagger_secs
-        return (not slot_free or too_soon, slot_free)
+        startup_full = self._manager._startup_population() >= self._manager._startup_cap()
+        return (not slot_free or too_soon or startup_full, slot_free)
 
     def _drain_queue_impl(self) -> None:
         """Spawn the next queued task if a slot is available and the stagger
@@ -484,6 +492,16 @@ class _PumpMixin(ManagerComponent):
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
+            return
+        # In-startup bound (``subagent_max_concurrent_startups``): as many
+        # agents as ``_startup_cap`` allows are past admission but have no
+        # runtime, stream or turn yet. Hold the pick -- the resumes above were
+        # granted, a resume is not a start -- and arm nothing: the next edge is
+        # one of them leaving startup, which ``_note_startup_progress`` (PID or
+        # first stream) and the slot-release drain (terminal, including the
+        # watchdog's reap of a wedged one) both pump. A timer here would only
+        # poll for those same edges.
+        if self._manager._startup_population() >= self._manager._startup_cap():
             return
         # Lane-aware pick: the weighted round-robin over the lanes with
         # eligible entries (resumes were granted above). When only the child

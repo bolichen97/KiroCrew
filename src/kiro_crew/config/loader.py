@@ -2783,6 +2783,12 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         subagent_spawn_stagger_secs=_safe_float(
             agent_data.get("subagent_spawn_stagger_secs", 0.25), 0.25
         ),
+        # 0 derives the in-startup bound from the running cap; the ceiling is
+        # the same one subagent_auto_max uses, since a bound above the cap
+        # can never bind.
+        subagent_max_concurrent_startups=_safe_int(
+            agent_data.get("subagent_max_concurrent_startups", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
+        ),
         spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
         resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
         resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
@@ -5666,6 +5672,12 @@ class KiroCrewConfig:
             # the session would spawn on the backend's default with no error.
             permission_mode: str | None = None,
             shared_scratch: Path | None = None,
+            # The subagent manager's gate-exit start-clock reset for a DEDICATED
+            # subagent process. NAMED for the same reason ``permission_mode``
+            # is: swallowed by the catch-all, the dedicated path would silently
+            # keep charging session-start-gate queue time to the startup
+            # watchdog, which is the exact defect the callback exists to end.
+            on_gate_acquired: Callable[[float], None] | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5805,6 +5817,7 @@ class KiroCrewConfig:
                 # the tree's work directory is mounted beside its own scratch
                 # and is what its ``$KIROCREW_SCRATCH`` names (agent_scratch).
                 shared_scratch=shared_scratch,
+                on_gate_acquired=on_gate_acquired,
             )
 
         return _acp

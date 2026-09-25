@@ -608,7 +608,15 @@ class TerminalCoordinator(ManagerComponent):
                     # as one. Predicate captured above the cancel; see there.
                     info.error = f"Reaped after {int(elapsed)}s while still awaiting an unanswered spawn approval (never started) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                 elif reason == "startup_timeout":
-                    info.error = f"Failed to start within {self._manager._startup_deadline}s (no runtime launched, no turn produced) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
+                    # The deadline the reaper decided on (pressure-aware; see
+                    # ``_startup_deadline_for``). A caller that reaps under this
+                    # reason without going through the reaper's sweep (tests, a
+                    # manual reap) has recorded none, and then the deadline in
+                    # force for this run right now is the honest value.
+                    _fired = info._startup_deadline_fired or self._manager._startup_deadline_for(
+                        info
+                    )
+                    info.error = f"Failed to start within {int(_fired)}s (no runtime launched, no turn produced) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                 else:
                     info.error = f"Reaped after {int(elapsed)}s (exceeded {self._manager._default_timeout}s deadline) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
             if not info.user_stopped:

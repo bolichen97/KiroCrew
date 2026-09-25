@@ -941,11 +941,18 @@ class OrphanStallMonitor(ManagerComponent):
                 # "failed to start" error instead of burning the full deadline
                 # and surfacing a misleading 30-minute turn-0 timeout.
                 if self._manager._is_startup_stalled(info, now):
+                    # Record the deadline this decision was made on BEFORE the
+                    # reap's awaits: the in-startup population it depends on
+                    # moves while the teardown runs, and the error must name
+                    # the value that fired, not a later reading.
+                    info._startup_deadline_fired = self._manager._startup_deadline_for(info)
                     logger.warning(
                         "Reaper: subagent %s failed to start within %ds "
-                        "(turn 0, no runtime launched), force-killing",
+                        "(turn 0, no runtime launched; %d other agent(s) in startup), "
+                        "force-killing",
                         agent_id,
-                        self._manager._startup_deadline,
+                        int(info._startup_deadline_fired),
+                        self._manager._startup_population(exclude=info),
                     )
                     try:
                         await self._manager._force_reap(
@@ -996,12 +1003,21 @@ class OrphanStallMonitor(ManagerComponent):
         A subagent qualifies only once it has actually entered execution
         (``_exec_started`` set by ``_run_inner``) yet has not begun its first
         provider stream, launched no runtime (``_pid is None``), and produced
-        no turn (``turns == 0``) within ``_startup_deadline`` seconds. A
-        provider can create its child lazily from ``stream()``, so a missing PID
-        alone is not evidence that startup has not progressed. Keying on
-        ``_exec_started`` — not the registration timestamp ``started`` — means
-        an agent merely awaiting spawn approval (never entered ``_run_inner``)
-        is never caught here.
+        no turn (``turns == 0``) within its startup deadline. A provider can
+        create its child lazily from ``stream()``, so a missing PID alone is not
+        evidence that startup has not progressed. Keying on ``_exec_started`` —
+        not the registration timestamp ``started`` — means an agent merely
+        awaiting spawn approval (never entered ``_run_inner``) is never caught
+        here.
+
+        The deadline is ``_startup_deadline_for(info)``: the fixed
+        ``_startup_deadline`` when this agent is alone in startup, and more --
+        up to a hard ceiling -- for every other agent concurrently in startup,
+        since a start that shares the session-start gate and the provider
+        handshake with N peers is legitimately slower than one that has them to
+        itself. A fixed deadline under a wide fan-out reaped healthy starts as
+        failures, and the retries those failures provoked deepened the same
+        crowd (measured ~50% loss at 120 concurrent items; ~2% at 24-45).
         """
         exec_started = info._exec_started
         if exec_started is None:
@@ -1010,7 +1026,7 @@ class OrphanStallMonitor(ManagerComponent):
             info.turns == 0
             and info._pid is None
             and info._first_stream_started is None
-            and (now - exec_started) > self._manager._startup_deadline
+            and (now - exec_started) > self._manager._startup_deadline_for(info)
         )
 
     async def _stall_verdict_impl(self, info: SubagentInfo) -> tuple[str, str]:

@@ -86,6 +86,7 @@
         "subagent_cpu_cost_cores": 1.0,
         "subagent_auto_max": 32,
         "subagent_spawn_stagger_secs": 0.25,
+        "subagent_max_concurrent_startups": 0,
         "subagent_max_turns": 1000,
         "subagent_timeout_secs": 10800,
         "subagent_stall_idle_secs": 120,
@@ -1251,6 +1252,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.25
+    },
+    {
+      "path": "agent.subagent_max_concurrent_startups",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "SubAgent Max Concurrent Startups",
+      "help": "How many subagents may be IN STARTUP at once: admitted and executing, but with no runtime process, no first provider stream and no turn yet. Further spawns wait in the ordinary spawn queue until one of them starts, finishes or is reaped. The spawn stagger bounds only the RATE of starts and max_subagents only the RUNNING population, so when each start is slow (a dedicated process per model override, a busy session-start gate) a wide fan-out otherwise piles dozens of agents into startup at once and the startup watchdog reaps healthy ones as failed. 0 = derive from the running cap: max(2 x session_start_concurrency, ceil(cap / 4)), never above the cap itself.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
     },
     {
       "path": "agent.subagent_max_turns",

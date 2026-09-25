@@ -150,11 +150,48 @@ deliberate v1 simplification we may revisit.
 | `agent.subagent_auto_max` | `32` | Absolute ceiling on the computed cap (provider-concurrency stand-in) |
 | `agent.spawn_min_memory_gb` | `4.0` | Per-spawn admission gate (separate runtime guard, refuses a spawn when free memory is low) |
 | `agent.subagent_spawn_stagger_secs` | `0.25` | Delay between successive spawns (initial fill and queued drain), so a high cap never bursts on cold start |
+| `agent.subagent_max_concurrent_startups` | `0` | How many admitted agents may be **in startup** at once (executing, but no runtime PID, no first provider stream, no turn yet); further spawns wait in the ordinary queue. `0` = derive `max(2 × session_start_concurrency, ceil(cap / 4))`, never above the cap |
 | `session.pool_size` | `0` | Warm-pool size; reserved in the memory term when > 0 |
 
 The cap interacts with `spawn_min_memory_gb` but does not replace it: the cap is
-a startup count limit, while `spawn_min_memory_gb` is a real-time per-spawn
-memory floor. They are independent guards.
+a bound on the RUNNING population, while `spawn_min_memory_gb` is a real-time
+per-spawn memory floor. They are independent guards.
+
+Three things bound a fan-out, and they bound different quantities. The cap
+bounds how many agents RUN at once. `subagent_spawn_stagger_secs` bounds the
+RATE at which starts are admitted -- one per interval -- and says nothing about
+how many are still starting. `subagent_max_concurrent_startups` bounds how many
+admitted agents are IN STARTUP at once: past admission (`_exec_started` set)
+but with no runtime PID, no first provider stream and no turn -- the same shape
+the startup watchdog reaps on. Without the third bound, one start is admitted
+every interval however long each start takes; when each start is slow (a
+dedicated process per `model` / `reasoning_effort` override, a queue at the
+session-start gate, a throttled provider handshake) dozens sit in startup
+together, all contending for the same gate and all running down the same
+startup deadline. Measured on a 623-item fan-out (2026-09): waves of 24-45
+items lost ~2%, waves of 50-60 lost 2-16%, and a wave of 120 lost ~50% -- every
+loss a healthy start reaped as `Failed to start within 120s`, and every retry of
+one deepening the crowd that caused it. The bound holds further spawns in the
+EXISTING queue (`_should_stagger_queue_impl` gains a third clause; the drain
+pump holds its pick under the same test) and the queue wakes on the edges that
+free a startup slot: a runtime PID or a first stream (`_note_startup_progress`)
+and a terminal, including the watchdog's reap of a wedged start (the
+slot-release drain), so a wedged population cannot hold the queue past the
+reap. The default derives from the running cap: twice the session-start gate's
+width keeps a full next round already admitted at the gate so it never idles,
+and a quarter of the cap keeps the startup burst -- the phase that spawns a
+process and initialises its MCP servers -- to a quarter of the steady-state
+footprint the cap was sized for.
+
+The startup watchdog is pressure-aware for the same reason. Its deadline is the
+base (`120s`, `SubagentManager(startup_timeout=...)`) plus one eighth of the
+base for every OTHER agent concurrently in startup, capped at three times the
+base (`_STARTUP_DEADLINE_PEER_FRACTION`, `_STARTUP_DEADLINE_CEILING_FACTOR`,
+`_startup_deadline_for`). Alone in startup, the deadline is exactly the base --
+the single-agent behaviour and a lone wedged agent's reap time are unchanged;
+at a cap of 40 (derived bound 10) a start earns up to `120 + 9 × 15 = 255s`;
+and a truly wedged agent is reaped within `360s` however large the crowd
+around it.
 When the memory floor is enabled, admission also reserves memory for the next
 start, for claimed starts awaiting registration, and for live dedicated workers.
 A start that has not settled yet -- fewer than two reaper sweeps have measured
