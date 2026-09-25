@@ -183,6 +183,16 @@ and a quarter of the cap keeps the startup burst -- the phase that spawns a
 process and initialises its MCP servers -- to a quarter of the steady-state
 footprint the cap was sized for.
 
+Time spent WAITING FOR A PERMIT is never charged as startup time, on either
+start path. `runtime.create_session` runs under the ACP `SessionStartGate`
+(`agent.session_start_concurrency`, default 2) and reports the queue wait at
+gate exit; `_gate_exit_reset` resets the run's start clock there. The
+session-shared path always did this; the dedicated-process path (`model` /
+`reasoning_effort` spawns, through `get_or_create` -> provider factory ->
+`AcpProvider`) now does too. So the watchdog measures time spent STARTING once
+a permit is held, and the pressure term below covers what is left: the
+handshake itself slowing under a shared provider.
+
 The startup watchdog is pressure-aware for the same reason. Its deadline is the
 base (`120s`, `SubagentManager(startup_timeout=...)`) plus one eighth of the
 base for every OTHER agent concurrently in startup, capped at three times the

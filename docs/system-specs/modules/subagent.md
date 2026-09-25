@@ -2081,9 +2081,28 @@ Decision + lifecycle:
   record the shared path.
 - `runtime.create_session()` runs under the ACP `SessionStartGate`
   (`agent.session_start_concurrency`, see acp-client.md). `_create_shared_session`
-  passes `on_gate_acquired`, which resets `info._exec_started` / `last_activity`
-  at gate EXIT so the 120s startup watchdog and the stall clock never count
-  queue time, and records the wait in `info._start_queue_wait_ms`.
+  passes `on_gate_acquired` = `_gate_exit_reset(info)`, which resets
+  `info._exec_started` / `last_activity` at gate EXIT so the startup watchdog
+  and the stall clock never count queue time, and records the wait in
+  `info._start_queue_wait_ms`.
+- **The dedicated-process path gets the SAME gate-exit reset.** Every `model` /
+  `reasoning_effort` / `allowed_tools` / `bare` spawn takes `get_or_create`, and
+  its own `AcpRuntime.create_session` runs under the same `SessionStartGate`;
+  until this reset existed, that queue time was charged to the fixed startup
+  deadline, so a wide model-pinned fan-out reaped healthy starts as `Failed to
+  start within 120s` -- the strongest single mechanism behind the measured ~50%
+  loss at 120 items. `_run_inner` passes `on_gate_acquired=_gate_exit_reset(info)`
+  into `get_or_create`; it rides `extra_factory_kwargs` to the provider factory
+  (`config/loader.py` `_acp`, where it is a NAMED parameter -- the `**_kwargs`
+  catch-all would swallow it silently), into `AcpProvider(on_gate_acquired=...)`,
+  and from `_start_kiro_runtime_impl` into the process's `create_session`. It is
+  not passed to `load_session`: a `session/load` resume takes no gate permit.
+  ONE definition (`RunEventCoordinator._gate_exit_reset_impl`) serves both
+  paths, so the clock rule cannot drift between them. The reset fires only once
+  the permit is HELD: a start wedged before the gate keeps its original clock
+  and is still caught; one wedged after it is caught at the base deadline from
+  gate exit. Pinned by `test_subagent_startup_pressure.py`
+  (`TestDedicatedPathGateExitReset`, `TestGateExitResetIsOneDefinition`).
 - **A `session/new` timeout is congestion, never a reason for a dedicated
   process.** `AcpRequestTimeout` from the shared runtime goes to
   `_await_late_start`: the row is marked `recovering`, and the run waits for
