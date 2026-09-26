@@ -227,13 +227,22 @@ def test_the_flag_is_off_by_default_and_editable_from_the_dashboard():
     assert core._EDITABLE_CONFIG["dashboard.crewmate_threads"] == {"type": "bool"}
 
 
-def _stub_turn(monkeypatch):
+def _stub_turn(monkeypatch, *, hold: asyncio.Event | None = None):
     """Replace the background turn with a no-op that only clears the in-flight
-    mark, as the real turn's ``finally`` does."""
+    mark, as the real turn's ``finally`` does.
+
+    Pass *hold* when a test needs the reservation to still be held while it makes
+    its next request: the fake turn then waits on that event before clearing the
+    mark, so the test decides when the turn ends instead of the event loop. The
+    call is recorded before the wait, so a caller counting turns sees it either
+    way.
+    """
     calls: list[dict[str, Any]] = []
 
     async def _fake(state, slot, mid, run_id, text, parent, context_before, flight_key, identity):
         calls.append({"mid": mid, "text": text, "parent": parent, "context_before": context_before})
+        if hold is not None:
+            await hold.wait()
         chat_threads._in_flight.discard(flight_key)
 
     monkeypatch.setattr(chat_threads, "_run_thread_turn", _fake)
@@ -1066,10 +1075,20 @@ async def test_second_reply_while_the_crewmate_is_replying_is_refused(tmp_path, 
 @pytest.mark.asyncio
 async def test_two_replies_racing_through_the_store_write_run_one_turn(tmp_path, monkeypatch):
     """The reservation is taken before the store write suspends, so a
-    double-click cannot start two turns on one thread."""
+    double-click cannot start two turns on one thread.
+
+    The winner's turn is held open for the whole gather. Without that, the loser's
+    409 is a scheduling accident: the winner's turn can clear the mark before the
+    loser reaches the check, and two replies that never overlapped both answer 202
+    -- which is correct behaviour, not the defect this test names. Holding the turn
+    is how the file's other in-flight test pins the same thing, and it also makes
+    the losing status a statement about the reservation rather than about how the
+    loop happened to interleave two sockets on the machine that ran it.
+    """
     state = _make_state(tmp_path)
     slot, mid = _member_slot(state)
-    calls = _stub_turn(monkeypatch)
+    hold = asyncio.Event()
+    calls = _stub_turn(monkeypatch, hold=hold)
     async with _client(state) as client:
         a, b = await asyncio.gather(
             client.post(
@@ -1079,8 +1098,14 @@ async def test_two_replies_racing_through_the_store_write_run_one_turn(tmp_path,
                 f"/api/chat/threads/{mid}/reply", json={"slot_key": _MEMBER_SLOT, "text": "two"}
             ),
         )
+        # The turn is still running, so the reservation the loser was refused by
+        # is still there to be seen. Asserting it here is what keeps the hold
+        # honest: remove the hold and this fails before the status assertion does.
+        assert f"{slot.key}:{mid}" in chat_threads._in_flight
+        hold.set()
         for task in list(state._background_tasks):
             await task
+    assert f"{slot.key}:{mid}" not in chat_threads._in_flight
     assert sorted([a.status, b.status]) == [202, 409]
     assert len(calls) == 1
     assert len(_threads(state, slot)[mid]) == 1
