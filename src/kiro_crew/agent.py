@@ -84,7 +84,7 @@ from kiro_crew.config.paths import (
     kiro_agents_dir,
     shared_kiro_agents_writable,
 )
-from kiro_crew.env import mcp_search_path, spec_path_key
+from kiro_crew.env import mcp_search_path, resolved_command_casing, spec_path_key
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.platform import (
     current_context,
@@ -3336,13 +3336,21 @@ def rebuild_agent_config(
         # to audit directories that were never consulted, which is the opposite
         # of the not-installed/installed-elsewhere distinction this path draws --
         # so return "" as the searched path even though the lookup still runs.
+        #
+        # Both lookups pass through ``resolved_command_casing``: the value
+        # returned here is PERSISTED as the spec's absolute ``command``, and an
+        # absolute path is accepted verbatim on the next pass, so a PATHEXT-
+        # synthesized ``.EXE`` written once would be indistinguishable from an
+        # operator's own spelling from then on. Repairing at the resolver, not
+        # at the persist site, also keeps the provenance record's ``emitted``
+        # value repaired, so ``command_is_ours`` still recognises the entry.
         if os.path.dirname(cmd):
-            return shutil.which(cmd, path=_search), ""
+            return resolved_command_casing(shutil.which(cmd, path=_search)) or None, ""
         # The search path is returned, not recomputed by the caller: a candidate
         # that declares its own ``env.PATH`` is searched against a DIFFERENT path
         # than one that does not, so a caller reporting ``mcp_search_path("")``
         # would name directories that were never searched.
-        return shutil.which(cmd, path=_search), _search
+        return resolved_command_casing(shutil.which(cmd, path=_search)) or None, _search
 
     resolved = mcp_sources.resolve_mcp_servers(config, sources, _resolve_command)
     mounted = mcp_aliases.normalize_server_keys(config, resolved.unresolved)
