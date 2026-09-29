@@ -4170,6 +4170,40 @@ class TestDoctorSkillViewCensus:
         assert f"{skill_projection._PROJECTION_METADATA_DIR_NAME}/ directory" in line
         assert f"in {skill_projection._PROJECTION_LEASE_DIR_NAME}/ cannot be read" in line
 
+    @staticmethod
+    def _residue(out: str) -> str:
+        return out.split("skill-view residue:", 1)[1]
+
+    def test_a_clean_directory_reports_no_residue(self, tmp_path, monkeypatch, capsys):
+        self._own(tmp_path, 0)
+        line = self._residue(self._run(tmp_path, monkeypatch, capsys))
+        assert line.startswith(" ✅ 0 ownership sidecar(s)")
+        assert "0 leftover alias .lock file(s), 0 alias(es) rewritten" in line
+
+    def test_residue_past_the_threshold_and_any_external_rewrite_warn(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import hashlib
+
+        from kiro_crew.doctor_checks import resources
+
+        monkeypatch.setattr(resources, "_SKILL_VIEW_RESIDUE_WARN", 1)
+        metadata_dir = tmp_path / ".kirocrew-skill-projection-metadata"
+        metadata_dir.mkdir()
+        for i in range(2):
+            (metadata_dir / f"{self.PREFIX}{i:024x}.json").write_text("{}")
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert self._residue(out).startswith(" ⚠️  2 ownership sidecar(s)")
+        assert "restart it once to drain the backlog" in out
+
+        stem = self._own(tmp_path, 9)
+        record = json.loads((metadata_dir / f"{stem}.json").read_text())
+        record["x-kirocrew-alias-sha256"] = hashlib.sha256(b"what was published").hexdigest()
+        (metadata_dir / f"{stem}.json").write_text(json.dumps(record))
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "1 alias(es) rewritten by another program" in out
+        assert "KIROCREW_NATIVE_SKILL_PROJECTION=0" in out
+
 
 class TestRunDirCensus:
     """The run-directory census is read-only, down to the workspace root itself.
