@@ -869,14 +869,24 @@ class TestSubdirGates:
 
     @requires_symlinks
     def test_contained_join_degrades_to_none_on_a_symlink_loop(self, tmp_path):
-        # A real loop, not a faked OSError: non-strict `Path.resolve` reports
-        # ELOOP as RuntimeError, and the callers that re-check containment after
-        # a third-party script wrote to the checkout need None, not a raise.
+        # A real loop, not a faked OSError. The callers that re-check containment
+        # after a third-party script wrote to the checkout need a value, never a
+        # raise, and never a path outside the root. What that value is depends on
+        # the kernel: POSIX non-strict `Path.resolve` reports ELOOP as
+        # RuntimeError for the link and for anything under it, so both joins
+        # degrade to None. Windows raises on the self-pointing link ITSELF (the
+        # resolve's stat fails, so the join degrades to None) but resolves a child
+        # beneath it lexically, without an error, to a path under the root.
         root = tmp_path / "root"
         root.mkdir()
         os.symlink("pkg", str(root / "pkg"))
-        assert registry._contained_join(root, "pkg") is None
-        assert registry._contained_join(root, "pkg/app.json") is None
+        for subdir, windows_answers_a_path in (("pkg", False), ("pkg/app.json", True)):
+            joined = registry._contained_join(root, subdir)
+            if sys.platform == "win32" and windows_answers_a_path:
+                assert joined is not None
+                assert joined.is_relative_to(root.resolve())
+            else:
+                assert joined is None
 
 
 # ---------------------------------------------------------------------------
@@ -3206,16 +3216,23 @@ class TestRunAppBuild:
         derived from the install's own copy, which keeps `B` as one link and never
         walks through it, and from the runtime's own file check, which the
         kernel resolves in one pass -- so the judgment is linear in the path's
-        components, and it says what the spawn would meet: 30 links resolve to
-        the root's `server.py` (waived), 60 exceed the kernel's symlink budget
-        (refused here, loudly, instead of failing at spawn)."""
+        components, and it says what the spawn would meet. On POSIX, 30 links
+        resolve to the root's `server.py` (waived) and 60 exceed the kernel's
+        symlink budget (refused here, loudly, instead of failing at spawn); on
+        Windows a reparse point carries no per-walk budget, so both depths resolve
+        and both are waived."""
         from kiro_crew.apps.manifest import file_entry_point_refusal
 
         (tmp_path / "B").symlink_to(Path("."))
         (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
         deep = "/".join(["B"] * depth) + "/server.py"
         runtime_accepts = file_entry_point_refusal(deep, tmp_path) == ""
-        assert runtime_accepts is (depth == 30)
+        # The verdict below is asserted against the runtime's own answer on every
+        # platform, and that answer is pinned per platform: which depths the
+        # runtime accepts is the kernel's symlink budget. POSIX stops at 40 links,
+        # so 30 resolves and 60 is refused; Windows resolves a reparse point without
+        # a per-walk budget, so both depths resolve to the root's `server.py`.
+        assert runtime_accepts is (depth == 30 or sys.platform == "win32")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         started = time.monotonic()
         result = await registry._run_app_build(
