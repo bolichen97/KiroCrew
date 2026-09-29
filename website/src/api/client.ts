@@ -107,6 +107,8 @@ export type {
   SecurityPostureData,
   TrustedAppsData,
   TrustedAppsRevokeResult,
+  TrustedRegistryRow,
+  TrustedRegistriesData,
   ManagedSecret,
   SecretsListResponse,
 } from './client/security'
