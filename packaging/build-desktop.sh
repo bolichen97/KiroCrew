@@ -1173,6 +1173,45 @@ print(p["sha256"])' "$cache/manifest.json" "$file")"
     mkdir -p "$dest"
     cp -a "$extracted" "$dest/$entry"
     rm -rf "$tmp"
+    # kiro-cli.exe imports VCRUNTIME140.dll, VCRUNTIME140_1.dll, MSVCP140.dll
+    # and MSVCP140_1.dll. Those ship with the Visual C++ redistributable and
+    # are not part of any Windows edition, so on a machine without it the exe
+    # cannot start: it exits 0xC0000135 (STATUS_DLL_NOT_FOUND) before running a
+    # line, which the probe below sees and the app would see at spawn time.
+    # Administrative extraction lays out the payload without running the
+    # installer, and the MSI carries exactly one file, so nothing supplies the
+    # runtime on the way in either.
+    #
+    # Stage the four beside the executable, where the loader looks first. This
+    # is the deployment the bundle already relies on elsewhere: the Python
+    # runtime it ships carries vcruntime140.dll next to its own interpreter,
+    # for the same reason.
+    #
+    # The runtime is one of two things the executable needs and the MSI does not
+    # bring. The other is DirectML: it imports DMLCreateDevice1 from
+    # directml.dll as a static import, so the loader resolves it before main.
+    # That one is left to the host because it is an OS component on desktop
+    # Windows, which is where the app runs and what an unbundled kiro-cli
+    # install already relies on -- but a build host without it (a Windows Server
+    # Core image carries none) needs it supplied, and the probe below is where
+    # that shows up.
+    local crt_dir crt
+    local -a crt_missing=()
+    crt_dir="$(cygpath -u "${SYSTEMROOT:-${WINDIR:-C:\\Windows}}")/System32"
+    for crt in vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll; do
+      if [ -f "$crt_dir/$crt" ]; then
+        cp -a "$crt_dir/$crt" "$dest/$crt"
+      else
+        crt_missing+=("$crt")
+      fi
+    done
+    if [ "${#crt_missing[@]}" -ne 0 ]; then
+      echo "ERROR: this build host has no Visual C++ runtime to stage beside kiro-cli" >&2
+      echo "       $crt_dir lacks: ${crt_missing[*]}" >&2
+      echo "       kiro-cli.exe imports them and cannot start without them." >&2
+      echo "       Install the Visual C++ 2015-2022 x64 redistributable." >&2
+      exit 1
+    fi
   else
     local tmp
     tmp="$(mktemp -d)"
