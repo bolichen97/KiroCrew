@@ -1264,9 +1264,25 @@ print(p["sha256"])' "$cache/manifest.json" "$file")"
     probe_environ+=("HOME=$clean_home" "PATH=/usr/bin:/bin")
   fi
   probe_environ+=("KIRO_NO_AUTO_UPDATE=1")
-  if ! env -i "${probe_environ[@]}" "$dest/$entry" --version >/dev/null 2>&1; then
+  # Keep what the probe saw. A binary that cannot start says so only through its
+  # exit status -- Windows reports a missing dependency as STATUS_DLL_NOT_FOUND
+  # with no output at all -- so discarding both leaves "does not execute" as the
+  # entire diagnosis and the reader with nothing to act on. The status a shell
+  # sees is the low 8 bits of the process's, so it is reported as-is rather than
+  # reconstructed into a code it cannot represent; silence beside a failure is
+  # itself the signal, and gets named.
+  local probe_out probe_status=0
+  probe_out="$(env -i "${probe_environ[@]}" "$dest/$entry" --version 2>&1)" || probe_status=$?
+  if [ "$probe_status" -ne 0 ]; then
     rm -rf "$clean_home"
-    echo "ERROR: staged kiro-cli does not execute" >&2; exit 1
+    echo "ERROR: staged kiro-cli does not execute (exit $probe_status)" >&2
+    if [ -n "$probe_out" ]; then
+      printf '       %s\n' "$probe_out" >&2
+    else
+      echo "       It produced no output, so it failed before running: check that" >&2
+      echo "       every library it links against is present on this host." >&2
+    fi
+    exit 1
   fi
   # `login` is the command the setup gate gives a fresh machine. Prove the
   # staged entry accepts the device-flow flag without starting a network login.
