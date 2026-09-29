@@ -4172,6 +4172,24 @@ async def handle_blob_proxy(request: web.Request) -> web.Response:
 
 _PROXY_TIMEOUT = 30  # seconds
 
+#: Longest silence tolerated on a proxied response body, streaming or not.
+#: ``_PROXY_TIMEOUT`` bounds how long an ORDINARY request may take in total; that
+#: bound cannot also cover a stream, whose whole purpose is to stay open. An
+#: idle bound covers both: an upstream that stops producing is still cut, and one
+#: that keeps producing is not. A server-sent-event stream must therefore emit
+#: something -- an event or a comment heartbeat -- at least this often.
+_PROXY_IDLE_TIMEOUT = 60  # seconds
+
+
+def _is_event_stream(content_type: str) -> bool:
+    """Whether a proxied response is a server-sent-event stream.
+
+    Matches on the media type alone, so a charset or any other parameter does
+    not hide the stream and turn the total timeout back on over it.
+    """
+    return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
+
+
 # App secret cache — secrets don't change after install, no need to read
 # from disk on every proxied request.  Invalidated on install/uninstall.
 _app_secret_cache: dict[str, str] = {}
@@ -4381,40 +4399,58 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
         )
 
     try:
-        timeout = aiohttp.ClientTimeout(total=_PROXY_TIMEOUT)
+        # The total bound is enforced HERE rather than handed to aiohttp as
+        # ``total``, because ``total`` also covers reading the response body and a
+        # stream's body does not end: one clock cannot bound an ordinary request
+        # without cutting every stream mid-body, which reaches the browser as a
+        # truncated chunked response rather than as an error. Enforced outside the
+        # client, the same bound is liftable once the response says it is a stream.
+        # ``sock_read`` stays armed for both kinds, so a silent upstream is cut
+        # either way.
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=_PROXY_TIMEOUT,
+            sock_read=_PROXY_IDLE_TIMEOUT,
+        )
         session = request.app.get("_proxy_session")
         owns_session = session is None or session.closed
         if owns_session:
             session = aiohttp.ClientSession()
         try:
-            async with session.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                data=body,
-                timeout=timeout,
-                allow_redirects=False,
-            ) as upstream:
-                # Stream response back
-                resp = web.StreamResponse(
-                    status=upstream.status,
-                    headers={
-                        k: v
-                        for k, v in upstream.headers.items()
-                        if k.lower() not in _PROXY_HOP_HEADERS
-                    },
-                )
-                try:
-                    await resp.prepare(request)
-                    async for chunk in upstream.content.iter_any():
-                        await resp.write(chunk)
-                    await resp.write_eof()
-                except (ConnectionResetError, ConnectionAbortedError):
-                    # The upstream request may finish after the browser has
-                    # already closed its side of the proxy stream. Do not turn
-                    # that routine client disconnect into a gateway traceback.
-                    pass
-                return resp
+            async with asyncio.timeout(_PROXY_TIMEOUT) as total_bound:
+                async with session.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    data=body,
+                    timeout=timeout,
+                    allow_redirects=False,
+                ) as upstream:
+                    if _is_event_stream(upstream.headers.get("Content-Type", "")):
+                        # A stream has no total. Lifted here rather than skipped
+                        # up front because only the response says what it is, and
+                        # the request's own leg stays bounded either way.
+                        total_bound.reschedule(None)
+                    # Stream response back
+                    resp = web.StreamResponse(
+                        status=upstream.status,
+                        headers={
+                            k: v
+                            for k, v in upstream.headers.items()
+                            if k.lower() not in _PROXY_HOP_HEADERS
+                        },
+                    )
+                    try:
+                        await resp.prepare(request)
+                        async for chunk in upstream.content.iter_any():
+                            await resp.write(chunk)
+                        await resp.write_eof()
+                    except (ConnectionResetError, ConnectionAbortedError):
+                        # The upstream request may finish after the browser has
+                        # already closed its side of the proxy stream. Do not turn
+                        # that routine client disconnect into a gateway traceback.
+                        pass
+                    return resp
         finally:
             if owns_session:
                 await session.close()
