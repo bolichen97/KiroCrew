@@ -56,6 +56,7 @@ from kiro_crew.agent_discovery import (
     _kiro_agents_dir,
     _read_agent_spec,
     cached_project_agent_names,
+    is_internal_agent_spec,
     list_agents,
     plain_markdown_document,
 )
@@ -84,6 +85,7 @@ from kiro_crew.context_management import (
     cap_result_file,
     evict_completed_agents,
 )
+from kiro_crew.dashboard.side_readonly_spec import readonly_base_name
 from kiro_crew.effort import effort_settings_key, model_supports_effort
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.hooks import (
@@ -273,6 +275,36 @@ AGENT_NOT_FOUND_CODE = "agent_not_found"
 #: short-circuit, and the gateway handler forwards the field without naming it.
 AGENT_NOT_AVAILABLE_CODE = "agent_not_available"
 
+#: Wire code for the refusal ``_validate_agent`` returns when the named agent is
+#: one of Kiro Crew's own generated specs (:func:`is_internal_agent_spec`): the
+#: file exists, but it is machinery, not a sub-agent. A third refusal kind, so it
+#: carries its own identifier: ``agent_not_found`` would send the caller looking
+#: for a typo in a name it can see on disk. Same single-definition rule as the
+#: two codes above.
+AGENT_INTERNAL_CODE = "agent_internal"
+
+
+def _internal_agent_refusal(requested: str, available: list[str]) -> str:
+    """Refusal prose for a spawn that names a generated spec (see :func:`is_internal_agent_spec`).
+
+    Names the base agent a read-only spec was derived from when that base is on
+    offer -- it is the agent the caller most likely meant -- and otherwise leaves
+    the roster to say what can be named. A base that is not offered (the host
+    default, reached by omitting ``agent``) is not suggested by name.
+    """
+    base = readonly_base_name(requested)
+    what = (
+        f"the read-only spec Kiro Crew derives from {base!r} for side replies"
+        if base
+        else "a spec Kiro Crew generates for its own use"
+    )
+    suggestion = f"; name {base!r} to spawn that agent" if base in available else ""
+    return (
+        f"agent {requested!r} is {what}, not a sub-agent"
+        f"{suggestion}{_available_agents_hint(available)}"
+    )
+
+
 #: Grammar an ``availableAgents`` glob must satisfy to be RENDERED into a refusal:
 #: the agent-name alphabet plus the fnmatch metacharacters. Matching never
 #: consults this; it only keeps instruction-shaped text out of a caller's context,
@@ -377,7 +409,11 @@ def _validate_app_agent_ownership(agent: str, app: str) -> str:
     or ``""`` when the agent is the app's own."""
     prefix = f"{app}--"
     try:
-        known = {a.name for a in list_agents() if a.filename.startswith(prefix)}
+        known = {
+            a.name
+            for a in list_agents()
+            if a.filename.startswith(prefix) and not is_internal_agent_spec(a)
+        }
     except Exception as exc:  # noqa: BLE001 - cannot confirm -> refuse
         return f"cannot verify agent {agent!r} for app {app!r}: {exc}"
     if agent not in known:
@@ -417,12 +453,20 @@ def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str, st
     """
     if not requested:
         return "", "", ""
-    known = {a.name for a in list_agents()}
+    agents = list_agents()
+    # Kiro Crew's own generated specs are on disk but are not sub-agents (see
+    # ``is_internal_agent_spec``): they are neither accepted nor offered. A
+    # project agent that declares the same name is the user's own and still wins.
+    internal = {a.name for a in agents if is_internal_agent_spec(a)}
+    known = {a.name for a in agents} - internal
     if project_dir:
         known |= set(cached_project_agent_names(project_dir) or frozenset())
     if requested in known:
         return requested, "", ""
     available = sorted(known - UNADVERTISED_AGENTS)
+    if requested in internal:
+        logger.warning("Agent %r is a generated internal spec; refusing spawn", requested)
+        return "", _internal_agent_refusal(requested, available), AGENT_INTERNAL_CODE
     # REFUSE a named-but-unknown agent rather than silently falling back to the
     # host default: that fallback runs the full default agent (frequently at
     # approval_mode="auto"), so a typo'd — or malicious — agent name was a silent

@@ -132,6 +132,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
 )
+from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.claim import mint_stub_session_token, send_claim
@@ -6978,12 +6979,12 @@ class AcpRuntime:
         elif mode_agent:
             _ids, _current, _adv = parse_session_modes(resp)
             await self.terminate_session(session_id)
+            cause, remedy = await asyncio.to_thread(unavailable_mode_explanation, mode_agent)
             raise AcpRuntimeError(
                 f"Agent mode {mode_agent!r} is not available on this session "
-                f"(advertised modes: {_ids or 'none'}); its "
-                f"~/.kiro/agents/{mode_agent}.json is likely missing. Refusing to run "
+                f"(advertised modes: {_ids or 'none'}); {cause} Refusing to run "
                 f"the backend default mode {_current or '(unknown)'} in its place. "
-                f"Run `kirocrew setup --agent-only` to materialize the agent config."
+                f"{remedy}"
             )
 
         # Drain MCP-server-init / oauth / config notifications before the first
@@ -7528,12 +7529,12 @@ class AcpRuntime:
             # different (broader) default agent than the one requested.
             _ids, _current, _adv = parse_session_modes(resp)
             await self.terminate_session(resume_sid)
+            cause, remedy = await asyncio.to_thread(unavailable_mode_explanation, mode_agent)
             raise AcpRuntimeError(
                 f"Agent mode {agent!r} is not available for resumed session "
-                f"{resume_sid} (advertised modes: {_ids or 'none'}); its "
-                f"~/.kiro/agents/{agent}.json is likely missing. Refusing to run "
-                f"the backend default mode {_current or '(unknown)'} in its place. "
-                f"Run `kirocrew setup --agent-only` to materialize the agent config."
+                f"{resume_sid} (advertised modes: {_ids or 'none'}); {cause} Refusing "
+                f"to run the backend default mode {_current or '(unknown)'} in its place. "
+                f"{remedy}"
             )
 
         # Drain MCP-init / oauth / config notifications before the first prompt

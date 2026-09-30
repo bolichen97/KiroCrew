@@ -580,6 +580,35 @@ declaration forbids and say so
 server resolves its own session's template best-effort and filters nothing
 when it cannot — and the gate above is the decision.
 
+### Kiro Crew's own generated specs are not sub-agents
+
+Two kinds of spec Kiro Crew writes into the user-level agents directory — the
+only place kiro-cli loads a spec from — exist for its own machinery:
+the side turn's derived read-only spec (`<agent>--readonly`, recognised by the
+owner marker its `description` opens with; `side.md`) and a skill-view alias
+(`kirocrew-skill-view-*`). `agent_discovery.is_internal_agent_spec` is the one
+predicate for both. A roster that offered one sent the model into a spawn that
+failed: the read-only spec is written per side turn, and a kiro-cli that listed
+its agents before then refuses the mode. So:
+
+- every spawn roster leaves them out — `spawn_run`'s parameter roster,
+  `spawn_list` (whose listing is otherwise unfiltered) and the unknown-agent
+  refusal's `available:` list;
+- `_validate_agent` refuses a named one with `agent_internal`
+  (`subagent.AGENT_INTERNAL_CODE`), naming the base agent a read-only spec was
+  derived from when that base is on offer. It is refused, not mapped onto the
+  base: the base carries the grants the read-only copy strips, so a silent
+  substitution would run the caller under more than it named. A PROJECT agent
+  declaring the same name is the user's own — kiro-cli resolves it first — and
+  is accepted. `spawn_run` stops the rest of a wave on this code, as it does on
+  `agent_not_found`;
+- an app does not own a spec derived from one of its agents
+  (`<app>--<agent>--readonly` shares the prefix): both the SpawnSDK's
+  ownership set and `_validate_app_agent_ownership` leave it out.
+
+The match is on the owner marker, never the name alone: a hand-authored agent
+that merely ends in `--readonly` stays listed and spawnable.
+
 Spawn flow:
 1. **YOLO mode**: skips approval, runs immediately
 2. **Parent trusted**: parent session has `approval_policy="auto"` (set by
@@ -2231,12 +2260,14 @@ machine-readable `code` beside the advisory `error` prose (plus `counted: true` 
 see Wave liveness above): `agent_not_found` for a named-but-unknown agent,
 `agent_not_available` for a target the parent agent spec's
 `toolsSettings.subagent.availableAgents` forbids (§ Parent agent spec allowlist),
+`agent_internal` for one of Kiro Crew's own generated specs (§ Kiro Crew's own
+generated specs are not sub-agents),
 `spawn_rejected` for every other kind (empty task, low memory, cwd refusal,
 governance). `code` is the contract and `error` is advisory (RFC 9457 3.1.3),
 which is what lets the refusal sentence be reworded without breaking a client.
-The identifiers are minted AT the decision — `subagent.AGENT_NOT_FOUND_CODE`,
-returned by `_validate_agent`, and `subagent.AGENT_NOT_AVAILABLE_CODE`, set by
-the gate — carried on `SubagentInfo.error_code`, and
+The identifiers are minted AT the decision — `subagent.AGENT_NOT_FOUND_CODE`
+and `subagent.AGENT_INTERNAL_CODE`, returned by `_validate_agent`, and
+`subagent.AGENT_NOT_AVAILABLE_CODE`, set by the gate — carried on `SubagentInfo.error_code`, and
 forwarded by the handler without being respelled there, so each value has exactly
 one spelling in the tree.
 

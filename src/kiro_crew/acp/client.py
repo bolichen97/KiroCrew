@@ -215,6 +215,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_VALUE,
 )
 from kiro_crew.credential_errors import is_credential_propagation_delay
+from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.env import (
     augmented_path,
     describe_search_path,
@@ -10745,12 +10746,11 @@ class AcpClient:
                 )
                 logger.info("ACP agent activated: %s", self._agent)
             else:
+                cause, remedy = await asyncio.to_thread(unavailable_mode_explanation, self._agent)
                 raise AcpError(
                     f"Agent mode {self._agent!r} is not available on this session "
-                    f"(advertised modes: {self._available_mode_ids or 'none'}); its "
-                    f"~/.kiro/agents/{self._agent}.json is likely missing. Refusing "
-                    f"to run the backend default mode in its place. Run "
-                    f"`kirocrew setup --agent-only` to materialize the agent config."
+                    f"(advertised modes: {self._available_mode_ids or 'none'}); {cause} "
+                    f"Refusing to run the backend default mode in its place. {remedy}"
                 )
 
         # 5. Set model — override if KiroCrew config specifies non-default.

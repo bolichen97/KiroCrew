@@ -9145,12 +9145,43 @@ async def test_create_session_fails_closed_when_agent_not_advertised():
     # session/new response, then the terminate roundtrip from the fail-closed path
     rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
     with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
-        with pytest.raises(AcpRuntimeError, match="not available"):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
             await rt.create_session(agent="kirocrew", mcp_servers=[])
+    # An ordinary agent keeps the materialize hint: setup does write that file.
+    assert "kirocrew setup --agent-only" in str(exc.value)
     methods = [c.args[0] for c in rt._send_and_await.call_args_list]
     assert METHOD_SET_MODE not in methods  # never activated the wrong mode
     assert METHOD_SESSION_TERMINATE in methods  # created session cleaned up
     assert "s1" not in rt._session_queues  # unregistered
+
+
+@pytest.mark.asyncio
+async def test_create_session_refusal_explains_a_derived_readonly_spec(tmp_path, monkeypatch):
+    """The side turn's ``<agent>--readonly`` spec is written by the side turn,
+    never by ``kirocrew setup``, and kiro-cli lists agents only at process start.
+    The refusal must say that and name the base agent -- the setup hint sent the
+    user to a command that cannot create the file. The spec is published by the
+    real publisher, because the owner marker on it is what the wording keys on."""
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.dashboard import side_readonly_spec as srs
+
+    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(srs, "_refresh_materialized_snapshot", lambda: None)
+    (tmp_path / "scout.json").write_text(json.dumps({"name": "scout"}), encoding="utf-8")
+    assert srs.publish_readonly_spec("scout").name == "scout--readonly"
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "kirocrew", "availableModes": [{"id": "kirocrew"}]})
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
+            await rt.create_session(agent="scout--readonly", mcp_servers=[])
+    message = str(exc.value)
+    assert "kirocrew setup --agent-only" not in message
+    assert "is likely missing" not in message
+    assert "read-only spec Kiro Crew derives from 'scout'" in message
+    assert "name 'scout'" in message
+    assert "Refusing to run the backend default mode kirocrew in its place" in message
 
 
 @pytest.mark.asyncio
