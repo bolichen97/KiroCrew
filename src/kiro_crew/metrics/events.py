@@ -74,6 +74,17 @@ CHILD_PERMISSION_ROUTED = "kirocrew.acp.child_permission.routed"
 #: value is a routing regression alarm.
 DROPPED_FRAMES = "kirocrew.acp.dropped_frames"
 
+#: One point per fallback outcome in ``acp/runtime.py::_activate_mode_bracketed``:
+#: a ``session/set_mode`` that did not land on the freshly prepared skill-view
+#: alias on the first try, or whose re-preparation could not run. One set_mode
+#: can record two (``kept_spawn_view``, then ``authored_agent`` when the host lost
+#: that alias too). ``outcome`` is the closed enum
+#: ``loaded_after_retry`` / ``kept_spawn_view`` / ``authored_agent`` /
+#: ``kept_previous_view``. Anything but a trickle of ``loaded_after_retry`` means
+#: the host is not seeing published aliases, and every
+#: ``authored_agent`` is a session running with unbounded native skill metadata.
+SKILL_VIEW_FALLBACKS = "kirocrew.acp.skill_view.fallback"
+
 #: Cause attribution for turn timeouts (the 2h-ceiling hangs): whether the
 #: session was parked on a permission prompt and whether backend children
 #: were live when the ceiling fired.

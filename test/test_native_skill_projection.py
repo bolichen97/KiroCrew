@@ -511,6 +511,61 @@ def _metadata_file(agents, prepared, name="custom"):
     return agents / projection._PROJECTION_METADATA_DIR_NAME / f"{prepared.agent(name)}.json"
 
 
+def _spec_with_injected_env(value, extra=None):
+    env = {"INJECTION_ID": value, **(extra or {})}
+    return json.dumps(
+        {"name": "custom", "mcpServers": {"injected": {"command": "helper", "env": env}}}
+    )
+
+
+def test_a_rewritten_env_value_reuses_the_alias(native_tree):
+    home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text(_spec_with_injected_env("first-write"), encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project).agent("custom")
+    source.write_text(_spec_with_injected_env("second-write"), encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared.agent("custom") == first
+    view = json.loads(_alias_file(agents, prepared).read_text(encoding="utf-8"))
+    assert view["mcpServers"]["injected"]["env"]["INJECTION_ID"] == "second-write"
+    aliases = [
+        p for p in agents.iterdir() if p.name.startswith(projection.NATIVE_SKILL_ALIAS_PREFIX)
+    ]
+    assert aliases == [agents / f"{first}.json"]
+
+
+def test_an_added_env_key_names_a_new_alias(native_tree):
+    home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text(_spec_with_injected_env("same"), encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project).agent("custom")
+    source.write_text(_spec_with_injected_env("same", {"NEW_VAR": "1"}), encoding="utf-8")
+    assert projection.prepare_native_skill_projection(project).agent("custom") != first
+
+
+def test_project_agents_differing_only_in_env_values_never_share_an_alias(
+    native_tree, tmp_path, monkeypatch
+):
+    home, agents, project = native_tree
+    monkeypatch.setattr(
+        projection,
+        "list_agents",
+        lambda **kw: [SimpleNamespace(name="custom", filename="custom.json", scope="project")],
+    )
+    views = {}
+    for name, token in (("one", "token-one"), ("two", "token-two")):
+        work = tmp_path / name
+        (work / ".kiro" / "agents").mkdir(parents=True)
+        (work / ".kiro" / "agents" / "custom.json").write_text(
+            _spec_with_injected_env(token), encoding="utf-8"
+        )
+        prepared = projection.prepare_native_skill_projection(work)
+        views[name] = (prepared.agent("custom"), _alias_file(agents, prepared))
+    assert views["one"][0] != views["two"][0]
+    first = json.loads(views["one"][1].read_text(encoding="utf-8"))
+    assert first["mcpServers"]["injected"]["env"]["INJECTION_ID"] == "token-one"
+
+
 def test_generated_view_keeps_lifecycle_ownership_out_of_the_agent_spec(native_tree):
     home, agents, project = native_tree
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
@@ -3406,3 +3461,65 @@ def test_reader_follows_a_live_global_preference_under_the_overlay(native_tree):
     assert projection.inherits_default_resources(project) is False
     settings.write_text('{"chat.disableInheritingDefaultResources":false}', encoding="utf-8")
     assert projection.inherits_default_resources(project) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refreshed_alias", ["same", "changed", None])
+async def test_set_mode_keeps_the_alias_the_host_loaded_at_spawn(
+    monkeypatch, tmp_path, refreshed_alias
+):
+    """``set_mode`` names a mode kiro-cli has already loaded.
+
+    The re-preparation before ``set_mode`` can derive a NEW alias for the mode
+    agent when its source spec changed since spawn. kiro-cli 2.26.0 does not see
+    a spec renamed into ``~/.kiro/agents`` after it started, so switching to the
+    new name fails with ``Mode '<alias>' not found`` while the file is on disk.
+    The spawn-time alias is the one the host advertised; that is the one sent.
+    An unchanged alias adopts the fresh view, and a re-preparation that could not
+    run (``None``) keeps the spawn-time projection instead of dropping it.
+    """
+    import types
+
+    import kiro_crew.agent as agent_module
+    from kiro_crew.acp import runtime as runtime_module
+
+    spawn = projection.NativeSkillProjection({"crew": "kirocrew-skill-view-spawn"})
+    if refreshed_alias == "same":
+        fresh = projection.NativeSkillProjection(
+            {"crew": "kirocrew-skill-view-spawn", "other": "kirocrew-skill-view-other"}
+        )
+    elif refreshed_alias == "changed":
+        fresh = projection.NativeSkillProjection({"crew": "kirocrew-skill-view-changed"})
+    else:
+        fresh = None
+    monkeypatch.setattr(projection, "prepare_native_skill_projection", lambda *a, **k: fresh)
+    # ``None``: an agent outside the derived-spec bracket, whose spawn alias is the
+    # one to keep (a bracketed agent runs its authored spec instead; that rule is
+    # pinned in test_acp_set_mode_projection_fallback.py).
+    monkeypatch.setattr(agent_module, "require_fresh_derived_spec", lambda *a, **k: None)
+    monkeypatch.setattr(agent_module, "require_unchanged_derived_spec", lambda *a, **k: None)
+
+    sent: list[dict] = []
+    terminated: list[str] = []
+
+    class Stub:
+        _native_skill_projection = spawn
+        _work_dir = tmp_path
+
+        async def terminate_session(self, sid):
+            terminated.append(sid)
+
+        async def _send_and_await(self, method, params, timeout=None):
+            sent.append(self._native_skill_projection.request(method, params))
+            return {}
+
+    stub = Stub()
+    activate = types.MethodType(runtime_module.AcpRuntime._activate_mode_bracketed, stub)
+    await activate("sid", "crew", budget=5.0, payload_snapshot=None, wire_registered=False)
+
+    assert sent[0]["modeId"] == "kirocrew-skill-view-spawn"
+    assert not terminated
+    if refreshed_alias == "same":
+        assert stub._native_skill_projection is fresh
+    else:
+        assert stub._native_skill_projection is spawn
