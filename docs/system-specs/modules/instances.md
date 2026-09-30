@@ -857,6 +857,22 @@ relies on and turn a working setup into `Bad configuration option`.
 The diagnostics probes are a different case and are left alone: they are
 one-shot commands whose exit status is the whole result, with no forward to own.
 
+**An inherited `ProxyCommand` runs under the ssh child's `PATH`.** A
+GUI-launched desktop-app gateway has launchd's minimal `PATH`, and the proxies in
+real use look a tool up by name (an SSM connect helper that execs
+`session-manager-plugin`, `sh -c "aws ssm start-session ..."` needs `aws`), so
+every ssh child failed with `ssh exited 255: Error: session-manager-plugin is not
+installed` while the plugin sat in `/usr/local/bin`. Every ssh spawn — tunnel,
+token mint, `restart_remote`, the diagnostics probes — therefore goes through
+`token_mint.ssh_spawn_argv_env`: the `ssh` head is resolved against the inherited
+`PATH` only, and the child gets `deploy.engine.tool_spawn_env`, the same env the
+SSM transport's `aws` child gets. That helper APPENDS the well-known install dirs
+(`/opt/homebrew/bin`, `/usr/local/bin`) and withholds them for a bare head, so
+the inherited `PATH` keeps first claim on every name and an `ssh` found only in
+those dirs is never exec'd. When the proxy still cannot find its program, the
+tunnel and mint errors say so and name the `PATH` the child was given, instead of
+the "connection closed" that ssh prints afterwards reading as a network drop.
+
 ### Dev host / home server (primary)
 
 Use your SSH config alias or `user@hostname`. As long as a key in your
