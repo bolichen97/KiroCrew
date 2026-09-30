@@ -6710,15 +6710,17 @@ class TestSsmTunnelProcessGroup:
         assert seen["creationflags"] == 0
 
     @pytest.mark.asyncio
-    async def test_ssm_child_gets_plugin_search_path_and_ssh_inherits(self, monkeypatch, tmp_path):
-        """The SSM child needs a PATH that can find session-manager-plugin.
+    async def test_ssm_and_ssh_children_get_the_same_plugin_search_path(
+        self, monkeypatch, tmp_path
+    ):
+        """Both tunnel children need a PATH that can find session-manager-plugin.
 
         The argv head is resolved absolutely, but the aws CLI then looks the
         plugin up BY NAME on this child's own PATH — under a GUI-launched gateway
         the minimal launchd one — so the tunnel died inside a correctly resolved
-        ``aws``. SSH keeps ``env=None`` (inherit): its binary lives in
-        the system bin dir and widening a tunnel child's PATH without a reason to
-        is the opposite of what this fix argues for.
+        ``aws``. The ssh child has the same gap through the user's
+        ``ProxyCommand`` (an SSM connect helper looks the plugin up by name), so
+        it gets the same appended dirs — once its own head resolves absolutely.
         """
         import kiro_crew.instances.ssh_tunnel_manager as mod
         from kiro_crew.deploy import engine
@@ -6758,9 +6760,15 @@ class TestSsmTunnelProcessGroup:
         # Appended: the inherited PATH still wins every name it can resolve.
         assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
 
+        # ssh: same widening, same order, once its head resolves on the
+        # inherited PATH (planted the same way as the aws stand-in above).
+        fake_ssh = inherited / ("ssh.cmd" if os.name == "nt" else "ssh")
+        fake_ssh.write_text("@echo off\n" if os.name == "nt" else "#!/bin/sh\n")
+        fake_ssh.chmod(0o755)
         seen.clear()
         await self._tunnel("ssh").start()
-        assert seen["env"] is None
+        child_path = seen["env"]["PATH"].split(os.pathsep)
+        assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
 
     def test_teardown_routes_through_the_platform_shim(self, monkeypatch):
         """Not raw os.killpg — that leaves the plugin alive on Windows."""
@@ -7696,6 +7704,60 @@ class TestOrphanForwarderReclaim:
             assert inst.local_port != port
         finally:
             self._cleanup(proc)
+
+    @pytest.mark.asyncio
+    async def test_reclaim_compares_the_resolved_ssh_head_the_tunnel_spawned(
+        self, tmp_path, monkeypatch
+    ):
+        """The ssh tunnel spawns an ABSOLUTE head, so the reclaim must compare one.
+
+        The builder returns the bare ``"ssh"`` and ``ssh_spawn_argv_env``
+        resolves it at spawn, so the kernel records the resolved path. A reclaim
+        that rebuilt the bare head compared ``ssh`` with ``/usr/bin/ssh``
+        element-exactly and leaked every genuine orphan. Runs on every platform:
+        the port is held by a real listener, every gate before the identity
+        check is real, and the argv handed to the identity check is compared
+        with the one ``_SshTunnel`` spawns for the same instance.
+        """
+        import kiro_crew.instances.ssh_tunnel_manager as stm
+        from kiro_crew.instances import token_mint
+
+        head = str(tmp_path / "bin" / "ssh")
+        monkeypatch.setattr(token_mint, "resolve_ssh_bin", lambda: head)
+        self._fake_orphan(monkeypatch)
+        sign = self._pin_identity_key(monkeypatch)
+        seen: dict = {}
+
+        def capture(pid, start, expected_argv, port, tree, audit):
+            seen["argv"] = list(expected_argv)
+            return "identity_mismatch"
+
+        monkeypatch.setattr(stm, "_verify_and_reclaim_forwarder", capture)
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            reg, mgr = self._mgr(tmp_path, base_port=54350)
+            reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+            pid, start = 424242, "12345"
+            reg.update(
+                "cd-1",
+                local_port=port,
+                forwarder_pid=pid,
+                forwarder_start=start,
+                forwarder_sig=sign("cd-1", pid, start, port),
+                was_connected=True,
+            )
+            await mgr.connect("cd-1")
+        finally:
+            holder.close()
+
+        spawned = stm._SshTunnel(
+            "cd-1", "cd-1-alias", port, reg.get("cd-1").remote_port
+        )._build_argv()
+        assert seen["argv"][0] == head
+        assert seen["argv"] == spawned
 
     @pytest.mark.skipif(
         sys.platform != "linux",

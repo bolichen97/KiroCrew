@@ -70,7 +70,7 @@ from kiro_crew.cloud.connect import FARGATE_TURN_PATH
 # hardcoded port, no wildcard). See server._extra_frame_ancestors.
 from kiro_crew.config import live
 from kiro_crew.config.loader import DASHBOARD_PORT as _LOCAL_DASHBOARD_PORT
-from kiro_crew.deploy.engine import aws_spawn_env
+from kiro_crew.deploy.engine import tool_spawn_env
 from kiro_crew.gateway_identity import gateway_id
 from kiro_crew.instances.constants import CAPABILITY_REPLY_MAX_BYTES as _CAPABILITY_REPLY_MAX_BYTES
 from kiro_crew.instances.constants import (
@@ -144,10 +144,13 @@ from kiro_crew.instances.ssm_token_mint import (
     run_remote_kirocrew_ssm,
 )
 from kiro_crew.instances.token_mint import (
+    PROXY_TOOL_MISSING_SIGNALS,
     HopRetiredError,
     TokenMintError,
     mint_remote_token,
+    proxy_tool_missing_message,
     run_remote_kirocrew,
+    ssh_spawn_argv_env,
     ttl_to_seconds,
 )
 from kiro_crew.instances.validation import (
@@ -728,6 +731,7 @@ class _SshTunnel:
         # child that fills the OS buffer while still running.
         self._stdout_buf = ""
         self._stdout_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._child_path = ""  # the PATH the last spawned child was given
         self.status = TunnelStatus(
             instance_id=instance_id,
             local_port=local_port,
@@ -744,9 +748,12 @@ class _SshTunnel:
                 profile=self._aws_profile,
                 region=self._aws_region,
             )
-        return _build_ssh_tunnel_argv(
-            self._ssh_host, self._local_port, self._remote_port, compression=self._compression
+        argv, _env = ssh_spawn_argv_env(
+            _build_ssh_tunnel_argv(
+                self._ssh_host, self._local_port, self._remote_port, compression=self._compression
+            )
         )
+        return argv
 
     async def start(self) -> bool:
         """Spawn the tunnel child and wait until the local forward is reachable.
@@ -760,9 +767,9 @@ class _SshTunnel:
         self._stopping = False
         self.status.state = TunnelState.CONNECTING
         self.status.error = ""
-        # Built in a worker thread: the SSM branch resolves the aws CLI
-        # absolutely, which probes the filesystem (PATH scan +
-        # well-known install dirs) — synchronous work that must not run on the
+        # Built in a worker thread: both branches resolve their argv head
+        # absolutely (aws: PATH scan + well-known install dirs; ssh: PATH scan),
+        # which probes the filesystem — synchronous work that must not run on the
         # gateway event loop, where a stalled network mount on PATH would
         # freeze every request and heartbeat.
         argv = await asyncio.to_thread(self._build_argv)
@@ -775,6 +782,10 @@ class _SshTunnel:
             target,
             self._remote_port,
         )
+        spawn_env = tool_spawn_env(argv[0])
+        # Kept for the exit classifier: a ProxyCommand whose program is missing
+        # is reported with the PATH this child actually searched.
+        self._child_path = spawn_env.get("PATH", "")
         try:
             ssm = self._transport == "ssm"
             self._proc = await asyncio.create_subprocess_exec(
@@ -798,17 +809,18 @@ class _SshTunnel:
                 # CREATE_NEW_PROCESS_GROUP is what makes the tree taskkill /T-reapable.
                 start_new_session=(ssm and platform_compat.IS_POSIX),
                 creationflags=(platform_compat.CREATE_NEW_PROCESS_GROUP if ssm else 0),
-                # SSM only: the argv head is resolved absolutely, but the aws CLI
-                # then looks session-manager-plugin up BY NAME on this child's own
-                # PATH, which a GUI-launched gateway hands down as the minimal
-                # launchd one — so the tunnel dies inside a correctly-resolved aws
-                # unless the child's env carries the install dirs. argv[0]
-                # is handed over so the widening is withheld for a bare head: that
-                # bare name IS a provenance refusal, and widening would put the
-                # refused binary back within execvp's reach. None means inherit,
-                # which is what the ssh transport wants: its binary lives in the
-                # system bin dir and needs no widening.
-                env=(aws_spawn_env(argv[0]) if ssm else None),
+                # Both transports: the argv head is resolved absolutely, but the
+                # child then looks a tool up BY NAME on its own PATH — aws finds
+                # session-manager-plugin that way, and ssh runs the user's
+                # ProxyCommand (an SSM connect helper, `aws ssm start-session`),
+                # which does the same. A GUI-launched gateway hands down launchd's
+                # minimal PATH, so the tunnel died with "session-manager-plugin is
+                # not installed" while the plugin sat in /usr/local/bin. argv[0] is
+                # handed over so the widening is withheld for a bare head (see
+                # tool_spawn_env): for aws that bare name IS a provenance refusal,
+                # for ssh it means no ssh on the inherited PATH, and either way
+                # widening would put an unvetted binary within execvp's reach.
+                env=spawn_env,
             )
         except OSError as e:
             self.status.state = TunnelState.ERROR
@@ -994,6 +1006,16 @@ class _SshTunnel:
         hit = _first_hit(low, _SSH_AUTH_SIGNALS)
         if hit is not None:
             return f"ssh auth failed (check SSH access): {_sanitize_banner(tail, anchor=hit)}"
+        # A ProxyCommand that could not find its program. Checked before the
+        # transport drops: ssh follows it with "Connection closed by ..." once the
+        # proxy exits, which would otherwise read as a network drop, and the
+        # actionable fact is which PATH the program was missing from.
+        # Gated on 255, ssh's own failure status, as the mint's twin is: the
+        # wording is shell prose, and only an ssh-level failure is the proxy's.
+        hit = _first_hit(low, PROXY_TOOL_MISSING_SIGNALS) if returncode == 255 else None
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
+            return f"{proxy_tool_missing_message(self._child_path)}: {detail}"
         # WSSH / transport session drops — not an auth problem. Worded neutrally
         # because this method is also used for the initial-connect failure path,
         # where no self-heal is armed yet (so it must not promise reconnection).
@@ -2055,16 +2077,24 @@ class SshTunnelManager:
                 region=params.aws_region,
             )
         else:
-            expected = _build_ssh_tunnel_argv(
-                params.ssh_host,
-                port,
-                # A chained forward targets its parent's loopback port, so the
-                # identity compared here has to be the argv that was actually
-                # spawned. Comparing the crew's own port would never match, and
-                # a mismatch is read as "not our child" — the leaked forwarder
-                # would be left holding the port forever.
-                params.forward_remote_port(inst.remote_port),
-                compression=self._ssh_compression,
+            # Through the same ssh_spawn_argv_env the spawn used, so the head is
+            # the resolved /usr/bin/ssh the kernel recorded, not the bare "ssh"
+            # the builder returns: an element-exact compare against the bare
+            # head reads every genuine orphan as "not our child" and leaks it.
+            # Off the loop, because resolving the head scans PATH.
+            expected, _env = await asyncio.to_thread(
+                ssh_spawn_argv_env,
+                _build_ssh_tunnel_argv(
+                    params.ssh_host,
+                    port,
+                    # A chained forward targets its parent's loopback port, so the
+                    # identity compared here has to be the argv that was actually
+                    # spawned. Comparing the crew's own port would never match, and
+                    # a mismatch is read as "not our child" — the leaked forwarder
+                    # would be left holding the port forever.
+                    params.forward_remote_port(inst.remote_port),
+                    compression=self._ssh_compression,
+                ),
             )
         outcome = await asyncio.to_thread(
             _verify_and_reclaim_forwarder,
