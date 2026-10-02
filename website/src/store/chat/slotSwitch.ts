@@ -20,9 +20,10 @@ import { deduplicateByMid, floorForGen, olderHeadAbovePage, raiseChunkSeq, sameT
 import { abortActiveOlderFetch, pagingCursorAfterKeptHead, slotCoverageShortfall, slotSwitchFetchLimit } from './paging'
 import { mergePreservedThinking, reinsertThinkingOrphans, type ThinkingAnchor } from './thinking'
 import { bumpRunEpoch, enterActiveSlot, pushHistory } from './runState'
-import { retainServerTotal, seedContextUsage, setPagingCursor, writeSlotPage } from './slotCache'
+import { parkActiveTranscript, retainServerTotal, seedContextUsage, setPagingCursor, writeSlotPage } from './slotCache'
 import { hydrateQueuedBubbles } from './queue'
 import { loadSlotActivity } from './activity'
+import { walkWindowBackTo } from './windowWalk'
 
 /** `switchSlot`'s argument. The plain-string spelling is the overwhelmingly
  *  common one; the object form exists for caller classes that must opt out of a
@@ -177,15 +178,8 @@ export const switchSlot = createAsyncThunk<
     const _newestSlotTs = () => (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.last_ts
     // Bounded to the page size so opening a long session costs one page, not the
     // whole chained transcript; `loadOlderMessages` walks back from the cursor
-    // this fetch returns. Unbounded while the slot is streaming, for the same
-    // reason warmSlotCache and ChatPane's hydrate are -- deliberately, not because a
-    // bound would cut raw rows: the handler collapses chunk runs BEFORE it slices.
-    // `slotRun` and not `selectSlotStreamState`: switchSlot.pending has already
-    // assigned `activeSlot = key` by the time this body runs, so that selector
-    // would always take its active-slot branch and report `slotState`, which
-    // still describes the OUTGOING slot. `slotRun` is keyed per slot, so it
-    // answers for the incoming one. Guarded because a partial preloaded state
-    // can omit `slotRun` entirely, and throwing here would skip the fetch.
+    // this fetch returns, and a window that misses rows this tab already holds
+    // is extended older by `walkWindowBackTo` before it replaces the view.
     try {
       // EVERY switch is bounded, including into a slot mid-turn: ask for what
       // this tab already holds (never fewer than one page) and let the coverage
@@ -208,19 +202,19 @@ export const switchSlot = createAsyncThunk<
       // already covered its cache exactly. See slotCoverageShortfall.
       const shortfall = slotCoverageShortfall({ cached: cachedRows, window: first.messages })
       if (shortfall > 0) {
-        // Named in the inspector because this is the one path that can multiply the
-        // loaded transcript in a single step with no paging door involved. Reaching it
-        // now means a hole was OBSERVED between the cache and the window, not merely
-        // assumed for want of an earlier total.
+        // A hole was OBSERVED between the cache and the window, not merely assumed
+        // for want of an earlier total. Close it by extending the window OLDER
+        // until it anchors a cached row -- `switchSlot.fulfilled` then keeps the
+        // cache above that anchor (`olderHeadAbovePage`), so replacing the view
+        // with the walked window deletes nothing. The shortfall count itself
+        // stays the conservative multiset it is: it cannot tell "above the
+        // anchor" from "in a hole", and does not have to -- the walk answers that.
+        // Carry the bounded read's count forward: it is the baseline the next
+        // switch compares against.
         if (inspectorOn()) {
-          devLog('SWITCH', `unbounded short=${shortfall} lim=${limit ?? '-'} cached=${cached} total=${first.total ?? '?'}`)
+          devLog('SWITCH', `short=${shortfall} lim=${limit ?? '-'} cached=${cached} total=${first.total ?? '?'}`)
         }
-        // Unbounded deliberately: the hole's width is server rows this tab never saw,
-        // so a locally-sized window cannot be proven to reach the cache, and this path
-        // REPLACES rather than merges. Carry the bounded read's count forward -- it is
-        // the only one of the two in settled units, and returning only the retry threw
-        // away the baseline the next switch needs.
-        const wide = await fetchSlotDetail(key)
+        const walked = await walkWindowBackTo(key, first, cachedRows)
         // Emit only while this request still owns the slot switch: a rapid
         // A->B switch leaves A's fetch resolving after B took over, and A's
         // transcript never rendered — relaying its read would clear sibling
@@ -228,7 +222,7 @@ export const switchSlot = createAsyncThunk<
         // atomically before this thunk body runs, so a superseded request
         // observes someone else's key here.
         if ((getState() as { chat: ChatState }).chat.activeSlot === key) emitSlotRead(key, _newestSlotTs())
-        return { ...wide, comparableTotal: first.total }
+        return { ...walked, comparableTotal: first.total }
       }
       if ((getState() as { chat: ChatState }).chat.activeSlot === key) emitSlotRead(key, _newestSlotTs())
       return first
@@ -400,6 +394,9 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
           run: { state: state.slotState, running: state.slotRunning, stopping: state.slotStopping },
         }
       }
+      // Cache the outgoing slot's messages before the switch fields below are
+      // re-keyed (see parkActiveTranscript).
+      parkActiveTranscript(state)
       // This fetch replaces the cursor, so it is stale from here until it lands
       // -- including a same-key switch, where the key alone still looks valid.
       state.slotCursorKey = null
@@ -408,15 +405,6 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       // Save current slot's activity
       if (state.activeSlot) {
         state.slotActivity[state.activeSlot] = { toolLog: state.toolLog, subagents: state.subagents, activityTab: state.activityTab, activityOpen: state.activityOpen }
-      }
-      // Cache current slot's messages before switching
-      if (state.activeSlot && state.messages.length > 0) {
-        // Once its switch has landed the view is the whole transcript, so its own
-        // has_more is the marker; before that, preserve what the pane already had.
-        const k = safeKey(state.activeSlot)
-        writeSlotPage(state, state.activeSlot, state.messages,
-          viewIsProvisional ? undefined : state.slotHasMore,
-          viewIsProvisional ? state.slotPaneBounded?.[k] : undefined)
       }
       // Always strip target from history: activeSlot ∉ slotHistory
       state.slotHistory = state.slotHistory.filter(k => k !== target)
@@ -490,9 +478,9 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       const { key, messages, running, hasMore, queue, nextBefore } = action.payload
       if (isUnsafeKey(key)) return
       if (state.activeSlot !== key) return  // user switched away during fetch
-      // A payload carrying `comparableTotal` came from the coverage retry: its
-      // own `total` is the raw unbounded count, the carried one is the settled
-      // bounded count, and only the latter may become the baseline.
+      // A payload carrying `comparableTotal` came from the coverage walk: the
+      // carried count is the first bounded read's settled one, and only that
+      // may become the baseline.
       const comparable = (action.payload as { comparableTotal?: number }).comparableTotal
       retainServerTotal(state, key, comparable ?? action.payload.total, running,
         undefined, comparable !== undefined || action.payload.boundedRead)

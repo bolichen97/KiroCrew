@@ -85,7 +85,9 @@ const fetchedSlots = (): string[] =>
 /** The bounded (warm-of-an-uncached-slot) subset. */
 const warmedSlots = (): string[] =>
   (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls
-    .filter(c => c[1] === PANE_HYDRATE_LIMIT)
+    // The active slot's refresh asks for the same floor on an empty view, so a
+    // warm is told apart by slot; the active slot's single read is pinned below.
+    .filter(c => c[0] !== ACTIVE && c[1] === PANE_HYDRATE_LIMIT)
     .map(c => c[0] as string)
 
 const row = (mid: string, role: string, content: string, meta?: Record<string, unknown>): ChatMessage =>
@@ -174,7 +176,7 @@ describe('useWebSocket reconnect hydrates every mounted ChatPane (observed hydra
 
     expect(warmedSlots()).toEqual([MEMBER])
     // The active slot keeps its own refresh, untouched by the pane warm.
-    expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE)
+    expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE, PANE_HYDRATE_LIMIT)
 
     unmount()
     vi.useRealTimers()

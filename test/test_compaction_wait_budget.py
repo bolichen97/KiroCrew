@@ -120,6 +120,134 @@ def test_inner_status_wait_never_below_floor_or_non_positive():
         assert _compact_result_wait_secs(elapsed) == _COMPACT_RESULT_WAIT_FLOOR_SECS
 
 
+# ── The budget is configurable (session.compact_wait_secs) ────
+#
+# The report's "No config key changes it" is the defect: both the outer budget
+# and the inner status wait read the built-in constant, so no setting reaches
+# either. A positive ``session.compact_wait_secs`` must change the EFFECTIVE
+# budget, and it must reach the inner status wait too — the one the logged
+# failures ("async status wait 300s") spend the whole budget in. 0 (the
+# default) must keep the built-in budget, so default behavior is unchanged.
+
+
+def test_configured_budget_zero_falls_back_to_built_in():
+    """0 (the default) and any non-positive value resolve to the built-in
+    budget, so an install that sets nothing behaves exactly as before."""
+    from kiro_crew.session import _resolve_compact_wait_secs
+
+    assert _resolve_compact_wait_secs(0.0) == COMPACT_WAIT_TIMEOUT_SECS
+    assert _resolve_compact_wait_secs(-1.0) == COMPACT_WAIT_TIMEOUT_SECS
+
+
+def test_configured_budget_positive_is_the_effective_budget():
+    """A positive setting is used verbatim as the effective budget."""
+    from kiro_crew.session import _resolve_compact_wait_secs
+
+    assert _resolve_compact_wait_secs(600.0) == 600.0
+
+
+def test_configured_budget_reaches_the_inner_status_wait():
+    """The inner status wait derives from the EFFECTIVE budget, not the
+    built-in constant — raising the setting raises the inner wait, which is
+    where the measured timeouts occur."""
+    from kiro_crew.session import _compact_result_wait_secs, _resolve_compact_wait_secs
+
+    budget = _resolve_compact_wait_secs(600.0)
+    assert _compact_result_wait_secs(0.0, budget) == 600.0
+    # Still spends the FULL remaining raised budget, never a fixed slice.
+    assert _compact_result_wait_secs(100.0, budget) == 500.0
+
+
+@pytest.mark.asyncio
+async def test_inner_wait_uses_the_snapshotted_budget_not_a_live_reread():
+    """One compaction uses one effective budget: the inner status-wait DI
+    callable derives from the budget passed to it, so a live
+    ``session.compact_wait_secs`` change between the outer snapshot and the
+    inner call cannot split one compaction across two budgets."""
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.session import SessionManager
+
+    cfg = KiroCrewConfig()
+    cfg.session.compact_wait_secs = 600.0
+    mgr = SessionManager(cfg)
+    inner = mgr._compaction._deps.compact_result_wait_secs
+
+    # The outer path snapshots the budget and hands it to the inner wait.
+    snapshot = mgr._compaction._deps.compact_wait_timeout_secs()
+    assert snapshot == 600.0
+
+    # A live config change lands AFTER the snapshot. The inner wait is driven by
+    # the snapshot passed to it, so the mutation does not reach it.
+    cfg.session.compact_wait_secs = 60.0
+    assert inner(0.0, snapshot) == 600.0
+    assert inner(100.0, snapshot) == 500.0
+
+
+def test_default_config_leaves_compaction_budget_at_built_in():
+    """A freshly-defaulted config resolves to the built-in budget — the key
+    exists but changes nothing until an operator sets it."""
+    from kiro_crew.config.sections import SessionConfig
+    from kiro_crew.session import _resolve_compact_wait_secs
+
+    cfg = SessionConfig()
+    assert cfg.compact_wait_secs == 0.0
+    assert _resolve_compact_wait_secs(cfg.compact_wait_secs) == COMPACT_WAIT_TIMEOUT_SECS
+
+
+def test_load_honours_a_configured_budget(tmp_path, monkeypatch):
+    """A written ``session.compact_wait_secs`` survives the full load path and
+    resolves to the operator's value — the builder must read the key, not drop
+    it back to the default."""
+    import json
+
+    from kiro_crew.config import loader as loader_module
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.session import _resolve_compact_wait_secs
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"session": {"compact_wait_secs": 900.0}}), encoding="utf-8")
+    monkeypatch.setattr(loader_module, "config_path", lambda: path)
+    monkeypatch.setattr(loader_module, "config_local_path", lambda: tmp_path / "missing.local.json")
+
+    cfg = KiroCrewConfig.load()
+
+    assert cfg.session.compact_wait_secs == 900.0
+    assert _resolve_compact_wait_secs(cfg.session.compact_wait_secs) == 900.0
+
+
+def test_load_clamps_an_out_of_range_budget(tmp_path, monkeypatch):
+    """A negative value collapses to the sentinel (built-in budget), a
+    near-zero positive value is lifted to the floor, and an oversized value is
+    capped, so a hand-edited typo cannot arm a near-zero or unbounded wait."""
+    import json
+
+    from kiro_crew.config import loader as loader_module
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.config.sections import COMPACT_WAIT_SECS_MAX, COMPACT_WAIT_SECS_MIN
+    from kiro_crew.session import _resolve_compact_wait_secs
+
+    monkeypatch.setattr(loader_module, "config_local_path", lambda: tmp_path / "missing.local.json")
+
+    neg = tmp_path / "neg.json"
+    neg.write_text(json.dumps({"session": {"compact_wait_secs": -5.0}}), encoding="utf-8")
+    monkeypatch.setattr(loader_module, "config_path", lambda: neg)
+    cfg = KiroCrewConfig.load()
+    assert cfg.session.compact_wait_secs == 0.0
+    assert _resolve_compact_wait_secs(cfg.session.compact_wait_secs) == COMPACT_WAIT_TIMEOUT_SECS
+
+    tiny = tmp_path / "tiny.json"
+    tiny.write_text(json.dumps({"session": {"compact_wait_secs": 5.0}}), encoding="utf-8")
+    monkeypatch.setattr(loader_module, "config_path", lambda: tiny)
+    cfg = KiroCrewConfig.load()
+    assert cfg.session.compact_wait_secs == COMPACT_WAIT_SECS_MIN
+
+    big = tmp_path / "big.json"
+    big.write_text(json.dumps({"session": {"compact_wait_secs": 10_000.0}}), encoding="utf-8")
+    monkeypatch.setattr(loader_module, "config_path", lambda: big)
+    cfg = KiroCrewConfig.load()
+    assert cfg.session.compact_wait_secs == COMPACT_WAIT_SECS_MAX
+
+
 def test_no_call_site_pins_a_shorter_wait():
     """Regression guard: no production call site may pass an
     explicit numeric-literal timeout below the shared budget — keyword or

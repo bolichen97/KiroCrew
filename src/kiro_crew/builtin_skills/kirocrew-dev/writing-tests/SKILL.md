@@ -291,7 +291,10 @@ package re-export when the caller reads its own defining module, or patching
 `pkg.mod.fn` when the caller did `from pkg.mod import fn` and holds its own binding.
 Either way the real function runs, the assertion passes for the wrong reason, and the
 test pays real time. **Treat an unexpectedly slow "mocked" test as evidence the mock
-missed.**
+missed.** The opposite trap is a patch that is too WIDE: a side effect on a module global
+also fires for every background worker that calls it (the `eventlog-io` legacy fold calls
+`members.read_dm_binding`). Patch the function awaited in the window you mean, and pin
+the order of the calls the test relies on.
 
 Another: **the host is an input, and a "surely-unused" number is not a constant.**
 `999999` reads as an impossible PID and is not — `pid_max` is 4194304, so on a
@@ -382,8 +385,9 @@ spawned without `cwd=`.
 
 At ~56.5k tests, **per-test setup cost dominates any single slow test** — an autouse
 fixture is paid ~56,500 times. Profile, never guess; compare candidates back to back on
-the same host (`git stash`, run, pop, run), because a loaded host makes an absolute
-number meaningless.
+the same host (run the change, then the base in `git worktree add --detach <dir> <base>`;
+never `git stash`: every worktree shares one stash list), because a loaded host makes an
+absolute number meaningless.
 
 The recurring wins, in order of leverage:
 
@@ -709,3 +713,58 @@ The consequence for how you write a test:
 - [ ] A test that asserts a key PASSES THROUGH a scrub (`HOME`, `PATH`) plants that key in the
       parent first — CI runners export `HOME` on Windows, a server session does not, and the
       assertion otherwise measures the host
+- [ ] A refusal raised by an object that holds a process-global resource (a crew-log handle
+      and its write lease) is asserted through a CLASS-based context manager whose `__exit__`
+      copies the exception's fields into a plain record and returns -- never
+      `pytest.raises(...) as exc` (the `ExceptionInfo` and the test frame form a cycle that
+      keeps `append`'s `self` alive until the cyclic collector runs) and never a
+      `@contextlib.contextmanager` (throwing into a generator adds the same cycle through the
+      generator's frame); the file's autouse teardown pins the table (`lease._held`) empty
+      without `gc.collect()`
+- [ ] A stand-in handed to a table that judges liveness by probe (`RUNTIME_TENANCY._alive`
+      reads `is_alive` / `is_process_alive`) either answers the probe or its test releases the
+      claim itself -- a fake with neither is alive for the rest of the worker -- and a stubbed
+      `_dispose_*` still owes every release the real one performs
+- [ ] A test that hands the reaper a reset that never returns (`_hanging_reset`) pins
+      `_RESET_TIMEOUT` the way its sibling classes do; a passing test whose wall time lands on a
+      product constant (30.0 s, 60.0 s) with the CPU idle is spending that constant, not
+      measuring it -- `classify.py`'s TIMEOUT-SHAPED rows name them
+- [ ] `monkeypatch.delenv(key, raising=False)` on a key that is ABSENT records no undo: when the
+      product then `os.environ.setdefault`s it, `setenv` the key first so the fixture's undo
+      removes whatever the product leaves
+- [ ] A harness that runs a real shell script SUPPLIES every tool the script requires that
+      the host may lack (`jq` beside the `gh` and `curl` it already stubs) as a shell
+      function in its `BASH_ENV` file, implementing exactly the invocations the script
+      makes and failing loudly on any other -- never a `pytest.skip` on the missing tool,
+      which is a loosened ratchet (`a-ratchet-may-only-tighten`); probe the host through
+      the bash the script will run under, not `shutil.which`, and prefer the real binary
+      where that bash has one
+- [ ] A leaked child whose spawning thread is a NAMED pool reaper (`mc-*-reaper`) is the
+      shared `executors` pool warming, not the test's child: the fix is at the pool (a
+      `shutdown` that joins its reaper BEFORE the kill loop, so a tick past its stop check
+      cannot refill the slot it just emptied) and at session end
+      (`shutdown_maintenance_executor()` in a `test/conftest.py` fixture), never a reap in
+      the first test that happened to trigger it
+- [ ] Two writers creating one sidecar on a fresh directory open it `O_CREAT | O_EXCL` first
+      and reopen without `O_CREAT` on `FileExistsError`: a nonexclusive `O_CREAT` can lose
+      the create race on Darwin with a bare `ENOENT` for the leaf, and a `prune` or flush
+      that swallows it silently skips its work (`_open_lock_sidecar`)
+- [ ] A test double's pid (`4242`) is a shared name across hundreds of files, so any
+      process-wide table keyed by pid (`runtime_ownership`'s leases and tenancy) is reset on
+      BOTH sides of every test by a `test/conftest.py` autouse fixture; a kill-gate assertion
+      that reads `refused` where it expects the failed-kill wording is a neighbour's lease,
+      not the gate
+- [ ] A race detector never parks on a `threading.Barrier(..., timeout=)` a correct
+      interleaving cannot reach: the correct code then pays the whole timeout every run and
+      pass is told from fail by elapsed time. Park on an `Event`, signal the arrival you are
+      waiting for through the seam under test, and assert the event count while parked
+- [ ] `monkeypatch.chdir` does not put a `cwd` on the spawn: the descriptor still says
+      `cwd=None`, indistinguishable to a per-spawn audit from a spawn in the checkout. Pin the
+      helper's seam instead -- `runner=partial(subprocess.run, cwd=...)`, or the script
+      module's `subprocess` binding replaced with a namespace whose `run` carries `cwd`
+- [ ] An object whose constructor opens SQLite (`SubagentManager` -> `tasks.db`,
+      `KnowledgeStore` per thread, `SkillsLoader` -> the skill index) is closed through its
+      production close path at teardown -- `test/conftest.py`'s `close_subagent_managers` /
+      `close_skills_loaders` opt-in fixtures, `opened(...)`, or `_close_all_for_tests()` when
+      ANOTHER thread held a connection (`close()` is per-thread) -- never left to the cyclic
+      collector, whose timing is what makes the descriptor count flap between runs

@@ -31,7 +31,7 @@ highlight parameter — so there is nothing to assemble and nothing to guess. Fo
 the "Highlight recent sessions" entry, the route is:
 
 ```
-/settings/display?highlight=display.highlight-recent-sessions
+/settings/display/sidebar?highlight=display.highlight-recent-sessions
 ```
 
 Present it as a link labelled with the control name — a markdown link whose
@@ -49,7 +49,7 @@ shipped prebuilt rather than described:
 
 A route is a dashboard path, so it is clickable only where a dashboard path
 resolves. On a chat channel (Slack, Telegram, Teams, …) prefix it with the
-gateway's own address — `http://localhost:5476/settings/display?highlight=…` for
+gateway's own address — `http://localhost:5476/settings/display/sidebar?highlight=…` for
 a default local install — or name the tab and the control in words if you do not
 know the address.
 
@@ -88,7 +88,7 @@ second form meeting a translated dashboard, not a stale registry.
 - Controls whose label is computed at runtime rather than written in the panel.
   They are skipped by generation, so a control missing from the file is not
   necessarily missing from the UI.
-- Everything outside Settings — the Developer page, Agent Capabilities, and the
+- Everything outside Settings — the Developer page, Customize, and the
   App Store each have their own routes and are not enumerated here.
 - Config keys with no control at all. Those are set in `config.json` or with
   `kirocrew config`; see [configuration.md](configuration.md).

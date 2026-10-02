@@ -865,7 +865,12 @@ class ScopedRuleset:
     matcher: str = _DEFAULT_MATCHER
 
     @staticmethod
-    def from_dict(d: Mapping[str, object], *, matcher: str = _DEFAULT_MATCHER) -> "ScopedRuleset":
+    def from_dict(
+        d: Mapping[str, object],
+        *,
+        matcher: str = _DEFAULT_MATCHER,
+        scope: str = "",
+    ) -> "ScopedRuleset":
         # additionalProperties:false — a typo'd key (e.g. "deney" instead of
         # "deny") must be a validation error, NOT silently dropped.  The
         # dangerous case is a deny-list typo: it would otherwise become an empty
@@ -882,12 +887,62 @@ class ScopedRuleset:
         deny = _str_tuple(d.get("deny"))
         # Rule 1: in allow-mode the deny array is ignored — warn so an operator
         # who set both does not believe a dead deny entry is protecting anything.
+        # Every entry is ignored, so a count says all there is, and a deny entry
+        # can be a pasted URL with credentials, so none is interpolated.
         if mode == MODE_ALLOW and deny:
             logger.warning(
-                "ScopedRuleset mode=allow ignores its deny=%r (Rule 1: allow beats deny); "
-                "put hard bounds in policy, not a profile deny",
-                list(deny),
+                "ScopedRuleset mode=allow ignores all %d of its deny entries "
+                "(Rule 1: allow beats deny); put hard bounds in policy, not a profile deny",
+                len(deny),
             )
+        # The ``host`` matcher tests an EXTRACTED host (``_url_host``), never the
+        # URL an operator fetched, so an entry carrying a character no host can
+        # contain never matches any item.  Warn rather than raise: a dead deny
+        # silently permits what it was written to block, a dead allow silently
+        # refuses it, and nothing else reports either.  Refusing the document
+        # outright would instead turn one stale entry into a boot failure on
+        # upgrade for a policy that loads today.
+        if matcher == "host":
+            # Only the list the engine reads: ``permits`` never consults ``allow``
+            # in deny mode, and an allow-mode ``deny`` is already reported above.
+            listed, live = ("allow", allow) if mode == MODE_ALLOW else ("deny", deny)
+            effect = "refuses" if mode == MODE_ALLOW else "permits"
+            for index, pattern in enumerate(live):
+                # Each reason is a character or shape a host cannot carry, read off the
+                # pattern itself.  Round-tripping ``_url_host`` is no test: it cuts a
+                # bare IPv6 literal at its last colon (``::1`` gives ``:``) and a
+                # netloc at the first ``?`` (``api?.skills.sh`` gives ``api``), so it
+                # condemns live rules.
+                name, _, port = pattern.strip().partition(":")
+                stripped = pattern.strip()
+                # IPv6 only when ``_url_host`` unwraps the bracket to an address:
+                # it finds no host in the fnmatch class ``[a:].example.com``.
+                ipv6 = stripped.startswith("[") and ":" in _url_host(stripped)
+                if "/" in pattern:
+                    why = "a '/' (a scheme, a path or a CIDR mask)"
+                elif "@" in pattern:
+                    why = "an '@' (userinfo)"
+                elif ipv6:
+                    # ``_url_host`` unwraps the brackets, so the item never has them.
+                    # Any other bracket is an fnmatch character class and is live.
+                    why = "IPv6 brackets"
+                elif name and port.isdigit() and not set(name) & set("*?["):
+                    # Exactly one colon, so a port: an IPv6 literal has two or more.
+                    # A glob before it can absorb a colon: ``*:443`` matches ``fe80::443``.
+                    why = "a port"
+                else:
+                    continue
+                # Never interpolate the pattern: an operator pastes whole URLs,
+                # with userinfo, signatures and ``?api_key=`` queries, and this
+                # fires on every boot with no redaction before the sink.  The
+                # position identifies the entry.
+                reason = (
+                    "scope %r uses matcher=host and can never match %s[%d]: the item "
+                    "under test is a host, not a URL, and the entry carries %s, so it "
+                    "is dead and the scope %s the host it names"
+                )
+                args: Tuple[object, ...] = (scope, listed, index, why, effect)
+                logger.warning(reason, *args)
         return ScopedRuleset(mode=mode, allow=allow, deny=deny, matcher=matcher)
 
     def permits(self, item: str) -> Decision:
@@ -2416,7 +2471,7 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
             return OrdinalControl(scale=spec.ordinal_scale, value=raw)
         raise PlatformCompositionError(f"scope {scope!r} must be an object")
     if spec.kind == RULESET:
-        ruleset = ScopedRuleset.from_dict(raw, matcher=spec.matcher)
+        ruleset = ScopedRuleset.from_dict(raw, matcher=spec.matcher, scope=scope)
         for floor in spec.always_permitted:
             # An ``always_permitted`` identifier is one this scope may not forbid.
             # Two reasons qualify, and the catalog entry says which applies: the

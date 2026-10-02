@@ -85,18 +85,40 @@ DEFAULT_SSH_COMPRESSION: bool = True
 DEFAULT_PROBE_INTERVAL_SECS: int = 30
 DEFAULT_PROBE_FAILURE_THRESHOLD: int = 3
 
+# Total timeout (secs) for one steady-state end-to-end liveness probe: a
+# `GET /api/health` through the local forward that must reach the remote gateway
+# and return an HTTP response. A TCP connect alone only proves the local
+# listener is bound, which a zombie forward (a session-manager-plugin holding
+# the socket while relaying nothing) satisfies while the far end answers with
+# zero bytes; requiring a completed response within a bounded budget is what
+# turns that stall into a probe failure. Set to 4x the 1.0s loopback TCP
+# connect budget `_port_reachable` uses, so one slow round trip does not tear
+# down a good tunnel before the consecutive-failure threshold has a say. This
+# is deliberately not user-tunable (the per-transport connect timeouts below
+# are the knob for a slow proxy); a round trip through a bound local forward
+# that cannot answer in 4s is treated as a stall.
+DEFAULT_PROBE_HEALTH_TIMEOUT_SECS: float = 4.0
+
 # Max consecutive self-heal attempts before giving up on an unhealthy tunnel
-# (2-tier recovery). Reset to 0 once a rebuild succeeds, so a tunnel that
-# flaps-then-recovers isn't permanently capped. With the capped-exponential
-# backoff below, this many attempts span the total recovery window (~2 min at
-# the default 8 attempts / 30s cap) before the tunnel is left disconnected.
+# (2-tier recovery). Reset to 0 once a rebuilt forward answers the end-to-end
+# health probe (not merely on a local rebind), so a tunnel that
+# flaps-then-recovers isn't permanently capped while one whose far end stays
+# dead still climbs to the cap. Two windows bound the climb: a rebuild that
+# fails outright spends only the capped-exponential backoff between attempts
+# (~2 min total at the default 8 attempts / 30s cap), while a dead-far-end
+# forward that re-binds but never answers additionally spends one probe window
+# per attempt (DEFAULT_PROBE_FAILURE_THRESHOLD x DEFAULT_PROBE_INTERVAL_SECS =
+# 3 x 30s = 90s), so the handoff to diagnosis takes attempts x (90s + backoff)
+# ~= 16 min at the defaults. Size instances.max_recovery_attempts against the
+# longer window.
 DEFAULT_MAX_RECOVERY_ATTEMPTS: int = 8
 
 # Upper bound on a user-configured instances.max_recovery_attempts. A value above
 # this is clamped down to it (with a warning) so a pathological setting can't turn
 # the bounded self-heal into a near-infinite retry loop on a dead connection. Kept
-# generous (~47 min recovery window at the 30s backoff cap) so only extreme values
-# trip it.
+# generous: at this ceiling a dead-far-end forward spends roughly
+# CEILING x (probe_failure_threshold x probe_interval + 30s backoff cap) =
+# 100 x (90s + 30s) ~= 3.3h before giving up, so only extreme values trip it.
 MAX_RECOVERY_ATTEMPTS_CEILING: int = 100
 
 # Cap (secs) on the per-attempt backoff between self-heal attempts. The backoff
@@ -108,7 +130,8 @@ DEFAULT_RECOVER_BACKOFF_MAX_SECS: float = 30.0
 # larger value is clamped down to it (with a warning) so a pathological pacing
 # (e.g. a 1-day backoff) can't stretch the bounded self-heal into a multi-day
 # wall-clock window even with the attempt count capped. At this ceiling the worst
-# case is ~MAX_RECOVERY_ATTEMPTS_CEILING * this (~8h).
+# case is ~MAX_RECOVERY_ATTEMPTS_CEILING * (probe window + this) =
+# 100 * (90s + 300s) ~= 10.8h.
 RECOVER_BACKOFF_MAX_CEILING_SECS: float = 300.0
 
 # How long (secs) to wait for the local forward port to start accepting
@@ -257,12 +280,25 @@ PROXY_PATH_MAX_DECODE_PASSES: int = 4
 
 # Timeout (secs) for one session-transfer request over an already-open tunnel
 # (POST the bundle to the peer's import endpoint — no SSH spawn). Far larger than
-# the token probe above because this carries a whole conversation: a bundle is
-# capped at ~20 MB of message content, and the SSH forward it crosses can be a
-# high-latency link, so a probe-sized budget would fail every large transfer. The
-# request is still bounded rather than unlimited, so an unresponsive peer
+# the token probe above, because the SSH forward it crosses can be a
+# high-latency link. It bounds each connect and each read, NOT the whole
+# request: a bundle has no size ceiling, so a total budget would fail every
+# transfer that simply takes long to upload. An unresponsive peer still
 # surfaces as a clean transfer error instead of hanging the caller's turn.
 DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS: float = 30.0
+
+# How long (secs) an arriving session waits for the host to have memory to
+# parse it before the importer answers a retryable 429. Shared with the sender,
+# whose wait for the importer's reply has to outlast it.
+SESSION_IMPORT_MEMORY_WAIT_SECS: float = 300.0
+
+# Cap (bytes) on a peer's reply to a session transfer, read before it is
+# decoded. The upload has no size ceiling and so no total timeout, which leaves
+# the reply as the one read nothing else bounds. An importer answers with a few
+# hundred bytes of JSON (the new slot and its title, or a refusal code); 256 KiB
+# only ever bites on a hostile or broken peer. Bound before buffering, like
+# SEARCH_REPLY_MAX_BYTES.
+SESSION_TRANSFER_REPLY_MAX_BYTES: int = 256 * 1024
 
 # Timeout (secs) for one federated session-search request over an already-open
 # tunnel (GET the peer's /api/sessions/search — no SSH spawn). Sized between the

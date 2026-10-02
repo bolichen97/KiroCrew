@@ -90,7 +90,8 @@ def _tunnel_double(instance_id: str, *, pid: int = 4321, local_port: int = 18022
     ``tunnel.status.local_port`` when it refreshes the forwarder identity.
     """
     return SimpleNamespace(
-        pid=pid, status=TunnelStatus(instance_id=instance_id, local_port=local_port)
+        pid=pid,
+        status=TunnelStatus(instance_id=instance_id, local_port=local_port),
     )
 
 

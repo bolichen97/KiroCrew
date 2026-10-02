@@ -76,7 +76,7 @@ export const PREVIEW_ARTIFACT_DEPLOY = `${PREVIEW_FLAG_PREFIX}artifact-deploy`
  *
  * This flag used to hold a second door too — the "New Crew Mode chat" entry in
  * the sidebar's create menu. Crew Mode retired in favour of the Members page,
- * and that menu entry is now "Crew Members": rendered whatever this flag says,
+ * and that menu entry is now "Crewmates": rendered whatever this flag says,
  * it opens `/members` when the flag is on and, when off, the Settings card that
  * turns it on (`ChatSidebar.openCrewMembers`). The flag therefore gates only the
  * page and where the entry lands, never whether the entry exists — a user who
@@ -125,6 +125,21 @@ export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
  * and skip the fetch, rather than fetching and hiding the rows.
  */
 export const PREVIEW_INSTANCE_SESSIONS = `${PREVIEW_FLAG_PREFIX}instance-sessions`
+
+/**
+ * The composable-layout dev harness (`/layout-harness`).
+ *
+ * Held because it is a MECHANISM being built beside the Members page, not a
+ * shippable surface: it mounts the layout renderer + scope over a hand-authored
+ * seed so the "panes connect by placement" mechanism can be verified in
+ * isolation, and it changes nothing a user sees. Gating the INGRESS only —
+ * turning it off hides the route; it orphans nothing (the harness holds no saved
+ * state). Its own flag so it releases (or is retired) independently.
+ *
+ * The key string is `layout-harness`, matching the flag the layout feature
+ * itself reads, so the toggle here and the feature's own gate agree on one key.
+ */
+export const PREVIEW_LAYOUT_HARNESS = `${PREVIEW_FLAG_PREFIX}layout-harness`
 
 /**
  * Read a preview flag. Absent, unparseable, or storage-denied all mean OFF —

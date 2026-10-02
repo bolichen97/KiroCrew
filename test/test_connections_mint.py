@@ -23,10 +23,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from dashboard_owner_helpers import as_owner
 from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import hooks, mcp_grant
 from kiro_crew.connections import mint
 from kiro_crew.dashboard.handlers import connections
+from kiro_crew.runtime_ownership import RUNTIME_TENANCY, release_runtime_tenancy
 
 _URL = "https://mcp.example.com/mcp"
 _AUTHORIZE = (
@@ -463,7 +464,9 @@ async def test_the_revalidation_fallback_is_rate_limited(
 ):
     # Each fallback spawns a process, so it must not fire on every grant poll for
     # the whole TTL. With the interval left at its real value, many ticks yield
-    # exactly one probe.
+    # exactly one probe. Counted in watcher ticks, not wall-clock time: a
+    # contended runner can take longer than any fixed sleep to finish the first
+    # tick.
     monkeypatch.setattr(mint, "_MINT_GRANT_POLL_SECONDS", 0.001)
     _write_paired_grant_artifacts(_URL)
     _FakeClient.command_results["/mcp"] = {
@@ -471,17 +474,51 @@ async def test_the_revalidation_fallback_is_rate_limited(
     }
     monkeypatch.setattr(mint, "grant_fingerprint", lambda url, **kw: None)
 
-    await mint.start_oauth_mint("notion", _URL)
-    entry = mint._mints["notion"]
+    # Patched before the mint starts: the watcher is live before
+    # `start_oauth_mint` returns, so a validator swapped in afterwards can miss
+    # the first fallback. The first call is the start-up validation, made before
+    # the watcher exists, so it goes to the real validator. Every later call is
+    # a watcher fallback.
     calls: list[str] = []
+    first_fallback = asyncio.Event()
+    real_validate = mint._validate_existing_grant
+    startup_validated = False
 
-    def _never_proves(slug: str, url: str):
+    async def _never_proves(slug: str, url: str) -> bool:
+        nonlocal startup_validated
+        if not startup_validated:
+            startup_validated = True
+            return await real_validate(slug, url)
         calls.append(slug)
-        return _async_value(False)
+        first_fallback.set()
+        return False
 
     monkeypatch.setattr(mint, "_validate_existing_grant", _never_proves)
 
-    await asyncio.sleep(0.05)
+    # Every watcher tick calls `grant_observed` first, so counting its calls after
+    # the first fallback counts the polls that had a chance to fire a second one.
+    ticks_after_first = 0
+    enough_ticks = asyncio.Event()
+    real_grant_observed = mint.grant_observed
+
+    async def _counting_grant_observed(url: str, **kw: Any) -> bool | None:
+        nonlocal ticks_after_first
+        if first_fallback.is_set():
+            ticks_after_first += 1
+            if ticks_after_first >= 20:
+                enough_ticks.set()
+        return await real_grant_observed(url, **kw)
+
+    monkeypatch.setattr(mint, "grant_observed", _counting_grant_observed)
+
+    await mint.start_oauth_mint("notion", _URL)
+    entry = mint._mints["notion"]
+    assert startup_validated
+
+    await asyncio.wait_for(first_fallback.wait(), timeout=30)
+    # The window opens at the first fallback, and this bound keeps every counted
+    # tick inside the shipped 60 s interval.
+    await asyncio.wait_for(enough_ticks.wait(), timeout=30)
 
     assert len(calls) == 1
     assert mint._mints["notion"]["state"] == "waiting"
@@ -1296,7 +1333,14 @@ async def test_the_mint_pid_is_protected_while_readiness_is_still_stalled(monkey
     monkeypatch.setattr(mint, "_acp_client_factory", lambda: _SlowReady)
 
     async def _fake_dispose(holdings):
-        return None
+        # The real dispose is the ONLY thing that releases the tenancy the pid
+        # claim above took on the process-global ``RUNTIME_TENANCY`` table, and
+        # ``_SlowReady`` answers neither ``is_alive`` nor ``is_process_alive``, so
+        # the table would hold pid 4242 "alive" for the rest of the worker: every
+        # later test on it that asks the kill gate about 4242 (``test_cron_reaper``
+        # fabricates that pid) is then refused with "runtime still leased by
+        # another tenant". Stubbing the releaser means owing the release.
+        release_runtime_tenancy(holdings.pop("tenancy", "") or None)
 
     monkeypatch.setattr(mint, "_dispose_mint", _fake_dispose)
     flow = asyncio.get_running_loop().create_task(mint.start_oauth_mint("notion", _URL))
@@ -1307,6 +1351,7 @@ async def test_the_mint_pid_is_protected_while_readiness_is_still_stalled(monkey
         ready.set()
         await asyncio.wait_for(flow, timeout=5)
         mint._mints.pop("notion", None)
+    assert RUNTIME_TENANCY.claims_on_pid(4242) == 0, "the mint's tenancy outlived the mint"
 
 
 async def _until(predicate, interval: float = 0.01) -> None:
@@ -2317,6 +2362,29 @@ def test_a_relative_row_is_never_unlinked():
     # Relative paths resolve against the process cwd, which is not a property the
     # gateway controls; only the absolute form the writer recorded is reapable.
     assert mint._is_reapable_spec("kirocrew-mint-notion-4242-abcdef01.json") is False
+
+
+def test_a_junction_at_a_mint_spec_name_is_never_unlinked(tmp_path, monkeypatch):
+    # A directory JUNCTION is the only directory link an unprivileged Windows
+    # writer can plant, and it answers is_symlink() False while is_dir() True, so
+    # a leaf ``is_symlink()`` guard read a junction planted at a mint-spec name as
+    # our own spec and unlinked it -- removing a link into a target this module
+    # does not own. make_dir_link plants a junction on Windows and a directory
+    # symlink on POSIX, so the guard is pinned on every shard. Its name matches
+    # the mint shape, so only the link check can refuse it.
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not ours", encoding="utf-8")
+    monkeypatch.setattr(mint._agent, "kiro_agents_dir_path", lambda: agents_dir)
+
+    planted = agents_dir / "kirocrew-mint-notion-4242-abcdef01.json"
+    make_dir_link(planted, outside)
+
+    assert mint._is_reapable_spec(str(planted)) is False
+    # The link and its target are untouched by the refusal.
+    assert (outside / "keep.txt").read_text(encoding="utf-8") == "not ours"
 
 
 @pytest.mark.asyncio

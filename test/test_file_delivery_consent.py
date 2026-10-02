@@ -915,6 +915,38 @@ class TestGrantRequiresAHostStepUp:
         # consent artifact outliving its window fails open.
         assert file_delivery_consent.pending_grant_path().exists() is False
 
+    def test_a_non_ascii_nonce_is_refused_not_raised(self):
+        # The nonce is a credential delivered by the request body, so the claim
+        # must be total over every string the request layer can hand over:
+        # hmac.compare_digest raises TypeError on a str holding a non-ASCII
+        # character, and a lone surrogate arrives the same way through JSON body
+        # decoding. A TypeError escapes the StepUpError contract the approve
+        # handler catches, so the malformed credential would surface as a 500
+        # instead of the refusal a wrong ASCII nonce produces.
+        pending = file_delivery_consent.arm_grant(file_delivery_consent.CLASS_OWNER_DASHBOARD)
+        with pytest.raises(file_delivery_consent.StepUpError):
+            file_delivery_consent.claim_grant("é" + pending.nonce)
+        with pytest.raises(file_delivery_consent.StepUpError):
+            file_delivery_consent.claim_grant(pending.nonce + chr(0xDCFF))
+        # A refused claim consumes nothing: the armed request survives for the
+        # owner's real approve.
+        survivor = file_delivery_consent.read_pending_grant()
+        assert survivor is not None
+        assert survivor.nonce == pending.nonce
+
+    def test_the_approve_route_refuses_a_non_ascii_nonce_without_a_500(self):
+        # The same contract through the real handler: a malformed nonce is an
+        # audited refusal, never an unhandled TypeError racing past the
+        # StepUpError arm.
+        from kiro_crew.dashboard.handlers import file_delivery_consent as handler
+
+        pending = file_delivery_consent.arm_grant(file_delivery_consent.CLASS_OWNER_DASHBOARD)
+        req = _local_approve_request(nonce="é" + pending.nonce, local=True)
+        resp = asyncio.run(handler.api_file_delivery_consent_approve(req))
+        assert resp.status == 403
+        assert json.loads(resp.text)["code"] == "file_delivery_approve_refused"
+        assert file_delivery_consent.read_pending_grant() is not None
+
     def test_a_stale_nonce_spares_a_newer_armed_request(self):
         # Lost-update guard: the owner arms request A, re-arms before approving,
         # and the delayed `approve` still carrying A's nonce must not consume B --

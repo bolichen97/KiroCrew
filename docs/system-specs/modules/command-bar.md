@@ -219,8 +219,18 @@ that.
   empty. `view` is named separately from its group because it opens a surface instead of acting
   and closing.
 - `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page;
-  settings use the tighter `SETTINGS_IDLE_LIMIT = 2` while the query is empty, and `recent` is
-  capped ahead of ranking by the overlay at `RECENT_SESSION_ROWS = 3` rather than by this limit.
+  settings carry a second, tighter `SETTINGS_WEAK_LIMIT = 2` on WEAK matches whether or not a
+  query is present, and `recent` is capped ahead of ranking by the overlay at
+  `RECENT_SESSION_ROWS = 3` rather than by this limit. A weak settings match is one that does not
+  name the setting — an empty query (every row is weak), or a typed query that is not a substring
+  of the title and only survived as a scattered subsequence. The cap on weak matches holds under
+  a query for the same reason it holds on the idle page: a word that merely scatters across six
+  long setting titles would otherwise spend six rows and push the overlay's recovery rows (Ask
+  the agent, Search sessions / artifacts / folders / crewmates) below the fold — and those rows
+  are the whole answer to "the root does not search content" for a reader who typed a name. A
+  DIRECT settings hit (the query is a substring of the title) is the user naming the setting, so
+  it ranks up to `PER_GROUP_LIMIT` like any row and searching settings on their own name surfaces
+  every one of them. The full settings corpus stays one `view` row away regardless.
   **Known gap:** rows past a root cap are dropped silently. The artifacts view does not share
   that gap — it renders a `+N more` line under its list, outside the listbox so it cannot become
   an option that Enter does nothing with — and that line is the shape to copy when this one is
@@ -285,6 +295,31 @@ debounced query already matches the new ones.
   it would never turn off, so the cue lives on the active OPTION. The one state with no option
   to highlight is an empty scope (`rowCount === 0`), and there the field carries the ring
   instead — a keyboard user is never left with no cue.
+- Opening a session — an attention or recent row on the root, or a row of the sessions view —
+  leaves the caret in that session's composer once the bar has closed, the outcome a sidebar
+  click has. The bar says so itself (`focusComposerForOpenedSession` /
+  `focusComposerForResumedSession` in `composerFocus.ts`) rather than leaning on the composer's
+  own autofocus: that effect fires only on a slot-key TRANSITION, so it never runs for the session
+  that is already active, and it declines while an editable element holds focus, which the bar's
+  input still does when a root row's `switchSlot` commits (the bar closes only once the row's
+  promise settles). The caret moves only once the switch has LANDED — the unwrapped
+  `switchSlot` has fulfilled and the opened slot is still the active one — never while the
+  gateway round trip is in flight: `switchSlot.pending` enters the slot synchronously, so a caret
+  placed before the answer would route the keystrokes typed meanwhile to a slot a 404 then
+  unwinds and evicts, and the page would file that text under the evicted key. A rejected switch
+  gets no focus from the bar: the selection unwinds to the origin, the pane notice explains the
+  gesture, and the composer's own autofocus treats that key transition as it treats any other.
+  A fulfilment the user has already moved past focuses nothing, as the `switchSlot.fulfilled`
+  reducer ignores it. Two switches to the same key can overlap (a second gesture, or the chat
+  page's mount-time `switchSlot(activeSlot)` when the bar was used from another page); when the
+  older read lands first, the caret waits for the newer claim to settle — placed once it clears
+  with the slot still active, dropped when its 404 unwinds the selection. In split view (a
+  session-grid pane is mounted) the bar places no caret at all: every pane's composer is bound to
+  that pane's own slot and the grid's focus model never follows the active slot, so the only
+  composer on offer belongs to a session the gesture did not open — the pre-existing behaviour,
+  until a lookup can resolve the pane bound to the opened key.
+  Touch devices are skipped and a collapsed composer stays collapsed, exactly as the sidebar's
+  autofocus leaves them; a resume the chat page cannot display focuses nothing.
 
 ## Invariants pinned by tests
 
@@ -320,6 +355,9 @@ debounced query already matches the new ones.
 | that cap still bounds one app's contributions | an app with twenty commands turns the first page into its index |
 | the product's own command list is uncapped | a builtin silently dropped from a page this repository reviews |
 | `aria-modal` and the focus trap travel together | a dialog that traps nothing while claiming modality |
+| a session opened from the bar ends with the caret in its composer, same-key or not | a keyboard-first switch that ends in a mouse click on the composer (#15732) |
+| the caret moves only once the opened session's `switchSlot` has fulfilled; a refused switch gets none from the bar | keystrokes typed during the gateway round trip filed under a slot the 404 unwind then evicts |
+| an older same-key read landing first defers the caret to the newer claim | a stale fulfilment focusing while the live read is still out, then its 404 stranding the typed text |
 | the `apps` query is a pure cache consumer (`enabled: false`) | a second identical fetch per open |
 | every `['apps']` reader goes through the one api call | a divergent shape silently poisons the shared cache |
 | no builtin declares both `ui.overlays` and `ui.entry` | origin downgrade on restart refuses its own slot |

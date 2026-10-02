@@ -82,9 +82,75 @@ Three structural facts explain most of the rest:
   instead of racing it. A `needs:` edge cannot cross a workflow file, which is why
   that barrier is a job that reads the other workflow's run rather than a
   dependency GitHub resolves for us.
-- **The real merge gate is human approval plus armed auto-merge.** `PR Readiness`
-  is the one status worth watching; individual red checks are strong signals a
-  human can weigh.
+- **The real merge gate is human approval plus the merge queue.** `PR Readiness`
+  is the one required status: on a pull request head it aggregates every lane,
+  and on a merge group it is the queue's own check (next bullet). Individual red
+  checks are strong signals a human can weigh.
+- **Merge queue:** every test workflow runs on `merge_group`, the tree that
+  actually lands: `ci.yml`, `fast-gate.yml` and `build.yml` on the fleet with
+  the diff-scoped gates diffing against the group's `merge_group.base_sha`,
+  `main-ratchet-audit.yml` on the fleet judging the whole integrated tree,
+  `client-py.yml` hosted, and `internal-content-scan-gate.yml`, which already
+  did. `merge-queue-readiness.yml` -- a `merge_group`-only workflow whose
+  single job is named `PR Readiness`, the ruleset's required check -- waits for
+  those six runs on the group's commit and passes only when all six did, within
+  a 150-minute budget covering `ci.yml`'s 100-minute longest chain of job caps
+  plus a rerun. A run that concludes without success has its failed jobs rerun
+  (`gh run rerun --failed`, which is why the job holds `actions: write`), up to
+  twice per workflow, and fails the check only when its third attempt still does
+  not succeed: about 15% of approved heads fail their first try, mostly Windows
+  backend shards and lost runners, and every ejection rebuilds each group queued
+  behind it, so the retry has to happen before the check fails. A failed CI run
+  is held until Fast Gate's latest run has succeeded, because CI's
+  `await-fast-gate` fails at once on a failed gate and a rerun before the gate
+  recovers would spend CI's attempts on it. A failed API
+  call, a read or a rerun request, is retried until the budget runs out and never
+  spends a rerun; only a run still absent after the five-minute appear window,
+  or one whose last attempt failed, fails the check. Each tick reads ONE runs listing for the
+  commit, not one per workflow, every 60 s while a run may still be appearing
+  and every 180 s once all six are seen: the installation token is shared by
+  every workflow, and 40 queued groups then cost ~800 calls an hour instead of
+  ~4,800. A rate-limited call sleeps until the limit's reset (read from
+  `gh api rate_limit`, which does not count against it) plus jitter, within
+  the budget. It is a separate
+  file because a same-named job inside `ci.yml` behind an `if:` would still
+  create a `skipped` check run on every PR head, and a skipped required check
+  counts as satisfied. The AI review lanes do not run on a merge group: the
+  queue re-tests the PR's already-reviewed diff on the tree it lands on, it
+  does not re-review it. The two macOS legs (ci.yml's boot matrix, build.yml's
+  desktop build) are the one thing a merge group does not run: a hosted mac
+  runner has waited hours at this merge rate, and that wait inside the queue
+  would hold every group behind it. The push-to-main path is governed by the
+  repository variable `MERGE_QUEUE_ENABLED`: with it unset, a push to main runs
+  the full matrix in `ci.yml` and `build.yml`; with it set to `true` -- which
+  the admin does in the same operation as enabling the queue in the ruleset --
+  a **push to main runs the macOS legs and little else**: `ci.yml` skips
+  `changes` and `await-fast-gate` (and with them every heavy job) and boots the
+  gateway on macos-15 alone; `build.yml` skips the wheel and the Windows
+  installer and, after its seconds-long matrix resolver, builds and
+  smoke-installs the macOS desktop package alone, per commit and never evicted,
+  because the merge group proved everything else on that exact tree. Two small
+  workflows still run on that push unchanged -- `main-ratchet-audit.yml`'s
+  gates and `internal-content-scan-gate.yml` -- as they did before. Unsetting
+  the variable together with unticking the queue restores the full push
+  matrix. `fast-gate.yml` and the per-commit concurrency group follow the same
+  variable: with it set, `fast-gate.yml`'s push run exists but every job skips
+  (the merge group established those gates for the tree, and `ci.yml`'s
+  barrier skips on that path too), and all three workflows key their push
+  group on the commit SHA so the one macOS leg per landed commit is never
+  evicted by the next merge. With it unset, `fast-gate.yml` runs every gate
+  on the push and `ci.yml`'s barrier consumes that run, and the push keeps
+  today's per-ref group -- one running plus one pending, later pushes evict
+  the pending one -- so nothing on main changes until the admin sets the
+  variable. Enabling the queue is a
+  ruleset change (`protected-branches`, "Require merge queue"), not a workflow
+  change, with `max_entries_to_build` 40, `max_entries_to_merge` 1 (one PR per
+  main commit) and a status-check timeout of 180 minutes (the 150-minute poll
+  plus a slow hosted pickup). The values come from a queue simulation over a
+  week of real merges: one rerun removed ~90% of flaky ejections and a second
+  almost all the rest; a third made the queue slower, because a real failure
+  takes ~85 minutes to eject and invalidates everything queued behind it; and a
+  build depth beyond ~40 did not help.
 - **A fork PR is aggregated like any other and can reach a passing readiness
   state**; CodeQL is the one lane it cannot run. See [Fork PRs](#fork-prs).
 
@@ -102,7 +168,8 @@ Out-of-band lanes that never gate a PR:
   bundle is replaced on disk and relaunches.
 - **The ratchet verdict `main` otherwise never gets:** `main-ratchet-audit.yml`
   re-runs only the cheap ratchet, ceiling and baseline gates on every push to
-  `main`. Two things make a push to `main` unable to answer for them in `ci.yml`:
+  `main` and on every merge group, where it is one of the runs the queue's
+  required check waits on. Two things make a push to `main` unable to answer for them in `ci.yml`:
   GitHub keeps one *pending* run per concurrency group, so on a busy `main` each
   run is evicted before its slower lanes report and a commit's checks end up
   `cancelled` rather than `failure` — which is not a red X, so `main` looks green
@@ -128,8 +195,9 @@ Out-of-band lanes that never gate a PR:
   eslint ceiling out of `ci.yml` rather than transcribing it, because a second
   copy would keep granting the old budget after a burn-down and report green on a
   tree the PR gate reds. It deliberately does not touch `ci.yml`'s concurrency or
-  add a second full run: full serialization or a merge queue is a runner-budget
-  call, and `test-durations.yml` already pays for a full suite on `main`.
+  add a second full run of its own: the merge queue is what runs the full suite
+  on the integrated tree, and `test-durations.yml` already pays for a full suite
+  on `main`.
   Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
   `test-durations.yml` (re-measures `.test_durations`, which no sharding lane reads
@@ -309,7 +377,7 @@ See [oss-fork-boundaries](../system-specs/oss-fork-boundaries.md).
 | `testpaths-coverage` | `scripts/check_testpaths_coverage.py`, self-test first. Fails on a `test_*.py` file outside the roots `setup.cfg` pins in `testpaths` — such a file is never collected, so it is green by omission and rots against the code it claims to cover (#6577 found twelve). Whole-tree, since the backlog is zero |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
 | `memory-store-seam` | `scripts/check_memory_store_seam.py`, self-test first, with `MEMSTORE_BASE_REF` resolved to the diff base. Enforces explicit store selection on added memory-context calls. The prepare-pr floor runs both commands; the main ratchet lane classifies this as a diff-only gate because its whole-tree backlog is a non-failing report |
-| `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, every bare Autopilot `S<n>` ID in a source comment names a row in `autopilot.md`, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
+| `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, every bare harness `H<n>` ID in a source comment names a row in `harness-parity.md`, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
 
 Each of these runs its own self-test in the same step, ahead of the real check. A
 gate that has silently stopped matching reads as a green signal, which is worse than
@@ -563,9 +631,11 @@ Test commands route only `ipv6_required` items to the hosted lane described abov
 This is one migration being validated, not eight already-proven shards
 or a rollout conditional on three green canaries.
 
-The CI workflow requires this repository, a push or an `opened`/`synchronize`
-same-repository PR event, and
+The CI workflow requires this repository, a push, a merge-group event or an
+`opened`/`synchronize` same-repository PR event, and
 `contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id)`.
+A `merge_group` run's actor is the person who queued the pull request, so the
+same list admits it without a new entry.
 Other PR activities (including edits, reopens and labels) stay hosted even for
 an admitted actor: that actor did not supply the code being run. The same
 restriction applies to every inline PR route and both platform resolvers.
@@ -581,7 +651,15 @@ webhook filter. The maintainer changing either fleet project's actor filter owns
 updating `CODEBUILD_ACTOR_IDS` in the same operational change and verifying that
 both projects and the routing mirror agree before declaring that change complete.
 Missing/empty membership routes to hosted; a fork PR stays
-hosted even when its actor is admitted. Every output consumer has a hosted
+hosted even when its actor is admitted. A merge group is different in kind
+from a pull request and is routed like a push: by ruleset construction it holds
+only a head that a maintainer approved at that exact commit (the queue admits
+nothing that fails the `protected-branches` rules), it cannot be amended once
+queued, and it is the very tree that lands on `main` -- where the push run
+executes it on the fleet -- minutes later. The fork fence exists for code
+nobody has approved; a merge group cannot carry any. The people who can queue
+a fork's code (maintainers, who can also push it to `main` directly) are the
+same people the fleet already trusts. Every output consumer has a hosted
 fallback. Removing the variable routes all these jobs back to hosted on new
 runs, without changing tests or AWS resources. It does not reroute an already
 queued job. The independent webhook filter remains necessary: routing is not a
@@ -683,7 +761,7 @@ Where the coverage went:
 |---|---|---|
 | `backend-test-macos` (full suite, 4 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
 | The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`). Over those three sits a CEILING: the path and sample switches are refused while this lane already holds `LANE_MAX_LIVE_RUNS` (4) live runs of the hosted macOS pool (a run holds one job per shard, so the ceiling is expressed in runs but felt in jobs, and it moves with the shard count), because on 2026-09-24 it held 53 of the 56 in-progress macOS jobs and one shard waited 14 hours for a runner while `build.yml` and `release.yml` queued behind it. A capped run is skipped, not queued, so the ceiling bounds demand and settles the lane at about six verdicts an hour -- a timely verdict for a few pull requests instead of a 14-hour one for all of them, with the nightly still covering every merge. The `ci:macos` label is never refused, and neither is a re-run, so a retry cannot turn a red lane into a skip | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
-| Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, push-to-main leg; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
+| Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, the only job on the push-to-main path; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
 
 `test/test_macos_platform_tests_gate.py` pins all of it, including the property that
 nothing on the required `pull_request` path may instantiate a macOS runner.
@@ -880,7 +958,10 @@ Details worth knowing:
     than only the failed ones, because `gh run rerun --failed` reuses the first
     attempt's `changes` outputs and therefore re-queues the routed jobs under a
     label whose attempt suffix is stale, and CodeBuild's documentation does not
-    say whether it honours that. A workflow clears TWO heal-safety gates. The
+    say whether it honours that. (It did on CI run 36831273812: attempts 2 and 3
+    of a `--failed` rerun kept the `-1` label on their Linux and Windows jobs and
+    each got a fresh runner within two minutes, which is what the merge-queue
+    readiness poll's rerun relies on.) A workflow clears TWO heal-safety gates. The
     declared gate is `HEAL_SAFE_WORKFLOWS`, a written judgement that a full
     re-run is safe, and it is the LOAD-BEARING one: a workflow joining the
     watched set is exempt until a person puts it there. There are two declared
@@ -1003,6 +1084,11 @@ Details worth knowing:
     young to have carried such a start may still act. An own-queue dispatching
     reading does not lift this hold: it is read off the starts the sweep read, and
     the slow same-queue start that would refute it can sit in a run nobody read.
+    On a tick that has an orphan to judge, the sweep first reads the jobs of every
+    unread run that could hold such a start, up to 200 more reads (all or nothing:
+    a partial read cannot lift the hold, so a larger set is not read at all), so the
+    hold is reached only past that top-up bound; a tick with no orphan spends none
+    of those reads, which is why they are not folded into the per-tick bound.
     The unread runs are retained
     with their creation times and re-judged on age at each cancel, not counted once:
     the cancel phase re-reads the listing once and then judges several cancels
@@ -2824,9 +2910,28 @@ Nothing the fork controls can influence these reviews:
 
 - `workflow_run` **always** runs the workflow definition from the **default branch**,
   so a fork editing these files in its PR has no effect on what runs.
-- `github.event.workflow_run.head_sha` is set by GitHub and is the only authoritative
-  input taken from the trigger. The PR is resolved by matching an open PR whose head
-  SHA equals it, because `workflow_run.pull_requests` is empty for forks.
+- `github.event.workflow_run.head_sha`, `head_repository.full_name`, and
+  `head_branch` are set by GitHub and form the authoritative trigger identity. The
+  four review resolvers changed in D1 (Design, GPT, Opus, and UX), plus Workflow
+  Guard, aggregate every open-PR page, match all three values as jq data, and
+  proceed only when exactly one candidate remains; empty or ambiguous identity
+  fails closed instead of degrading to a SHA-only first match. First Principles
+  and Security Scope remain outside D1's resolver-conversion boundary: they filter
+  repository and ref when those fields are present, but retain first-match and
+  empty-field compatibility until the dependent D2 change normalizes them.
+- Fork-lane concurrency uses the immutable numeric id of the triggering trusted
+  workflow run. GitHub retains that id across attempts but assigns distinct runs to
+  sibling PR triggers, so reruns collapse while case-only or very long fork refs
+  neither collide nor expand the group. The workflow guard prefixes the trusted
+  event name, then uses the same run id for `workflow_run` and the immutable
+  pull-request id for `pull_request_target`, keeping those numeric ID domains
+  separate; its case-sensitive `(repository, ref, SHA)` resolver remains the
+  authorization check. Because a run-id group no longer cancels a second trigger
+  on the same head (a close/reopen produces a fresh run id), each lane's
+  finalize sweep — which completes a check-run row this PR left stranded, matched
+  by the `<lane>-pr-<PR>-` prefix — now also compares the row's `external_id`
+  run-id dimension and leaves alone any row written by a NEWER run, so an older
+  trigger's run can never overwrite a newer one's verdict on the same head.
 - The base SHA is re-fetched from the PR via the API and the diff is re-derived from
   GitHub's compare endpoint pinned to `(base_sha...head_sha)`. Stage 1's artifact is
   an untrusted **hint** only, so a fork faking it changes nothing.

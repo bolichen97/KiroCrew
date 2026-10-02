@@ -36,6 +36,17 @@ def _isolated_home(tmp_path, monkeypatch):
     """Every test writes into its own data home, never the live one."""
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     yield
+    # The write lease is released when the handle that adopted it is dropped, and
+    # the holder table is process-global, so a handle a test here keeps reachable
+    # is a lease the next test on this worker -- in whatever file xdist hands it
+    # -- reads as held. Read WITHOUT a ``gc.collect()``: release rides the handle's
+    # refcount, so a lease still held here is a retention (a reference cycle
+    # through the handle, typically a caught exception's traceback holding the
+    # ``append`` frame whose ``self`` is the handle), not a frame that has not
+    # finished unwinding. Reported here, where it is created, rather than in
+    # ``test_crew_log_edge_exhaustion.py``'s teardown, which is where the fourth
+    # Windows sweep first read it.
+    assert not lease._held, f"a lease outlived its test on this worker: {sorted(lease._held)}"
 
 
 def _crew(unit_id: str = CREW, **fields) -> CrewLog:
@@ -48,12 +59,74 @@ def _session(unit_id: str = SESSION, **fields) -> CrewLog:
     return CrewLog.create(lg.KIND_SESSION, unit_id, **fields)
 
 
-def _raises(code: str):
-    return pytest.raises(CrewLogError)
+class _Refusal:
+    """What a refusal SAID, copied out of the exception at the moment it is caught.
+
+    A plain record with the fields these tests read -- ``code``, ``field``,
+    ``message``, ``written`` -- and ``str()`` as the exception's own. Deliberately
+    NOT the exception: see :func:`_raises`.
+    """
+
+    __slots__ = ("code", "field", "message", "written")
+
+    def __init__(self, exc: BaseException) -> None:
+        self.code = getattr(exc, "code", None)
+        self.field = getattr(exc, "field", None)
+        self.message = str(exc)
+        self.written = getattr(exc, "written", None)
+
+    def __str__(self) -> str:
+        return self.message
 
 
-def _code(excinfo) -> str:
-    return excinfo.value.code
+class _raises:
+    """Assert the block raises *exc_type* -- with *code*, when one is given -- and RETAIN NOTHING.
+
+    ``pytest.raises(...) as exc`` binds an ``ExceptionInfo`` in the test's frame,
+    and that object holds the exception, whose traceback holds every frame it
+    unwound through -- the test's own frame (a reference cycle only the cyclic
+    collector breaks) and ``CrewLog.append``'s frame, whose ``self`` is the handle.
+    The handle's write lease is released when the handle is dropped, so with the
+    cycle standing the lease outlived the test by however many tests it took the
+    collector to get round to it: the fourth Windows sweep read this file's leases
+    from ``test_crew_log_edge_exhaustion.py``'s teardown, 3 of 3 rounds.
+
+    A CLASS, not a ``@contextlib.contextmanager``: an exception thrown into a
+    generator is a second cycle of the same kind (the traceback grows the
+    generator's frame, whose ``f_back`` is ``__exit__``'s frame, whose ``value``
+    is the exception), measured here with ``gc.get_referrers`` -- 26 of this
+    file's tests still held their lease under that shape. Here ``__exit__`` reads
+    the exception's fields into a :class:`_Refusal`, returns, and its frame is
+    the only thing that ever named the exception; nothing outlives the ``with``
+    but strings, so the handle -- and the lease -- go with the test's frame, by
+    refcount. The autouse fixture's ``lease._held`` pin is what proves it, test
+    by test.
+    """
+
+    def __init__(self, code: str | None, exc_type: type[BaseException] = CrewLogError) -> None:
+        self.code = code
+        self.exc_type = exc_type
+        self.value: _Refusal | None = None
+
+    def __enter__(self) -> "_raises":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is None:
+            pytest.fail(f"expected {self.exc_type.__name__} {self.code!r}, nothing was raised")
+        if not isinstance(exc, self.exc_type):
+            return False
+        self.value = _Refusal(exc)
+        if self.code is not None and self.value.code != self.code:
+            raise AssertionError(
+                f"refused with code {self.value.code!r}, expected {self.code!r}: {self.value}"
+            ) from None
+        return True
+
+
+def _code(caught: _raises) -> str:
+    assert caught.value is not None
+    return caught.value.code
 
 
 def _log_bytes(kind: str = lg.KIND_SESSION, unit_id: str = SESSION) -> bytes:
@@ -541,9 +614,8 @@ def test_a_type_the_vocabulary_dropped_is_refused_with_its_domain(tmp_path):
     """
     led = _session("vocab-dropped")
     for dropped in ("skill/loaded", "skill/searched", "summary/written", "remote/placed"):
-        with pytest.raises(lg.CrewLogError) as excinfo:
+        with _raises(lg.CODE_EVENT_TYPE_NOT_OWNED):
             led.append(dropped, {}, src="gateway")
-        assert excinfo.value.code == lg.CODE_EVENT_TYPE_NOT_OWNED
 
 
 def test_a_type_outside_the_vocabulary_is_still_refused(tmp_path):
@@ -551,9 +623,8 @@ def test_a_type_outside_the_vocabulary_is_still_refused(tmp_path):
     # kind does not have must still fail closed rather than be written.
     led = _session("vocab-refuse")
     for foreign in ("member/joined", "patrol/ran", "item/phase", "nonsense/happened"):
-        with pytest.raises(lg.CrewLogError) as excinfo:
+        with _raises(lg.CODE_EVENT_TYPE_NOT_OWNED):
             led.append(foreign, {}, src="gateway")
-        assert excinfo.value.code == lg.CODE_EVENT_TYPE_NOT_OWNED
 
 
 def test_a_reader_with_the_vocabulary_reconstructs_every_type(tmp_path):
@@ -593,7 +664,22 @@ def test_message_is_owned_by_both_kinds_because_both_have_messages():
     )
 
 
-@pytest.mark.parametrize("bad", ["noslash", "/leading", "trailing/", "a/b/c", "-bad/x", "x/-bad"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "noslash",
+        "/leading",
+        "trailing/",
+        "a/b/c",
+        "-bad/x",
+        "x/-bad",
+        # The name pattern ends at ``\Z``: a trailing newline is not part of a
+        # plain name, and an accepted one would be persisted into every reader of
+        # the entry.
+        "activity/tick\n",
+        "activity\n/tick",
+    ],
+)
 def test_a_type_that_is_not_domain_slash_action_is_refused(bad):
     crew = _crew()
     with _raises(lg.CODE_BAD_TYPE) as exc:
@@ -607,7 +693,10 @@ def test_a_crew_log_accepts_its_own_emitters(src):
     assert _crew().append(entry_type, {}, src=src).src == src
 
 
-@pytest.mark.parametrize("bad", ["", "Gate way", "session:s-1", "crew:", "app:bad/name", "unknown"])
+@pytest.mark.parametrize(
+    "bad",
+    ["", "Gate way", "session:s-1", "crew:", "app:bad/name", "unknown", "crew:qa\n", "app:radar\n"],
+)
 def test_an_unrecognized_src_is_refused(bad):
     crew = _crew()
     with _raises(lg.CODE_BAD_SRC) as exc:
@@ -1248,6 +1337,114 @@ def test_a_torn_last_line_is_truncated_on_open():
     assert reopened.append("item/opened", {}, src="gateway").seq == 2
 
 
+def _append_stuck_in_fsync(monkeypatch, crew):
+    """Start an append that has written and flushed its line and is inside a failing fsync.
+
+    Returns the event that lets the fsync fail and the appender thread. Until the event
+    is set the line is in the file and the append lock is held, which is the window a
+    reader without the lock would see a line the rollback then removes.
+    """
+    in_fsync, fail = threading.Event(), threading.Event()
+    real_fsync = store.os.fsync
+
+    def _fsync(fd: int) -> None:
+        # Only the append's own fsync fails; the rollback's fsync is real, so the
+        # failure is the definite "the line is gone" outcome a rollback promises.
+        if threading.current_thread().name != "stuck-appender" or in_fsync.is_set():
+            return real_fsync(fd)
+        in_fsync.set()
+        fail.wait(5)
+        raise OSError(5, "simulated fsync failure")
+
+    monkeypatch.setattr(store.os, "fsync", _fsync)
+
+    def _append() -> None:
+        with pytest.raises(OSError):
+            crew.append("item/opened", {"kept": False}, src="gateway")
+
+    appender = threading.Thread(target=_append, name="stuck-appender", daemon=True)
+    appender.start()
+    assert in_fsync.wait(5)
+    return fail, appender
+
+
+def _read_in_thread(read):
+    """Run *read* on a thread; return (finished event, result box)."""
+    done, box = threading.Event(), {}
+
+    def _run() -> None:
+        try:
+            box["value"] = read()
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return done, box
+
+
+def test_an_open_does_not_see_an_append_whose_fsync_has_not_returned(monkeypatch):
+    # No reader folds bytes the writer has not yet fsynced under its lock: the open's
+    # tail read waits for the append, and the failed fsync's rollback is what it sees.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    fail, appender = _append_stuck_in_fsync(monkeypatch, crew)
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    assert path.read_bytes().count(b'"seq":2') == 1  # the in-flight line is on disk
+
+    done, box = _read_in_thread(lambda: CrewLog.open(lg.KIND_CREW, CREW).last_seq)
+    assert not done.wait(0.3), "the open read the tail while the append held the lock"
+    fail.set()
+    appender.join(5)
+    assert done.wait(5)
+
+    assert box["value"] == 1
+
+
+def test_a_held_handle_does_not_read_an_append_whose_fsync_has_not_returned(monkeypatch):
+    # The same rule for a handle opened earlier: each read measures the newest
+    # segment's end under the lock, so an in-flight line is never yielded.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    held = CrewLog.open(lg.KIND_CREW, CREW)
+    fail, appender = _append_stuck_in_fsync(monkeypatch, crew)
+
+    done, box = _read_in_thread(lambda: [entry.seq for entry in held.iter_from(1)])
+    assert not done.wait(0.3), "the read walked the file while the append held the lock"
+    fail.set()
+    appender.join(5)
+    assert done.wait(5)
+
+    assert box["value"] == [1]
+
+
+def test_a_torn_tail_still_waits_for_the_lock_before_truncating():
+    # A torn tail may be an append in flight, so its open takes the lock and
+    # reads again: the holder finishing the line means nothing is dropped.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    intact = path.read_bytes()
+    finished = b'{"type":"item/opened","seq":2}\n'
+    path.write_bytes(intact + finished[:12])
+    taken, release = threading.Event(), threading.Event()
+
+    def _finish_under_lock() -> None:
+        with store._open_lock(store._lock_path(lg.KIND_CREW, CREW)):
+            taken.set()
+            release.wait(5)
+            path.write_bytes(intact + finished)
+
+    holder = threading.Thread(target=_finish_under_lock, daemon=True)
+    holder.start()
+    assert taken.wait(5)
+    threading.Timer(0.2, release.set).start()
+
+    CrewLog.open(lg.KIND_CREW, CREW)
+    holder.join(5)
+
+    assert path.read_bytes() == intact + finished
+
+
 def test_a_complete_last_line_missing_only_its_newline_is_kept():
     # Only the separator was lost, so the record is real; the next append
     # re-supplies the newline instead of rewriting the line.
@@ -1309,10 +1506,9 @@ def test_a_duplicate_seq_is_refused_by_a_read_that_never_yields_it():
         damaged.write(last_line)  # byte-identical copy: seq 2 appears twice
     crew.append("activity/tick", {"i": 2}, src="gateway")  # seq 3, past the damage
 
-    with pytest.raises(CrewLogError) as excinfo:
+    with _raises(lg.CODE_BAD_DATA) as excinfo:
         list(CrewLog.open(lg.KIND_CREW, CREW).iter_from(3))
 
-    assert excinfo.value.code == lg.CODE_BAD_DATA
     assert excinfo.value.field == "seq"
 
 
@@ -1329,10 +1525,9 @@ def test_a_strictly_backward_seq_is_refused_not_only_a_duplicate():
     with open(path, "ab") as damaged:
         damaged.write(first_record)  # seq 1 again, after seq 3: backward, not duplicate
 
-    with pytest.raises(CrewLogError) as excinfo:
+    with _raises(lg.CODE_BAD_DATA) as excinfo:
         list(CrewLog.open(lg.KIND_CREW, CREW).iter_from(4))
 
-    assert excinfo.value.code == lg.CODE_BAD_DATA
     assert excinfo.value.field == "seq"
 
 
@@ -2127,9 +2322,8 @@ def test_a_gap_between_segments_is_refused_rather_than_read_across(tmp_path):
     (lg.crew_log_dir(lg.KIND_SESSION, "seg-gap") / "log.5.jsonl").unlink()
 
     reader = lg.CrewLog.open(lg.KIND_SESSION, "seg-gap")
-    with pytest.raises(CrewLogError) as excinfo:
+    with _raises(lg.CODE_SEGMENT_GAP):
         list(reader.iter_from(1))
-    assert excinfo.value.code == lg.CODE_SEGMENT_GAP
 
 
 def test_a_neighbour_file_sharing_the_prefix_is_ignored_not_refused(tmp_path):
@@ -2320,7 +2514,10 @@ def test_a_group_is_refused_whole_and_leaves_the_file_identical():
     session.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="acp")
     before = lg.crew_log_path(lg.KIND_SESSION, SESSION).read_bytes()
 
-    with _raises("bad_src"):
+    # The second entry is a crew type in a session log (rule 1), so the whole
+    # group is refused as ``event_type_not_owned``. The old ``_raises`` helper
+    # never compared the code, and this site named ``bad_src`` for years.
+    with _raises(lg.CODE_EVENT_TYPE_NOT_OWNED):
         session.append_many(
             [
                 {"type": "message/chunk", "data": {"turn": 1, "delta": "aa"}},
@@ -2418,9 +2615,8 @@ def test_a_newer_format_version_says_upgrade_rather_than_corrupt():
     header["somethingNewer"] = {"whatever": 1}
     path.write_text(json.dumps(header) + "\n" + "".join(lines[1:]), encoding="utf-8")
 
-    with pytest.raises(CrewLogError) as caught:
+    with _raises(lg.CODE_UNSUPPORTED_VERSION) as caught:
         CrewLog.open(lg.KIND_SESSION, SESSION)
-    assert caught.value.code == lg.CODE_UNSUPPORTED_VERSION
     assert "upgrade" in str(caught.value)
     assert "not damaged" in str(caught.value)
 
@@ -2654,7 +2850,7 @@ def test_a_group_refuses_a_cite_that_does_not_return_an_entry():
     session.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="acp")
     before = lg.crew_log_path(lg.KIND_SESSION, SESSION).read_bytes()
 
-    with pytest.raises(CrewLogError) as caught:
+    with _raises("bad_data") as caught:
         session.append_many(
             [{"type": "message/chunk", "data": {"turn": 1, "delta": "aa"}, "ignorable": True}],
             src="acp",
@@ -2812,7 +3008,7 @@ def test_an_append_whose_rollback_also_fails_says_so():
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(os, "fsync", _fsync_failing_once(burned))
         patch.setattr(store, "_rollback_append", _rollback_fails)
-        with pytest.raises(lg.IndeterminateAppend) as caught:
+        with _raises(None, lg.IndeterminateAppend) as caught:
             session.append("turn/completed", {"turn": 1, "stop_reason": "end_turn"}, src="acp")
     assert burned
     assert "could not be rolled back" in str(caught.value)

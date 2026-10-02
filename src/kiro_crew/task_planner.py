@@ -8,9 +8,10 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.constants import DENY_CAUSE_POLICY, DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_DENY, hook_gate_kwargs
-from kiro_crew.llm_helpers import _extract_json_of_type
+from kiro_crew.llm_helpers import _extract_json_of_type, _steer_host_deny
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
@@ -27,6 +28,14 @@ if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
 
 logger = logging.getLogger(__name__)
+
+#: What the model is told when the planning (decomposition) phase refuses a tool
+#: call it has no hook store to gate. Says what the surface permits -- nothing --
+#: and nothing about the call itself, which was never judged.
+_DECOMPOSITION_DENY_REASON = (
+    "the planning phase runs no tools: it only decomposes the spec into steps and "
+    "has no hook store to gate a tool call, so every call is refused here"
+)
 
 
 # ── Name Resolution ──
@@ -326,7 +335,11 @@ async def decompose(
                         **hook_gate_kwargs(event),
                     )
                     if hook_result.action == TOOL_DENY:
-                        await client.reject_tool(event.request_id)
+                        # Audit FIRST, then tell the model in-band that the
+                        # HOST refused this (a rejected permission reaches it
+                        # as kiro-cli's "User denied tool execution"), then
+                        # answer the wire. The hook judged the call itself: a
+                        # policy verdict, with the hook's own reason.
                         sel().log_tool_invocation(
                             session_key=session_key,
                             agent=agent or "kirocrew",
@@ -338,13 +351,21 @@ async def decompose(
                             error="hook_deny",
                             metadata={"phase": "decomposition"},
                         )
+                        await _steer_host_deny(
+                            client,
+                            event,
+                            hook_result.reason or "",
+                            cause=DENY_CAUSE_POLICY,
+                        )
+                        await client.reject_tool(event.request_id)
                         continue
                 else:
                     # Deny-by-default: with no hook store there is nothing to
                     # gate the request, so reject rather than fall through to
                     # approve. Decomposition normally only emits JSON (no tool
                     # calls), so this blocks only the anomalous/injection case.
-                    await client.reject_tool(event.request_id)
+                    # The SURFACE refuses the call (nothing about it was
+                    # judged), so the notice says what this phase permits.
                     sel().log_tool_invocation(
                         session_key=session_key,
                         agent=agent or "kirocrew",
@@ -356,6 +377,13 @@ async def decompose(
                         error="no_hook_store",
                         metadata={"phase": "decomposition"},
                     )
+                    await _steer_host_deny(
+                        client,
+                        event,
+                        _DECOMPOSITION_DENY_REASON,
+                        cause=DENY_CAUSE_SURFACE_POLICY,
+                    )
+                    await client.reject_tool(event.request_id)
                     continue
                 approval_sent = await client.approve_tool(event.request_id)
                 sel().log_tool_invocation(

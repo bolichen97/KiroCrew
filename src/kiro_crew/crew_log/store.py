@@ -59,7 +59,7 @@ import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -541,7 +541,11 @@ def remove_unit(
                 unit_id,
             )
             return REMOVE_FAILED
-        failures, history_gone = _remove_unit_contents(directory)
+        # With this process's eager folder held between batches, so no fold has one of
+        # these files open: Windows refuses to unlink a file any handle holds, and a fold
+        # reads segments without the lease this removal holds.
+        with _eager_folder_paused():
+            failures, history_gone = _remove_unit_contents(directory)
         if failures:
             # Say WHICH of the two failures this is. Segments go first, so a
             # failure after some of them went is a PARTIAL removal -- that
@@ -1543,6 +1547,13 @@ def unit_opened_previous(kind: str, unit_id: str) -> "str | None":
     return sid if isinstance(sid, str) and sid else None
 
 
+def _eager_folder_paused() -> "AbstractContextManager[bool]":
+    """:func:`eager.paused`, imported late: the eager folder imports this module."""
+    from kiro_crew.crew_log import eager
+
+    return eager.paused()
+
+
 def _remove_unit_contents(directory: Path) -> "tuple[int, int]":
     """Delete everything in *directory* except the lease. ``(failures, history_gone)``.
 
@@ -2268,8 +2279,34 @@ def _has_content(path: Path) -> bool:
         return False
 
 
-def _iter_entries(path: Path) -> Iterator[Entry]:
+class _Bounded:
+    """A binary reader that stops at byte *end* of *source*.
+
+    What :func:`_iter_entries` reads through when a caller fixed the end under the
+    append lock: bytes past it may be an append whose fsync has not returned, and a
+    line read from them can be truncated away a moment later. Only the two calls the
+    record framer makes are offered, so a new one fails loudly rather than reading
+    past the end.
+    """
+
+    def __init__(self, source: Any, end: int) -> None:
+        self._source = source
+        self._end = end
+
+    def tell(self) -> int:
+        return int(self._source.tell())
+
+    def readline(self, size: int = -1) -> bytes:
+        left = self._end - self.tell()
+        if left <= 0:
+            return b""
+        return bytes(self._source.readline(left if size < 0 else min(size, left)))
+
+
+def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
     """Every parseable entry in *path*, oldest first, header excluded.
+
+    *end*, when given, is the byte offset the read stops at (see :class:`_Bounded`).
 
     A malformed interior line is SKIPPED, not raised on: the log is append-only
     and one damaged line must not hide the history in front of it. The file is
@@ -2292,7 +2329,8 @@ def _iter_entries(path: Path) -> Iterator[Entry]:
     produced: it is damage, and the skip posture already applies to damage.
     """
     try:
-        with open(path, "rb") as source:
+        with open(path, "rb") as raw_source:
+            source: Any = raw_source if end is None else _Bounded(raw_source, end)
             for index, raw in enumerate(
                 bounded_raw_records(source, path, cap=MAX_ENTRY_BYTES, label="crew log")
             ):
@@ -2437,6 +2475,13 @@ class CrewLog:
         "_last_seq",
         "_needs_newline",
         "_lease_key",
+        # The ``weakref.finalize`` that releases this handle's lease when the
+        # object is dropped. Held so :meth:`release_ownership` can run it
+        # DETERMINISTICALLY -- dropping the last reference frees the lease only
+        # once the cyclic collector runs the finalizer, and a caller retiring
+        # this handle (a test boundary, a cache eviction) cannot wait for a GC
+        # pass it does not control. See :meth:`_adopt_lease`.
+        "_lease_finalizer",
         # Weak-referenceable so this handle being dropped is what releases its
         # write ownership. See :meth:`_claim`.
         "__weakref__",
@@ -2460,6 +2505,7 @@ class CrewLog:
         self._last_seq = last_seq
         self._needs_newline = needs_newline
         self._lease_key: str | None = None
+        self._lease_finalizer: "weakref.finalize | None" = None
         if lease_key is not None:
             # A reference already taken on this handle's behalf -- the repair an
             # ``open`` ran before the instance existed. Adopting it here is what
@@ -2613,18 +2659,13 @@ class CrewLog:
             )
         path = segments[-1]
         header_path = segments[0]
-        with _open_lock(_lock_path(kind, unit_id)):
-            tail = _scan_tail(path)
-            if tail.torn_offset is not None:
-                dropped = path.stat().st_size - tail.torn_offset
-                _truncate(path, tail.torn_offset)
-                logger.warning(
-                    "dropped %d torn trailing byte(s) from %s crew log %r",
-                    dropped,
-                    kind,
-                    unit_id,
-                )
-            raw = _read_header_line(header_path)
+        # Under the lock, always: an append holds it from its write through its fsync
+        # and any rollback, so a tail read under it sees only lines the writer has made
+        # durable or has already taken back. A read without it can land between the
+        # flush and a failed fsync and hand a fold a line that is truncated a moment
+        # later. The same pass drops a torn tail.
+        tail = cls._settle_tail(kind, unit_id, path)
+        raw = _read_header_line(header_path)
         parsed = None if not raw else _parses_to_object(raw)
         if parsed is None:
             raise CrewLogError(
@@ -2660,6 +2701,22 @@ class CrewLog:
             needs_newline=tail.needs_newline,
             lease_key=lease_key,
         )
+
+    @staticmethod
+    def _settle_tail(kind: str, unit_id: str, path: Path) -> _Tail:
+        """Re-read *path*'s tail under the lock, dropping torn trailing bytes."""
+        with _open_lock(_lock_path(kind, unit_id)):
+            tail = _scan_tail(path)
+            if tail.torn_offset is not None:
+                dropped = path.stat().st_size - tail.torn_offset
+                _truncate(path, tail.torn_offset)
+                logger.warning(
+                    "dropped %d torn trailing byte(s) from %s crew log %r",
+                    dropped,
+                    kind,
+                    unit_id,
+                )
+        return tail
 
     def repair_interrupted_turn(self, *, child_gone: "Callable[[str], bool] | None" = None) -> int:
         """Close an open turn on this crew log. Returns how many closers landed.
@@ -2732,7 +2789,36 @@ class CrewLog:
         that is about to append.
         """
         self._lease_key = key
-        weakref.finalize(self, release_lease, key)
+        self._lease_finalizer = weakref.finalize(self, release_lease, key)
+
+    def release_ownership(self) -> None:
+        """Release this handle's write lease NOW, without waiting for a GC pass.
+
+        Dropping the last reference to a handle frees its lease through the
+        ``weakref.finalize`` :meth:`_adopt_lease` armed -- but only once the
+        cyclic collector RUNS that finalizer, and a handle reachable only through
+        a reference cycle (the member event-log service holds one: its projection
+        registry keeps a bound method back to it) is never freed by refcount, so
+        the release waits for a generational GC pass. That wait is invisible on
+        POSIX -- an advisory lock on a torn-down directory harms nothing and the
+        next acquire against a fresh path just works -- but on Windows the still-open
+        descriptor keeps a mandatory lock on the file and pins its directory open,
+        so the directory cannot be removed and a later write under the same
+        inherited process fails. A caller retiring this handle deterministically
+        (a test boundary, a cache eviction that is not GC-driven) runs the
+        finalizer itself instead.
+
+        ``weakref.finalize`` is idempotent and atomic: calling the finalizer here
+        runs ``release_lease`` exactly once and marks it dead, so the later GC-time
+        call it would have made is a no-op. Safe to call more than once and safe on
+        a handle that never took a lease (a pure reader), where there is nothing to
+        run.
+        """
+        finalizer = self._lease_finalizer
+        if finalizer is not None:
+            finalizer()
+        self._lease_finalizer = None
+        self._lease_key = None
 
     # -- write -------------------------------------------------------------- #
 
@@ -3173,6 +3259,14 @@ class CrewLog:
                 continue
             yield entry
 
+    def _durable_end(self, path: Path) -> int:
+        """*path*'s size measured under the append lock: the end no append is still writing."""
+        with _open_lock(_lock_path(self._kind, self._id)):
+            try:
+                return path.stat().st_size
+            except FileNotFoundError:
+                return 0
+
     def _iter_segments(self) -> Iterator[Entry]:
         """Every entry of every segment, oldest first, refusing bad provenance.
 
@@ -3189,7 +3283,15 @@ class CrewLog:
         segment is invisible unless the boundary is checked.
         """
         expected = 0
-        for index, path in enumerate(segment_paths(self._kind, self._id)):
+        paths = segment_paths(self._kind, self._id)
+        # The newest segment is the one a writer appends to, so its end is measured
+        # under the append lock before anything is read. An append holds that lock
+        # from its write through its fsync and any rollback, so the size seen under it
+        # covers only lines the writer has made durable; bytes past it are an append
+        # still in flight, and a reader that yields them can hand a fold an entry the
+        # durable log never keeps. Older segments take no more appends.
+        newest_end = self._durable_end(paths[-1]) if paths else None
+        for index, path in enumerate(paths):
             raw_header = _read_header_line(path)
             parsed_header = None if not raw_header else _parses_to_object(raw_header)
             try:
@@ -3223,7 +3325,8 @@ class CrewLog:
                 )
 
             at_boundary = bool(index) and expected > 0
-            for entry in _iter_entries(path):
+            end = newest_end if index == len(paths) - 1 else None
+            for entry in _iter_entries(path, end):
                 if at_boundary and entry.seq != expected:
                     raise CrewLogError(
                         f"segment {path.name} starts at seq {entry.seq}, but the "

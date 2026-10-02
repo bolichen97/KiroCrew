@@ -650,7 +650,20 @@ def claim_grant(nonce: str) -> PendingGrant:
                 "no armed grant request (it may have expired) -- confirm from the "
                 "dashboard's Security panel first"
             )
-        if not nonce or not hmac.compare_digest(pending.nonce, nonce):
+        # Compared as BYTES, never as ``str``. ``hmac.compare_digest`` rejects
+        # a str holding a non-ASCII character by raising ``TypeError``, and the
+        # nonce arrives in the request body, so a malformed one would escape the
+        # caller's ``StepUpError`` arm as a 500 instead of the refusal a wrong
+        # ASCII nonce produces. ``surrogatepass`` because a lone surrogate must
+        # still compare rather than raise on the way in, and it keeps two
+        # distinct strings distinct. The armed values are hex digests by
+        # construction, so a nonce that matched before still matches. The epoch
+        # compare below gets the same treatment: both operands are the claim's
+        # credential material, and neither compare may be partial over str.
+        if not nonce or not hmac.compare_digest(
+            pending.nonce.encode("utf-8", "surrogatepass"),
+            nonce.encode("utf-8", "surrogatepass"),
+        ):
             raise StepUpError("approval nonce does not match the armed request")
         # The step-up's whole claim is that a human armed this while the agent
         # could not read the nonce. Checking that only at approve time is
@@ -660,7 +673,10 @@ def claim_grant(nonce: str) -> PendingGrant:
         # through. Compared here, inside the claim, so no caller can consume a
         # request whose conditions moved after it was armed.
         current = safety_epoch()
-        if not pending.safety_epoch or not hmac.compare_digest(pending.safety_epoch, current):
+        if not pending.safety_epoch or not hmac.compare_digest(
+            pending.safety_epoch.encode("utf-8", "surrogatepass"),
+            current.encode("utf-8", "surrogatepass"),
+        ):
             raise StepUpError(
                 "the sandbox or computer-use configuration changed after this request "
                 "was armed, so it no longer proves a human approved it -- confirm "

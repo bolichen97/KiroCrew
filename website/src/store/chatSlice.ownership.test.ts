@@ -35,6 +35,7 @@ import * as slotSwitch from './chat/slotSwitch'
 import * as subagents from './chat/subagents'
 import * as transcript from './chat/transcript'
 import * as wire from './chat/wire'
+import * as windowWalk from './chat/windowWalk'
 import * as workflows from './chat/workflows'
 
 const CHAT_DIR = join(__dirname, 'chat')
@@ -176,6 +177,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ]],
   ['slotSwitch', slotSwitch, ['clearSwitchSlotGone', 'switchSlot', 'switchSlotNoticeCopy']],
   ['slotRefresh', slotRefresh, ['refreshSlot', 'warmSlotCache']],
+  ['windowWalk', windowWalk, ['WINDOW_WALK_MAX_PAGES']],
   ['lifecycle', lifecycle, ['createSlot', 'deleteHistorySession', 'fetchHistory', 'forkSlot', 'resumeFromHistory']],
 ]
 

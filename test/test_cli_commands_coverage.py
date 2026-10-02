@@ -139,7 +139,7 @@ class TestSmallHelpers:
         (tmp_path / ".local_secret").write_text("  s3cr3t\n", encoding="utf-8")
         with patch("kiro_crew.cli_commands.read_local_secret", return_value="s3cr3t") as read:
             assert cc._internal_secret(6123) == "s3cr3t"
-        read.assert_called_once_with(6123)
+        read.assert_called_once_with(6123, dial_host="127.0.0.1")
 
     def test_internal_secret_missing_file_is_empty(self, tmp_path: Path) -> None:
         """A missing secret must yield "" so the server answers 403, not a crash."""
@@ -2585,7 +2585,7 @@ class _MemHarness:
     def __init__(self) -> None:
         self.store = MagicMock()
         self._patches = [
-            patch("kiro_crew.cli_commands.VectorMemoryStore", return_value=self.store),
+            patch("kiro_crew.cli_commands.declared_store", return_value=self.store),
             patch.object(KiroCrewConfig, "load", return_value=KiroCrewConfig()),
         ]
 

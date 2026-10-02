@@ -78,6 +78,7 @@ from pathlib import Path
 
 from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE
 from kiro_crew.gateway_shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
+from kiro_crew.platform_compat import trusted_system_bin
 from kiro_crew.service import apparmor, selinux
 from kiro_crew.service.common import (
     RESTART_NOT_UP,
@@ -175,10 +176,23 @@ def _current_group(user: str) -> str:
     shared ``users`` group), so ``Group=<username>`` would fail with
     systemd's status 216/GROUP. Resolve the actual primary group via
     ``id -gn``. Falls back to the username only if id can't resolve it.
+
+    ``id`` is resolved from fixed system directories, never ``PATH``: this runs
+    as root under ``sudo kirocrew service install``, where a ``PATH`` leading
+    with an agent-writable directory would otherwise let a planted ``id`` shim
+    execute with euid 0.
     """
+    id_bin = trusted_system_bin("id")
+    if id_bin is None:
+        return user
     try:
         res = subprocess.run(
-            ["id", "-gn", user], capture_output=True, text=True, check=False
+            [id_bin, "-gn", user],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
@@ -220,6 +234,90 @@ def _home_for_user(user: str) -> str:
         return pwd.getpwnam(user).pw_dir
     except Exception:
         return str(Path.home())
+
+
+def _linger_enabled(user: str) -> bool | None:
+    """Whether ``user``'s per-user systemd manager lingers past logout.
+
+    ``True`` / ``False`` from ``loginctl show-user <user> -p Linger``; ``None``
+    when it cannot be determined — no ``loginctl``, an unknown user, or an
+    unrecognised value — so the caller stays quiet rather than guessing. Linger
+    is a system-level logind property, so a plain (non ``--user``) ``loginctl``
+    read answers it regardless of whether that account currently has a session.
+
+    The ``Linger=`` value is parsed out of the ``Key=value`` output rather than
+    taken from ``--value``: ``--value`` arrived in systemd 230, and this module
+    commits to systemd 219 (see the module docstring), where that option is
+    rejected and the read would fail. The canonical probe for the whole package;
+    :func:`kiro_crew.cli_doctor._linger_enabled` delegates here.
+
+    ``loginctl`` is resolved from fixed system directories, never ``PATH``: the
+    system-install path runs as root under ``sudo``, where a ``PATH`` leading
+    with an agent-writable directory would let a planted ``loginctl`` shim
+    execute with euid 0.
+    """
+    loginctl = trusted_system_bin("loginctl")
+    if loginctl is None:
+        return None
+    try:
+        res = subprocess.run(
+            [loginctl, "show-user", user, "-p", "Linger"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    val = ""
+    for line in (res.stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "Linger":
+            val = value.strip().lower()
+            break
+    if val in ("yes", "true", "1"):
+        return True
+    if val in ("no", "false", "0"):
+        return False
+    return None
+
+
+def linger_warning_for_service_account() -> str | None:
+    """Operator warning for a system install whose service account has linger off.
+
+    The system unit bakes ``XDG_RUNTIME_DIR=/run/user/<uid>`` and
+    ``DBUS_SESSION_BUS_ADDRESS`` (see :func:`render_unit`), so an agent runtime
+    scope is created under that account's ``user@<uid>.service``. With
+    ``Linger=no`` logind stops the account's manager when its last login session
+    ends: an in-flight scoped runtime gets ``SIGTERM`` and dies with it. New
+    spawns do not fail — ``sandbox`` detects the gone manager and starts them
+    UNSCOPED, which drops the cgroup-v2 memory and fork-count ceilings those
+    scopes enforce, and logs each loss as a SECURITY warning. Linger keeps the
+    account's manager running without a login, which is what a persistent system
+    service needs to retain both the runtimes and their ceilings.
+
+    Returns the warning string when linger is off for the resolved account, or
+    ``None`` when it is on or cannot be determined (so the install reports
+    nothing it is not sure of). This only describes a condition and names the
+    fix; it never changes the install outcome.
+    """
+    user = _current_user()
+    if not user or user == "root":
+        return None
+    if _linger_enabled(user) is not False:
+        return None
+    return (
+        f"linger is off for {user}: this system service parents each agent "
+        f"runtime under that account's user manager, which systemd stops when "
+        f"{user}'s last login session ends — killing in-flight runtimes, and "
+        f"starting later spawns unscoped so they lose their memory and "
+        f"fork-count ceilings. Enable it so the service keeps the manager, and "
+        f"the ceilings, without a login:\n"
+        f"     sudo loginctl enable-linger {shlex.quote(user)}"
+    )
 
 
 def render_unit(*, user_scope: bool = False) -> str:

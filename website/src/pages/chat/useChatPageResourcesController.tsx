@@ -27,7 +27,6 @@ import { i18nT } from '../../i18n/t'
 import type { AppDispatch } from '../../store'
 import { openActivityPanel } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
-import { setConfigAutolinkRules } from '../../utils/autolinkRules'
 import { mergeIntoDraft, setDraft } from '../../utils/chatDrafts'
 import { setFileDraft } from '../../utils/chatFileDrafts'
 import { classifyDrop } from '../../utils/dropClassify'
@@ -52,6 +51,7 @@ import type { ResizeInfo } from '../../utils/resizeImage'
 import { errMessage } from '../../utils/thunkError'
 import { fileLandingSlot } from '../../utils/uploadRouting'
 import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
+import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 
 type MutableRef<T> = { current: T }
 
@@ -161,28 +161,24 @@ export function useChatPageResourcesController({
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[]; link_patterns?: Array<{ pattern: string; url: string }> }>({
+  const { data: sourceHostCfg, error: sourceHostError, errorUpdatedAt: sourceHostErrorAt } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
     queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
+    queryFn: fetchDashboardConfig,
     staleTime: 30_000,
   })
+  // A failed read leaves self-hosted source chips inert, so say so -- once
+  // per failure (keyed on errorUpdatedAt), not on every re-render.
+  useEffect(() => {
+    if (!sourceHostErrorAt || !sourceHostError) return
+    showActionError(i18nT('pages.chatPage.source_hosts_failed_reason', { reason: errMessage(sourceHostError) || i18nT('pages.chatPage.unknown_error') }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one notice per failure
+  }, [sourceHostErrorAt])
   const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
   const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
-  // Operator link rules feed the module-level autolink registry the renderer's
-  // remark plugin and inline-code chip already read; the registry validates
-  // each entry the same way an edition-registered rule is validated. Applied
-  // DURING render, before transcript children render, so the pass that
-  // delivers a config change also paints with it — an effect would run after
-  // memoized messages first painted with the previous rule set. The write is
-  // ref-guarded and idempotent, so a re-render or a discarded concurrent pass
-  // re-applying the same serialized value is a no-op.
-  const linkPatternRules = sourceHostCfg?.link_patterns
-  const linkPatternsKey = JSON.stringify(linkPatternRules ?? [])
-  const appliedLinkPatternsRef = useRef('')
-  if (appliedLinkPatternsRef.current !== linkPatternsKey) {
-    appliedLinkPatternsRef.current = linkPatternsKey
-    setConfigAutolinkRules(linkPatternRules ?? [])
-  }
+  // Operator link rules (dashboard.link_patterns) are registered into the
+  // autolink registry by the app shell (useConfigAutolinkRules), so every
+  // surface linkifies regardless of whether a chat page has rendered. This
+  // controller reads the same ['dashboardConfig'] query only for source hosts.
   // Read through refs by callbacks that must stay identity-stable (they are
   // handed to the sidebar, which re-renders every session row).
   const sourceHostsRef = useRef(sourceHosts)
@@ -548,7 +544,7 @@ export function useChatPageResourcesController({
       window.dispatchEvent(new CustomEvent('kirocrew-file-open', {
         detail: { path: filePath, before: original, after: modified },
       }))
-    } catch { /* ignore */ }
+    } catch { /* the IDE bridge is optional; the dashboard path below still runs */ }
     if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
     // Brand-new file (no prior content): a diff would render as one big green
     // all-additions block, which hurts readability. Open the normal readable

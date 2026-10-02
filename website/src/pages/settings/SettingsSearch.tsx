@@ -17,6 +17,7 @@ import { SidePanelDockContext } from '../../components/SidePanelLayout'
 import { SearchInput } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 import { api } from '../../api/client'
+import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 
 /**
  * SettingsSearch — in-page search over SETTINGS_REGISTRY. On desktop it is the
@@ -83,7 +84,7 @@ export default function SettingsSearch() {
   // rather than a hidden card and a live search entry pointing at it.
   const dashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
     queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
+    queryFn: fetchDashboardConfig,
     staleTime: 30_000,
   })
   // Offer unless the read SUCCEEDED and said otherwise: a failed or in-flight read is
@@ -170,9 +171,9 @@ export default function SettingsSearch() {
 
   return (
     // `settings-search` (index.css) turns the boxed input's `focus-ring` neutral:
-    // Settings is where the user hunts for a switch, and its search bar wears
-    // the same rule as the glass panes -- focus is the control stepping clearer
-    // (darker border, soft neutral halo), never the theme colour.
+    // Settings is where the user hunts for a switch, and its desktop search bar
+    // keeps a focus ring (darker border, soft neutral halo) that is never the
+    // theme colour; the mobile glass capsule shows no focus change at all.
     <div ref={rootRef} className="settings-search relative shrink-0">
       {floating ? (
         // The capsule host owns the chrome, so this input stays borderless;
@@ -181,11 +182,11 @@ export default function SettingsSearch() {
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted pointer-events-none" />
           <input
             {...inputProps}
-            // focus-cue-ok: the cue is the SidePanelLayout capsule's
-            // `.glass-shadow:focus-within` — the glass side lines step up
-            // (`--glass-edge-focus`) and the rest shadow deepens; under the solidifying fallbacks the same rule paints
-            // a neutral 2px outline (never the accent). The ancestor sits in another file, so
-            // the gate can't see it.
+            // focus-cue-ok: maintainer decision -- the SidePanelLayout glass
+            // capsule holding this input does not change on focus (no ring, no
+            // colour step, no shadow step, never the accent), in glass mode and
+            // in the solidifying fallbacks alike; the caret is the indicator.
+            // The ancestor sits in another file, so the gate can't see it.
             className="w-full bg-transparent border-none rounded-full pl-8 pr-4 py-2.5 text-[14px] text-text placeholder:text-muted focus:outline-hidden"
           />
         </>

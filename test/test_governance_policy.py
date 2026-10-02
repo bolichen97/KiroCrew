@@ -1145,6 +1145,191 @@ class TestSchemaStrictness:
             ScopedRuleset.from_dict({"mode": "allow", "allow": ["read"], "deny": ["grep"]})
         assert any("Rule 1" in r.message or "allow beats deny" in r.message for r in caplog.records)
 
+    def test_allow_mode_deny_warning_never_carries_the_pasted_url(self, caplog):
+        """The Rule-1 sibling fires on every boot too, so it must not echo a deny entry."""
+        pasted = "https://user:pass@evil.example/p?api_key=SECRET123"
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ScopedRuleset.from_dict({"mode": "allow", "allow": ["skills.sh"], "deny": [pasted]})
+        warned = [r.getMessage() for r in caplog.records if r.name == "kiro_crew.platform.governance"]
+        assert any("Rule 1: allow beats deny" in m for m in warned), warned
+        for secret in ("user", "pass", "SECRET123", pasted):
+            assert all(secret not in m for m in warned), (secret, warned)
+            assert secret not in caplog.text, secret
+
+    @staticmethod
+    def _host_warnings(caplog, body, *, matcher="host"):
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ScopedRuleset.from_dict(body, matcher=matcher, scope="network.egress")
+        return [r.getMessage() for r in caplog.records if "matcher=host" in r.getMessage()]
+
+    @pytest.mark.parametrize("matcher", sorted(governance._MATCHERS))
+    def test_only_the_host_matcher_warns_on_a_url_shaped_item(self, matcher, caplog):
+        """A URL-shaped entry is dead ONLY under `host`, so only `host` may warn.
+
+        Every other matcher tests an item that legitimately carries a `/`, a
+        path, a command line, an `@server/tool` reference, so warning there
+        would be noise on correct config.
+        """
+        warned = self._host_warnings(
+            caplog, {"mode": MODE_DENY, "deny": ["https://skills.sh/api"]}, matcher=matcher
+        )
+        assert bool(warned) is (matcher == "host"), f"{matcher} warned: {bool(warned)}"
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "skills.sh",
+            "*.skills.sh",
+            "*",
+            "**",
+            "*.*",
+            "localhost",
+            "skills.*",
+            "sub.*.skills.sh",
+            # urlparse reads `?` as a query and finds no host, yet the glob works.
+            "?.skills.sh",
+            # `_splitnetloc` cuts a netloc at `?`, so `_url_host` gives `api`, yet
+            # `apix.skills.sh` matches.
+            "api?.skills.sh",
+            "*.skills?.sh",
+            "foo_bar",
+            "127.0.0.1",
+            "UPPER.CASE.COM",
+            "xn--80ak6aa92e.com",
+            "skills.sh.",
+            # `_match_host` strips, so padding is not a dead entry either.
+            " skills.sh ",
+            "server",
+            "intranet",
+            # A bare IPv6 literal is the item `_url_host` yields for `[::1]`, so it
+            # matches. Its colons are not a port, whatever `rsplit(":")` makes of them.
+            "::1",
+            "2001:db8::1",
+            "fe80::1",
+            "2001:db8:0:0:0:0:0:1",
+            # `_match_host` is fnmatch, so a bracket that is not IPv6 syntax is a
+            # live character class: `[ab].example.com` matches `a.example.com`.
+            "[ab].example.com",
+            "[a-z].example.com",
+            # A colon inside the class does not make it IPv6: `_url_host` finds no
+            # host in `[a:].example.com`, and the class matches `a.example.com`.
+            "[a:].example.com",
+            "[a:b].example.com",
+            "[abc]x.com",
+            "web[0-9][0-9].corp.example",
+            # An unpaired bracket is literal to fnmatch, so the entry matches itself.
+            "a]b.com",
+            "a[b.com",
+            # A glob absorbs the colon: `*:443` matches `fe80::443`, the item
+            # `_url_host` yields for `https://[fe80::443]/x`, so this is no port.
+            "*:443",
+            "web*:443",
+        ],
+    )
+    def test_a_pattern_that_can_match_a_host_does_not_warn(self, pattern, caplog):
+        """The form that WORKS must stay silent, or the warning trains operators to ignore it.
+
+        A known-dead sibling rides along so the case fails if the guard is gone,
+        not only if it over-fires.
+        """
+        warned = self._host_warnings(
+            caplog, {"mode": MODE_DENY, "deny": [pattern, "https://dead.example/x"]}
+        )
+        assert len(warned) == 1 and "deny[1]" in warned[0], warned
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "https://skills.sh/api",
+            "skills.sh/api",
+            "//skills.sh/api",
+            "http://skills.sh",
+            "skills.sh:8080",
+            "localhost:3000",
+            "10.0.0.1:443",
+            # A single-label host does not look like a host to `_url_host`, which
+            # finds none here, yet the entry is just as dead.
+            "server:443",
+            "intranet:8080",
+            "db:5432",
+            "https://user:pass@skills.sh/api",
+            "[::1]",
+            "[::1]:443",
+            "[2001:db8::1]",
+            "https://*.skills.sh/api",
+            "/api/v1",
+            "file:///etc/passwd",
+            "http://",
+            "user:pass@skills.sh",
+            "*://skills.sh",
+            "2001:db8::/32",
+            "https://*",
+            "http://*",
+            "10.0.0.0/8",
+            "192.168.0.0/16",
+        ],
+    )
+    def test_a_dead_entry_is_named_by_position(self, pattern, caplog):
+        warned = self._host_warnings(caplog, {"mode": MODE_DENY, "deny": ["ok.example", pattern]})
+        assert len(warned) == 1, warned
+        assert "'network.egress'" in warned[0]
+        assert "deny[1]" in warned[0]
+
+    @pytest.mark.parametrize(
+        "pattern,secret",
+        [
+            ("https://user:pass@skills.sh/api", "pass"),
+            ("https://skills.sh/api?api_key=SECRET123", "SECRET123"),
+            ("https://hooks.slack.com/services/T0/B0/XXSECRETXX", "XXSECRETXX"),
+            # urlsplit cuts a netloc only at `/`, `?` and `#`, so each of these
+            # survives `_url_host` verbatim.
+            ("https://ghp_AAAABBBBCCCCDDDD\\x.com/p", "ghp_"),
+            ("https://ghp_TOKEN1234\\evil.com", "ghp_"),
+            ("https://abc|ghp_LEAK.com/p", "ghp_"),
+            ("https://a'ghp_LEAK2.com/p", "ghp_"),
+            ("https://ghp_TOK^3.com/p", "ghp_"),
+            ("https://a b.com/p", "a b.com"),
+            ("https://a%40b.com/p", "a%40b.com"),
+            # Every character is host-shaped: the token IS the DNS label.
+            ("https://ghp_" + "A" * 36 + ".example.com/p", "ghp_" + "A" * 36),
+            ("https://github_pat_" + "B" * 40 + ".example.com/p", "github_pat_" + "B" * 40),
+            ("https://sk-ant-" + "C" * 40 + ".example.com/p", "sk-ant-" + "C" * 40),
+        ],
+    )
+    def test_the_warning_never_carries_the_pasted_url(self, pattern, secret, caplog):
+        """A pasted URL carries credentials, and this logs on every boot unredacted."""
+        warned = self._host_warnings(caplog, {"mode": MODE_DENY, "deny": [pattern]})
+        assert len(warned) == 1, warned
+        assert "'network.egress'" in warned[0]
+        assert "deny[0]" in warned[0]
+        # The handler's formatted text, so a secret smuggled via `%s` args is caught too.
+        assert secret not in caplog.text
+
+    @pytest.mark.parametrize(
+        "mode,listed,effect",
+        [
+            (MODE_DENY, "deny", "permits"),
+            (MODE_ALLOW, "allow", "refuses"),
+        ],
+    )
+    def test_only_the_list_the_mode_reads_is_walked(self, mode, listed, effect, caplog):
+        """The engine never reads the other list, so a warning about it is noise.
+
+        The consequence must match the mode: a dead allow refuses what it names,
+        and saying "permits" misdirects an operator debugging an egress outage.
+        """
+        warned = self._host_warnings(
+            caplog,
+            {
+                "mode": mode,
+                "allow": ["https://allowed.example/a"],
+                "deny": ["https://denied.example/a"],
+            },
+        )
+        assert len(warned) == 1, warned
+        assert f"{listed}[0]" in warned[0]
+        assert f"the scope {effect} the host it names" in warned[0]
+
     def test_posture_key_must_be_admitted_member(self):
         # posture for a member not in the members allow-set is rejected.
         with pytest.raises(PlatformCompositionError):
@@ -1951,3 +2136,26 @@ class TestValidateReportsUngovernedCapabilities:
         ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
         out = self._validate(capsys, ceiling)
         assert "UNGOVERNED" not in out
+
+    def test_validate_run_surfaces_a_url_shaped_network_egress_deny_entry(self, capsys, caplog):
+        """The operator's own `policy validate` run must surface the dead entry.
+
+        `validate` reports on the ceiling boot ALREADY resolved, so the finding
+        reaches that run as the parse-time warning, not as stdout: validate
+        re-reads a parsed object and cannot see a pattern that never matched.
+        The line matters because this policy reports OK while denying nothing.
+        """
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ceiling = parse_policy(
+                _policy_body(
+                    network={"egress": {"mode": MODE_DENY, "deny": ["https://skills.sh/api"]}}
+                )
+            )
+            out = self._validate(capsys, ceiling)
+        assert "governed scopes" in out
+        # The entry the operator wrote to block skills.sh does not block it.
+        assert resolve(ceiling, None, "network.egress", "skills.sh").permitted
+        line = next(r.getMessage() for r in caplog.records if "matcher=host" in r.getMessage())
+        assert "'network.egress'" in line
+        assert "deny[0]" in line
+        assert "https://skills.sh/api" not in line

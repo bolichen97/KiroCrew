@@ -127,14 +127,20 @@ export type SlotQueueItem = { content: string; queueId: string; ts: string; kind
 export const workflowText = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 export async function fetchSlotDetail(key: string, limit?: number) {
-  // A limit takes the handler's most-recent-N slice. `undefined` keeps the
-  // unbounded shape, which a STREAMING warm/switch fetch still takes
-  // (deliberate, though the handler collapses before slicing). refreshSlot
-  // replaces the active transcript in place, so it cannot take a FIXED bound
-  // (that would shrink history the user already paged in) — it passes a
-  // COUNT-MATCHED one instead, see REFRESH_LIMIT_CEILING. Omit the arg when
-  // unbounded to keep the one-arg shape.
+  // A limit takes the handler's most-recent-N slice. `undefined` is the
+  // handler's read-everything shape; `refreshSlot` and `switchSlot` no longer
+  // take it -- a window that misses the rows they hold is extended by
+  // `walkWindowBackTo`, one bounded page at a time. `warmSlotCache` and the
+  // pane hydrate still may. Omit the arg when unbounded to keep the one-arg
+  // shape.
   const d = await (limit === undefined ? api.chatSlotDetail(key) : api.chatSlotDetail(key, limit))
+  return normalizeSlotDetail(key, d, limit !== undefined)
+}
+
+/** One slot-detail response in the store's shape. Shared by `fetchSlotDetail`
+ *  and the coverage walk, so a walked page reports its run state, queue and
+ *  context meter exactly as a first page does. */
+export function normalizeSlotDetail(key: string, d: Awaited<ReturnType<typeof api.chatSlotDetail>>, boundedRead: boolean) {
   type QueueItem = string | { content: string; id: string; meta?: unknown }
-  return { key, boundedRead: limit !== undefined, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString(), ...(typeof (q.meta as Record<string, unknown> | undefined)?.kind === 'string' ? { kind: (q.meta as Record<string, unknown>).kind as string } : {}), ...(typeof (q.meta as Record<string, unknown> | undefined)?.appLabel === 'string' ? { appLabel: (q.meta as Record<string, unknown>).appLabel as string } : {}), ...queueEntryAttachments(q.meta) }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
+  return { key, boundedRead, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString(), ...(typeof (q.meta as Record<string, unknown> | undefined)?.kind === 'string' ? { kind: (q.meta as Record<string, unknown>).kind as string } : {}), ...(typeof (q.meta as Record<string, unknown> | undefined)?.appLabel === 'string' ? { appLabel: (q.meta as Record<string, unknown>).appLabel as string } : {}), ...queueEntryAttachments(q.meta) }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
 }

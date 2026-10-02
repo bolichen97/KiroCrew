@@ -802,9 +802,13 @@ class InstancesConfig:
         metadata=_meta(
             "Max Recovery Attempts",
             "Consecutive self-heal attempts before a dropped tunnel is left "
-            "disconnected. With the capped-exponential backoff, the default 8 spans a "
-            "~2 min recovery window, enough to outlast a transient drop (screen lock, "
-            "proxy warmup) before giving up.",
+            "disconnected. A rebuild that fails outright spans a ~2 min window "
+            "under the capped-exponential backoff (enough to outlast a transient "
+            "drop such as a screen lock or proxy warmup); a forward that re-binds "
+            "but whose far end stays dead additionally spends one probe window per "
+            "attempt (probe_failure_threshold x probe_interval), so handoff to "
+            "diagnosis takes roughly attempts x (90s + backoff) ~= 16 min at the "
+            "default 8. Size this against the longer window.",
         ),
     )
     recover_backoff_max_secs: float = field(

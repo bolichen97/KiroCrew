@@ -231,7 +231,7 @@ describe('scroll shell: extraction wiring (the seams the split created)', () => 
   it('page threads the controller wiring onto the shell call', () => {
     // The import IS the extraction: its deletion is the "silently undone"
     // mutation, and a collection failure alone names no pin.
-    expect(SRC).toContain("import TranscriptScrollShell from './chat/TranscriptScrollShell'")
+    expect(SRC).toContain("import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScrollShell'")
     expect(SRC).toContain('scrollerRef={scrollerRef}')
     expect(SRC).toContain('virt={virt}')
     // Two consumers thread loadingOlder (the pinned-banner row props and the
@@ -261,6 +261,9 @@ describe('scroll shell: floating dock and jump pill', () => {
     // The pill's own markup (geometry, classes, catalog label) is pinned by
     // the ChatScrollChrome consumers' suites; what belongs to THIS page is the
     // visibility gate and the controller wiring.
-    expect(SRC).toContain('<JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />')
+    // `jumpPillVisible` IS that gate; dockClearance pins its definition and that
+    // the pill is an in-flow row of the dock (`placement="inline"`), not a float.
+    expect(SRC).toContain('const jumpPillVisible = !isAtBottom && messages.length > 0')
+    expect(SRC).toContain('<JumpToBottomButton visible={jumpPillVisible} onClick={() => scrollBottom(true)} placement="inline" />')
   })
 })

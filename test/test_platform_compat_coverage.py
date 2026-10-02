@@ -25,6 +25,7 @@ import errno
 import io
 import logging
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -436,7 +437,7 @@ class TestWindowsLocking:
         lock = tmp_path / "timeout.lock"
         lock.write_text("")
         with open(lock, "r+") as handle:
-            with pytest.raises(OSError, match=r"within 2\.5s"):
+            with pytest.raises(OSError, match=r"limit 2\.5s"):
                 with pc.file_lock(handle.fileno(), timeout=2.5):
                     pytest.fail("body must not run without the lock")
 
@@ -1461,19 +1462,50 @@ class TestRmtreeForce:
         victim = tmp_path / "ro.txt"
         victim.write_text("x")
         victim.chmod(0o444)
-        removed: list[str] = []
-        pc._clear_readonly_and_retry(removed.append, str(victim), OSError("denied"))
-        assert removed == [str(victim)]
+        pc._clear_readonly_and_retry(os.unlink, str(victim), OSError("denied"))
+        assert not victim.exists()
 
     def test_readonly_hook_warns_when_the_retry_also_fails(self, tmp_path, caplog):
-        def _boom(_path: str) -> None:
-            raise OSError("still denied")
-
         victim = tmp_path / "ro.txt"
         victim.write_text("x")
         with caplog.at_level(logging.WARNING, logger=pc.logger.name):
-            pc._clear_readonly_and_retry(_boom, str(victim), OSError("denied"))
+            # rmdir on a file fails again on every platform.
+            pc._clear_readonly_and_retry(os.rmdir, str(victim), OSError("denied"))
         assert any("Cannot remove" in r.getMessage() for r in caplog.records)
+
+    def test_readonly_hook_does_not_retry_a_failed_open_or_listing(self, tmp_path, caplog):
+        # rmtree reports a directory it could not open with func=os.open, which
+        # takes more than a path: a blind retry raised TypeError out of the hook.
+        directory = tmp_path / "locked"
+        directory.mkdir()
+        with caplog.at_level(logging.WARNING, logger=pc.logger.name):
+            for func in (os.open, os.close, os.scandir, os.lstat):
+                pc._clear_readonly_and_retry(func, str(directory), OSError("denied"))
+        assert directory.is_dir()
+        assert sum("Cannot remove" in r.getMessage() for r in caplog.records) == 4
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks and modes")
+    def test_readonly_hook_never_chmods_through_a_link_on_posix(self, tmp_path):
+        # rmtree hands the hook the failing entry's path; an agent-written tree
+        # can make that a symlink to any file this process can reach.
+        victim = tmp_path / "victim"
+        victim.write_text("x")
+        victim.chmod(0o640)
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+
+        # rmdir on a symlink fails, so only the hook's own handling is observed.
+        pc._clear_readonly_and_retry(os.rmdir, str(link), OSError("denied"))
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o640
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_readonly_hook_leaves_a_failed_directory_listable_on_posix(self, tmp_path):
+        directory = tmp_path / "busy"
+        directory.mkdir(mode=0o700)
+        (directory / "held").write_text("x")
+        pc._clear_readonly_and_retry(os.rmdir, str(directory), OSError("not empty"))
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert [p.name for p in directory.iterdir()] == ["held"]
 
 
 class TestLinkHelpers:

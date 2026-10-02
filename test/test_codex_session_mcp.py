@@ -1573,10 +1573,14 @@ def drive(element):
             if isinstance(msg.get("id"), int):
                 got[msg["id"]] = msg
         if 2 in got and "result" in got[2]:
-            # The child MCP server is launched and queried after session/new answers.
+            # The child MCP server is launched and tools/list is queried after session/new answers.
             for _ in range(120):
-                if os.path.exists(report):
-                    break
+                try:
+                    with open(report) as f:
+                        if "tools/list" in json.load(f).get("methods", []):
+                            break
+                except (OSError, ValueError):
+                    pass
                 time.sleep(0.25)
         return got.get(1) or {}, got.get(2) or {}
     finally:

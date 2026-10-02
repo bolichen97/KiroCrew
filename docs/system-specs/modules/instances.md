@@ -258,18 +258,46 @@ strip.
    token and cold-boots the remote SPA, so from the user's seat an eviction is
    hard to tell apart from a dropped connection — which is why the default
    tracks the registry rather than a fixed number.
-3. **Health probe.** While CONNECTED, a per-tunnel loop polls the loopback
-   forward every `DEFAULT_PROBE_INTERVAL_SECS` (30s, not user-configurable;
-   `<= 0` disables the probe); after `probe_failure_threshold` (3) *consecutive*
-   failures the child is terminated so recovery fires. This is what catches a
-   tunnel that is alive but no longer forwarding.
+3. **Health probe.** While CONNECTED, a per-tunnel loop probes the forward
+   **end-to-end** every `DEFAULT_PROBE_INTERVAL_SECS` (30s, not user-configurable;
+   `<= 0` disables the probe): a `GET` at the transport's own unauthenticated
+   liveness path through the local forward that must return a completed HTTP
+   response within `DEFAULT_PROBE_HEALTH_TIMEOUT_SECS` (4s). Any status line
+   counts as alive — a status code proves bytes traversed to the far end and
+   back — so the code itself is not inspected. The path is the far end's: a
+   gateway forward answers `/api/health` credential-free, and a fargate crew's
+   container answers `FARGATE_HEALTH_PATH` (`/health`); the probe picks the
+   fargate path when `turn_url` is set. It matters that the path is the far
+   end's own liveness route rather than a fixed one, because the fargate
+   container authorises before it routes and would emit a `control` deny record
+   for every probe aimed at a path it does not serve. Only a timeout or
+   connection error (no response) fails a probe; after `probe_failure_threshold`
+   (3) *consecutive* failures the child is terminated so recovery fires. A
+   successful probe also clears the self-heal attempt counter (§4). A bare TCP
+   connect (`_port_reachable`, used only by the readiness wait) is deliberately
+   **not** enough here: for an SSM forward the process accepting the connect is
+   `session-manager-plugin` on loopback, which a zombie forward keeps bound
+   while relaying nothing, so a connect-only probe passes forever on the very
+   stall this catches — a tunnel that is alive but no longer forwarding.
 4. **2-tier self-heal.** On unexpected child exit: **Tier 1** rebuilds the tunnel
    reusing the existing token; **Tier 2** re-mints the token over SSH and then
    rebuilds. Capped at `max_recovery_attempts` (8) consecutive attempts with a
    capped-exponential backoff (`recover_backoff_max_secs`, 30s; the wait grows
-   1, 2, 4, 8, 16 then holds at the cap), which spans roughly a two-minute
-   window: long enough to outlast a transient drop (screen lock, proxy warmup).
-   The counter resets on a successful rebuild or a successful `connect()`. A
+   1, 2, 4, 8, 16 then holds at the cap). A rebuild that fails outright spends
+   only that backoff — roughly a two-minute window, long enough to outlast a
+   transient drop (screen lock, proxy warmup). A dead-far-end forward that
+   re-binds but never answers additionally spends one probe window per attempt
+   (`probe_failure_threshold` x `probe_interval`, 3 x 30s = 90s), so its handoff
+   to diagnosis takes `attempts x (90s + backoff)` ~= 16 minutes at the
+   defaults.
+   The counter resets when the steady-state probe answers end-to-end (proving
+   the forward reaches its far end), or on a successful `connect()` — a rebuild
+   that only re-binds the local port while the far end stays dead (a forward
+   whose remote gateway is down) does NOT reset it, so recovery reaches the cap
+   and hands off to diagnosis instead of respawning a healthy-looking forward
+   every interval. Because the reset is driven by an observed live probe rather
+   than by the bind-only rebuild, a single slow probe right after a rebuild
+   cannot ratchet the budget down permanently: the next good probe clears it. A
    successful rebuild records the replacement child's `local_port` alongside its
    `forwarder_pid` / `forwarder_start` / `forwarder_sig` in one write — the same
    field set `connect()` persists. A rebuild takes its port from the live
@@ -307,6 +335,19 @@ delay the bind past the desktop app's gateway-wait window. A failed revive leave
 `was_connected` true and records the failure reason, so the entry persists showing
 why it is down.
 
+**The same supervisor without a gateway: `kirocrew desktop tunnel`.** The desktop
+app's client-only mode runs no local gateway, so nothing above is running there,
+yet its window reaches a remote crew through exactly this kind of forward.
+`instances/tunnel_keeper.py` runs `_SshTunnel` (readiness wait, zombie probe, exit
+classification) and `_recover_backoff_secs` on their own, for one fixed port pair,
+and the desktop app spawns it when a crew's `remoteHosts` entry carries
+`manageTunnel: true`. It deliberately takes none of the manager's registry, token
+minting or hop leases: the app fetches its own token over SSH. A connect resets the
+backoff, so a laptop waking from sleep reconnects within seconds, and the app also
+bounces the keeper on the OS resume event. It stops, always, when stdin
+closes, so the forward cannot outlive the app. Windows is not offered, for the same
+reason the ssh transport above is not.
+
 ---
 
 ## 5. Configuration
@@ -336,8 +377,9 @@ kirocrew config set instances.connect_timeout_secs 45
 kirocrew config set instances.mint_timeout_secs 60
 ```
 
-Constants that are **not** user-configurable: the probe interval (30s), the token
-refresh fraction (0.8), and the stored-token probe timeout (2s).
+Constants that are **not** user-configurable: the probe interval (30s), the
+end-to-end health-probe timeout (`DEFAULT_PROBE_HEALTH_TIMEOUT_SECS`, 4s), the
+token refresh fraction (0.8), and the stored-token probe timeout (2s).
 
 **Which of these a config write reaches (`SshTunnelManager.apply_config`).** The
 manager registers `live.watch_section(self, "instances", method="apply_config",
@@ -857,6 +899,22 @@ relies on and turn a working setup into `Bad configuration option`.
 The diagnostics probes are a different case and are left alone: they are
 one-shot commands whose exit status is the whole result, with no forward to own.
 
+**An inherited `ProxyCommand` runs under the ssh child's `PATH`.** A
+GUI-launched desktop-app gateway has launchd's minimal `PATH`, and the proxies in
+real use look a tool up by name (an SSM connect helper that execs
+`session-manager-plugin`, `sh -c "aws ssm start-session ..."` needs `aws`), so
+every ssh child failed with `ssh exited 255: Error: session-manager-plugin is not
+installed` while the plugin sat in `/usr/local/bin`. Every ssh spawn — tunnel,
+token mint, `restart_remote`, the diagnostics probes — therefore goes through
+`token_mint.ssh_spawn_argv_env`: the `ssh` head is resolved against the inherited
+`PATH` only, and the child gets `deploy.engine.tool_spawn_env`, the same env the
+SSM transport's `aws` child gets. That helper APPENDS the well-known install dirs
+(`/opt/homebrew/bin`, `/usr/local/bin`) and withholds them for a bare head, so
+the inherited `PATH` keeps first claim on every name and an `ssh` found only in
+those dirs is never exec'd. When the proxy still cannot find its program, the
+tunnel and mint errors say so and name the `PATH` the child was given, instead of
+the "connection closed" that ssh prints afterwards reading as a network drop.
+
 ### Dev host / home server (primary)
 
 Use your SSH config alias or `user@hostname`. As long as a key in your
@@ -1013,7 +1071,7 @@ whose current variable parts are all charset-bound literals.
 | Connect fails with an SSH auth error | Refresh your SSH credentials (re-add the key to `ssh-agent`); `BatchMode` never prompts, so a missing credential is an immediate failure. Tunnels self-heal once auth is restored. |
 | Connect fails for another reason | Use **Diagnose**. The ladder reports the first broken link: `ssh_unreachable` (check SSH access or the host alias), `remote_down` (remote gateway not listening), `not_connected` (SSH and remote are fine, this instance has no tunnel yet: click Connect), or `tunnel_down` (reconnect). |
 | "local port N was taken while connecting" | The allocator picked a port that something grabbed in the moment before `ssh` bound it. Retry. If it persists, stop whatever keeps taking ports in that range or move `instances.tunnel_base_port` to a quieter one. |
-| Instance keeps dropping | The health probe plus 2-tier self-heal retry over roughly a two-minute window (8 attempts, capped-exponential backoff). Tune `instances.max_recovery_attempts` / `recover_backoff_max_secs` / `probe_failure_threshold`; both recovery values are clamped so they cannot loop indefinitely. If self-heal gives up, diagnosis runs automatically. Check the remote gateway and SSH stability. |
+| Instance keeps dropping | The health probe plus 2-tier self-heal retry: a rebuild that fails outright spans roughly a two-minute window (8 attempts, capped-exponential backoff), while a forward that re-binds but whose far end stays dead additionally spends one probe window per attempt (`probe_failure_threshold` x `probe_interval`, 3 x 30s), so handoff to diagnosis takes `attempts x (90s + backoff)` ~= 16 minutes at the defaults. Tune `instances.max_recovery_attempts` / `recover_backoff_max_secs` / `probe_failure_threshold`; both recovery values are clamped so they cannot loop indefinitely. If self-heal gives up, diagnosis runs automatically. Check the remote gateway and SSH stability. |
 | A pane vanished from the warm set but its switcher entry is still there | It was LRU-evicted (warm set full). The tunnel is untouched: selecting the crew re-warms it, though the re-mint plus SPA cold boot makes that look like a reconnect. Only an explicit `instances.warm_set_cap`, or a fleet past the automatic ceiling (`WARM_SET_CAP_AUTO_CEILING`), can now be below the number of registered crews — set it to `0` to let the cap track the registry. |
 | Every token mint fails on one remote, though its gateway is healthy | The remote's `~/.local/bin/kirocrew` probably points at an uninstalled checkout. See §12: the run-marker is what makes mint follow the *running* gateway's install. |
 
@@ -1210,10 +1268,14 @@ spelling in that set reaches this same gateway. What it never does is move a
 CREDENTIAL: a navigation carrying `?token=` is served where it was addressed
 rather than redirected, because a 302 preserves the query. That gate does not
 depend on which families are bound, which is why it holds even when the second
-bind degraded. Callers
-that resolve a port and nothing finer
-(`config/loader.py`, `mcp_core.py`, `cron_script.py`, the container runtime) still
-read the port-keyed file, which is why it stays published.
+bind degraded. A caller that names the loopback ADDRESS it dials reads the
+address-keyed entry and refuses when the family that address reaches is uncovered
+(`config/loader.read_local_secret(port, dial_host=...)`, mirroring the app's
+`listenerSecretsFor`); it falls back to the port-keyed file only for a gateway that
+published NO listener entry for the port at all -- an older gateway, or one that
+could not name its bound address -- because there is then no other listener's
+credential to be confused with. The container runtime, which resolves a port and
+nothing finer, still reads the port-keyed file, which is why it stays published.
 
 The credential is generated per gateway start (`os.urandom(16).hex()`) and kept in
 memory as the value the auth middleware compares against, so it identifies ONE
@@ -1245,22 +1307,50 @@ Two rules keep the two halves paired:
   credential under a guessed address.
 - **The reader** is ONE shared helper, `config.loader.read_local_secret(port)`: it
   returns the credential for the port the caller is about to dial and falls back to
-  `.local_secret` when no per-port file exists. It lives there rather than in each
-  reader because every surface that implements its own read reintroduces the bug for
-  itself. **`port` is required.** An optional port would resolve the dial target from
-  process context, so a converted call site could read the credential for one gateway
-  while dialing another -- the same desync, reintroduced one call site at a time and
-  invisible in the hunk under review. A caller with no port resolves one explicitly
-  and passes it, where the choice is reviewable. `mcp_core`, `mcp_shared`,
-  `cron_script`, `computer_use/screencast` and the Sage review driver each name their
-  dial target; a test greps for a no-argument call so the shape cannot come back.
+  `.local_secret` when no per-port file exists. It takes an optional `dial_host`, the
+  loopback address the caller is about to send the credential to. When a caller names
+  it, the read is per LISTENER (`run_marker.read_listener_secret`, the Python twin of
+  the app's `listenerSecretsFor`): every loopback family that host reaches must be
+  covered by an entry carrying one shared secret, and the helper FAILS CLOSED --
+  returning `""` with no port-keyed fallback -- when listener entries exist for the
+  port but none covers the dialed family, because that fallback would hand the
+  credential to whatever else holds the address. It falls back to the port-keyed read
+  only when the gateway PROVABLY published NO listener entry for the port at all (a
+  pre-per-listener gateway), where nothing else claims the port;
+  `run_marker.has_listener_entries` is three-valued for exactly this and its `None`
+  (an enumeration error, absence unproven) fails closed like a covered-but-uncovered
+  `True`, never re-opening the fallback over an unreadable `run/`. A caller with no
+  `dial_host` keeps the port-keyed-then-shared read. It lives there rather than in
+  each reader because every surface that implements its own read reintroduces the bug
+  for itself. **`port` is required.** An optional port would resolve the dial target
+  from process context, so a converted call site could read the credential for one
+  gateway while dialing another -- the same desync, reintroduced one call site at a
+  time and invisible in the hunk under review. A caller with no port resolves one
+  explicitly and passes it, where the choice is reviewable. Each TCP-loopback caller
+  names the IPv4 loopback LITERAL (`127.0.0.1`) as its `dial_host` -- `cli_server`
+  (`_CLI_LOOPBACK`), `mcp_core` (derived from the base it dials), `mcp_shared`,
+  `mcp_cron`, `cron_script`, `cron_trigger`, `computer_use/screencast`, `cli_commands`
+  and the Sage review driver -- and dials that same literal in its URL, NOT the
+  ambiguous `localhost`. A literal reaches ONE family, so a gateway that bound only v4,
+  or a wildcard/container bind (`0.0.0.0`) that publishes a single v4-family entry,
+  still authenticates; the ambiguous name would demand BOTH families and refuse such
+  an ordinary single-family deployment even though the dial reaches that very gateway.
+  `app_lifecycle_client` is the one caller that passes NO `dial_host`: its request
+  travels the owner-only UNIX SOCKET, not TCP loopback, so the credential is not paired
+  to a dialed TCP address and a listener lookup would wrongly fail closed on a bind
+  with no v4 counterpart, silently dropping an uninstall to its file-only path while
+  the backend keeps running. A test greps for a no-argument call so an ambient-port
+  shape cannot come back.
 - **The dialed port's own credential outranks any path a caller names.**
-  `cron_trigger.trigger_cron_job` reads the per-port credential for the port it posts
-  to FIRST, and falls back to the `secret_path` its caller named only when that is
-  absent. The order is deliberate and is dictated by the callers: both of them pass
-  `config_dir() / ".local_secret"`, the home-wide file, which is exactly the file a
-  second gateway generation replaces -- so preferring the named path would reinstate
-  the defect this module exists to prevent.
+  `cron_trigger.trigger_cron_job` resolves the credential for the IPv4 loopback
+  listener it posts to FIRST (`run_marker.read_listener_secret`, refusing outright
+  when listener entries exist for the port but none covers that address), then the
+  port-keyed read for a gateway that published none, and only then the `secret_path`
+  its caller named. It does its OWN resolution rather than calling `read_local_secret`
+  because that helper's tail is the home-wide `.local_secret`, and the named path must
+  outrank that file: both callers pass `config_dir() / ".local_secret"`, which is
+  exactly the file a second gateway generation replaces, so preferring it over the
+  named path would reinstate the defect this module exists to prevent.
   The cost of that order, stated rather than hidden: a crash-orphaned
   `run/gateway-<port>.secret` (the prune never deletes credentials, see section 12)
   is preferred over a correct named path, so a caller that genuinely names another
@@ -1584,8 +1674,12 @@ was unreachable (the peer's own `code` is forwarded). After assembly, the sender
 passes the exact validated chain keys that produced the bundle to
 `ConversationLog.publication_hold` immediately before the tunnel POST. Any
 membership change is retryable as `503 transfer_snapshot_unstable`. The hold
-ends before that awaited call, so it never blocks the event loop; the transmit
-itself is the accepted residual window.
+ends before that awaited call, so it never blocks the event loop. Serialising a
+large bundle to its upload file takes long enough for the line to tighten
+meanwhile, so `send_session_bundle` runs the same revalidation again (its
+`recheck` hook, off the loop) after each serialisation and immediately before
+the request; a line tightened there is the same `400` / `503`, with nothing
+sent. The transmit itself is the accepted residual window.
 
 **`send-session` is NOT a third token-crossing route.** §6's invariant holds:
 `connect` and `refresh-token` remain the only two routes whose response carries a
@@ -1614,9 +1708,15 @@ re-reads, so:
 - reaching `/api/chat/slots/import` requires a valid dashboard credential, which
   in practice means a token this hub minted on that host — a peer cannot push a
   session into an instance it has no credential for;
-- bundles are size-bounded before anything is written (5,000 messages, 1 MB per
-  message, 20 MB of content total) and every message's role is checked against
-  `user`/`assistant`;
+- the body is **streamed to disk** on arrival and never held in memory
+  (`_read_bundle_body`), so a session of any size is copied rather than refused —
+  the owner's decision that a transfer is never blocked by size. Validation is
+  STRUCTURAL only (version, that `messages` is a non-empty array of
+  `{role, content}` objects, field types); there is no message-count, per-message
+  or total-content ceiling, and no byte ceiling either. The host's own resources
+  bound an arrival instead: the disk headroom stops the write, and the memory
+  admission gates the parse;
+- every message's role is checked against `user`/`assistant`;
 - assistant content is credential- and exfiltration-redacted on the way in,
   matching the fork path. User turns are left verbatim: redacting what the human
   typed would corrupt their own words;
@@ -1642,42 +1742,126 @@ is unchanged on purpose: the sender is an independently-updated install, so a
 receiver that started demanding compression would refuse every peer that has not
 shipped this yet.
 
-A compressed upload is an amplifier, so the expansion is bounded **while it is
-being produced** rather than measured afterwards — `_gunzip_bounded` decompresses
-in chunks and refuses at `_MAX_DECOMPRESSED_BYTES`, holding at most one chunk
-past the cap.
+**The body streams to disk; it is never held in memory.** The raw body is
+written to a temp file under the crew home a chunk at a time
+(`_stream_request_to_file`), a gzip body is stream-decompressed to a second temp
+file (`_gunzip_file`), and only the parse loads the document. Reading
+`request.content` rather than `request.read()` is deliberate: `request.read()` /
+`.post()` / `.json()` buffer the whole body and are the calls aiohttp enforces
+`client_max_size` in, so reading the raw stream bypasses that limit — exactly as
+the streaming multipart upload in `handlers/files.py` streams past the same limit
+under its own bound. A session of any size therefore arrives rather than being
+refused, and memory is bounded by the disk write, not by the body's size.
 
-What makes that ceiling safe is the comparison to the gateway's own body limit,
-not the arithmetic behind it. `client_max_size` is 60 MiB and applies to every
-body, compressed or not, so the PLAIN path can never deliver more than that much
-JSON; the ceiling sits above it, which means the gzip path accepts strictly more
-than the plain path can and a body it refuses is one the plain path refuses too.
-The magnitude is taken from §14.5's own ceilings
-(`_MAX_TOTAL_CHARS + _MAX_LAYER_B_CHARS` plus a structural allowance) so the
-number moves with them, but it is deliberately NOT the worst-case ENCODED width:
-those ceilings count CHARACTERS and `ensure_ascii` renders one non-ASCII
-character as six bytes, so sizing for that case would admit a ~360 MB allocation
-on an authenticated write route to accommodate a bundle `client_max_size` already
-refuses.
+**Staging files are reclaimed.** Every import and export temp file lives in
+`data_home()/tmp/session-{import,export}` and is removed in `finally` by the
+transfer that made it. A crash or kill skips that, so the first use of each
+directory in a gateway process removes its direct-child regular files older than
+the process (`_sweep_orphaned_staging`); symlinks and subdirectories are never
+followed or removed. Without it, orphans would count against the disk headroom
+and the disk gate would refuse imports the volume could hold.
 
-The per-body ceiling bounds ONE request; the sum across concurrent requests is
-what reaches a host, so expansion is also ADMITTED rather than merely started.
-`_expansion_admission` caps how many bodies expand at once and keeps a short
-queue in front; anything past the queue answers `429 transfer_expansion_busy`
+**Layer B is validated one record at a time.** Its JSONL records sit inside one
+JSON string, so the memory admission cannot count them; `_events_jsonl_is_loadable`
+walks the string by index instead of splitting it, keeping one record alive.
+
+**There is no size wall, operator-set or otherwise.** A byte ceiling would bound
+the disk and the memory an arrival uses, and both are bounded directly (the disk
+headroom and the memory admission below), so a ceiling would only refuse
+sessions the host can hold. The body is not read through `client_max_size`, so
+there is no comparison against it either.
+
+The per-body streaming bounds the ARRIVAL; the sum across concurrent arrivals is
+what reaches a host, so an arrival is also ADMITTED rather than merely started.
+`_expansion_admission` caps how many bundles are resident at once and keeps a
+short queue in front; anything past the queue answers `429 transfer_expansion_busy`
 immediately rather than parking, because a queue that grows without limit is the
 same failure with a delay in front of it.
 
-A permit is held for the whole ARRIVAL, not for the decompression: it is entered
-on an `AsyncExitStack` the handler owns, which is why the arrival is a separate
-function from the route. What has to be bounded is how many decompressed bundles
-are RESIDENT at once, and a bundle is resident — first as bytes, then as the
-parsed document — through validation, redaction and persistence. A permit ending
-at the gunzip would bound the CPU of expansion while leaving that count
-unbounded, which is the sum the admission exists to bound; the cost is
-throughput, since concurrent importers now reach the queue sooner. The plain-JSON
-path takes no permit: it is bounded by the Application's own `client_max_size`
-(60 MiB) and is not amplified, so a peer posting uncompressed cannot be refused
-with `429` by a busy host.
+The upload itself runs before that permit, so a slow sender never holds it, but
+each upload holds a staging-file descriptor while it streams. `_upload_admission`
+caps how many bodies stream at once (`_MAX_CONCURRENT_UPLOADS`); it is taken
+before the staging file is opened, released when the stream ends, and past it an
+upload answers `429 transfer_uploads_busy` with no file opened.
+
+Validation and the receive-side row build run in worker threads, and only the
+newest `_IMPORT_WINDOW` (500) rows are hydrated into the slot, the same window a
+session opened from History gets. The older rows are written straight to the
+transcript as its frozen prefix just before the durable save, which carries them
+verbatim, so every row lands on disk exactly once and neither the slot's
+in-memory cap (`_MAX_SLOT_MESSAGES`) nor the hydration cost depends on the
+session's length. Each row's `meta.mid` and `ts` are minted once, before the
+split, so the prefix and the window agree on identity. The prefix is written one
+row at a time into a staged file that is renamed into place, never joined in
+memory. A save that fails removes the prefix file, and a cancelled import
+abandons it: the writer's thread outlives the task, so the worker marks the
+file published after its rename and the cancellation arm marks the import
+abandoned, each reading the other's flag in the same step, and whichever comes
+second removes the file. The lock covers only those two flags, never the rename
+or its retry sleeps, so the event loop never waits on the worker. The durable
+save that follows runs as a shielded future for the same reason: its worker
+cannot be stopped and reads the prefix back as it writes, so a cancellation
+that lands during it removes nothing until the save finishes, then removes the
+transcript it wrote. A gateway that exits before that save finishes can still
+leave the transcript behind; that residual is accepted.
+
+The permit is held from the moment the body is on disk to the end of the
+ARRIVAL: it is entered on an `AsyncExitStack` the handler owns, which is why the
+arrival is a separate function from the route. What has to be bounded is how many
+parsed bundles are resident at once — a bundle is resident through validation,
+redaction and persistence. The upload itself is NOT under the permit: it holds
+one chunk of memory however large or slow it is, so a sender trickling a byte at
+a time must not occupy a permit every other import waits on. The temp files are
+removed as soon as the document is parsed: it is the parsed bundle that must be
+bounded, not the bytes on disk.
+
+**A sender that goes quiet is cut off.** The body read has no total deadline,
+because a body has no size ceiling, but a no-progress one
+(`_stalling_chunks`): every chunk that arrives moves it
+`DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS` ahead, the same rule the sending side's
+upload follows, and a lapse answers `400 transfer_body_unreadable` and removes
+the temp file.
+
+**The disk write stops before the volume fills.** A small gzip body can expand
+to anything once there is no ceiling, so the raw stream and the decompression
+both re-read the volume's free space every `_DISK_CHECK_EVERY_CHUNKS` chunks
+(4 MiB) and stop once it is down to `_DISK_HEADROOM_BYTES` (1 GiB), answering
+`507 transfer_disk_full`; nothing is imported and the temp files are removed. A
+volume whose free space cannot be read is not gated. The temp files are created
+in a worker (`_new_import_temp`), never on the loop.
+
+**The parse is admitted by memory, and waits rather than refuses.** With no size
+ceiling, what keeps a large import from exhausting the gateway is
+`_memory_admission`: before the document is parsed it reserves a text factor
+times the document's size on disk, plus
+`_PER_VALUE_BYTES` (96) for every JSON value the parse can build and
+`_PER_MESSAGE_BYTES` (1 KiB) per message, since a document of many small values
+costs far more in objects than in text (an array of empty objects is about 24
+times its size). The factor follows the document's widest character, because
+CPython stores a whole string at the width of its widest one: `_parse_factor`
+is the decoded text's width plus twice the parsed strings' width, at least
+`_PARSE_MEMORY_FACTOR` (3). ASCII is 3, one CJK character 5 or 6, one emoji 9
+(escaped) or 12 (raw); measured peaks are 2.05, 4.75, 7.25 and 8.0. All three
+figures are read off the file a chunk at a time by `_measure_document`: messages
+by their `"role"` key, the widths by UTF-8 lead bytes and `\u` escapes, values by
+the `{` `[` `,` `:` bytes outside strings, one of which precedes every value but
+the outermost (escapes are dropped and string contents cut out first, so a
+code-dense transcript or an embedded log reserves nothing for the marks in its
+text). It is admitted
+only once the available memory, less what other admitted imports have reserved
+and a fixed headroom, covers it. Both memory readings are the host's clamped to
+the gateway's own cgroup (`_gateway_memory`): the tightest `memory.max` on its
+ancestry and the headroom under it, the walk subagent sizing uses, so a gateway in
+a memory-limited unit or container is budgeted against that limit, not the host. Short of that it WAITS, re-reading every
+`_MEMORY_POLL_SECS`, so a large session imports late rather than not at all, and
+two large imports run one after the other. It refuses only when waiting cannot
+help: the estimate is larger than the host's total memory (`413
+transfer_bundle_too_large`, naming both figures), or nothing was freed within
+`SESSION_IMPORT_MEMORY_WAIT_SECS` (`429 transfer_expansion_busy`, retryable). A
+host whose memory cannot be read is not gated. The reservation spans the whole
+arrival, on the same stack as the permit. The parse decodes text as it reads, so
+the raw bytes are never resident beside the document, and the arrival drops the
+raw document once validated and the Layer B text once written.
 
 A corrupt or truncated stream answers `transfer_invalid_gzip`, distinct from
 `transfer_invalid_json`, because "your file did not survive the trip" and "your
@@ -1962,12 +2146,11 @@ CHANNEL-LINKED slot named by an app token — all three answer the same code,
 because a distinguishable 403 would let an app enumerate slots, or learn which of
 its own slots carry a channel link, across the isolation boundary (CWE-204);
 `400` an incognito or
-temporary session (`export_slot_not_persistent`), one with no visible messages
-(`export_bundle_empty`), or one whose bundle the importer itself would refuse
-(`export_bundle_rejected`, carrying the importer's own code); `503` no consistent
+temporary session (`export_slot_not_persistent`) or one with no visible messages
+(`export_bundle_empty`); `503` no consistent
 view of the transcript could be taken (`export_snapshot_unstable`, retryable);
 `500` any other assembly failure (`export_failed`). SEL-audited as
-`chat.slot_export`.
+`chat.slot_export`. There is no size refusal: a session of any size exports.
 
 **Owning the slot is not owning the transcript.** A channel-linked slot displays a
 conversation that lives on the channel's own session, and `get_or_create_slot`
@@ -1978,14 +2161,39 @@ slot rather than the handler reasoning about the binding — fail closed, becaus
 the cost of being wrong is a foreign conversation leaving the app sandbox. The
 dashboard owner is unaffected, being entitled to both.
 
-**A producer never emits a document its own reader would refuse.** Before
-compressing, the handler runs the bundle through `_validate_bundle` — the
-importer's own validator — and refuses the export if it would be rejected. The
-bounds (5,000 messages, 1 MB per message, 20 MB of content) are therefore
-consulted rather than restated, so the producer and the reader cannot drift apart.
-Only the VERDICT is used: the validated payload is discarded, because validation
-rebuilds a normalised allowlist that would strip the optional keys the export adds
-on purpose.
+**Export is never blocked by size.** There is no producer-side reject preflight:
+a session of any size exports, carrying the FULL conversation and (when the
+operator opted in) the FULL Layer B. The old "refuse a bundle the importer would
+reject" gate is gone, because the importer no longer refuses on size either — the
+two halves agree by both dropping the ceiling, not by consulting one shared bound.
+The only structural refusals left are an empty transcript (`export_bundle_empty`)
+and the non-persistent/ownership guards above.
+
+**Egress streams; the document is never encoded in memory.** `_read_layer_b`
+copies the event log to a private snapshot under the crew home, validating each
+record as it copies, and the bundle carries it as `LayerBEvents` rather than as
+text. `write_bundle_json` then writes the wire document a message at a time and
+streams the log out of the snapshot, byte-for-byte what
+`json.dumps(bundle, separators=(",", ":"))` produces, so every importer reads it
+unchanged. The file export writes the gzip to a temp file (`_stage_export`) and sends it
+from there (`_StagedExport`, a `FileResponse` that removes the file once the send
+ends), so neither the document nor its compressed form is resident; the tunnel send (`send_session_bundle(..., serialise=...)`)
+uploads a plain-JSON temp file, re-serialised per attempt. `release_bundle_files`
+removes the snapshot on every exit, including a discarded snapshot retry. The
+send's timeout bounds each connect and read, not the whole request, and its read
+budget outlasts the importer's memory wait. The peer's reply is read under
+`SESSION_TRANSFER_REPLY_MAX_BYTES` (256 KiB) before it is decoded, since with no
+total timeout nothing else bounds it; a longer or non-JSON reply reads as `{}`. The upload itself carries a
+no-progress deadline instead (`_upload_chunks`): each chunk aiohttp pulls moves it
+`DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS` ahead, so a peer that stops reading ends
+the transfer, and it is cleared once the body is sent.
+
+**An older peer still refuses on size, and the send falls back.** A receiver on
+an earlier release enforces the ceilings this side dropped and answers
+`transfer_layer_b_too_large` or `transfer_bundle_too_large`. That session used to
+arrive transcript-only, because the sender trimmed Layer B itself, so
+`send_session_bundle` resends once without Layer B and the peer answers `prefix`
+("Sent (transcript only)"). A bundle with no Layer B to drop is refused as it was.
 
 Three properties worth stating because they are easy to lose:
 
@@ -2271,6 +2479,16 @@ differs lives on the manager, not in the child.
 - **`restart_remote` refuses.** Nothing runs `kirocrew` on the task, so the call
   returns `{"ok": False, ...}` before any command is built and tells the user to
   stop and relaunch the task instead.
+- **Health probe runs, aimed at the container's own liveness path.** The
+  `fargate` child is an ordinary `_SshTunnel`, so the end-to-end health probe
+  (§3) runs for it too. The container front process serves only its chat API
+  (`FARGATE_HEALTH_PATH` = `/health`, and `/v1/chat/completions`) and authorises
+  before routing every other path, emitting a `control` access-denied audit
+  record for anything else. The probe therefore aims at `/health` (selected by
+  the non-empty `turn_url`) rather than the gateway's `/api/health`, so a
+  healthy `fargate` tunnel is neither torn down nor spamming its own audit log.
+  Any completed HTTP response counts as alive; only a stalled forward (no
+  response before the timeout) fails the probe.
 - **`diagnose` routes to `diagnose_instance_fargate`.**
 
 ### 16.3 Diagnosis ladder (`src/kiro_crew/instances/diagnostics.py`)

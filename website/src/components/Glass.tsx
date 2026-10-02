@@ -3,11 +3,17 @@
  *
  * Every surface that floats over the transcript in the composer dock (the
  * composer itself, an approval bar, the follow-up chips, a tip or suggestion
- * card, the queue, the memory chip, the jump-to-bottom button), the mobile
- * Settings search capsule, the notification panes (the in-app banner, the
- * bell popover's rows and controls card) and the list panels' search field
- * (Sessions sidebar, Crew Members roster; components/SearchFilterBar.tsx) wear
- * the SAME material, from the SAME primitive:
+ * card, the queue cards, the memory chip, the jump-to-bottom button, and the
+ * status stack above the box: the task, sub-agent and workflow progress bars,
+ * the Command Center card, the held-delivery line, the quote bubble in flight),
+ * the mobile Settings search capsule, the notification panes (the in-app banner, the
+ * bell popover's rows and controls card), the list panels' search field
+ * (Sessions sidebar, Crew Members roster; components/SearchFilterBar.tsx) and
+ * the crewmate DM header's centred identity pill (face + name, itself the
+ * "Edit crewmate" button; pages/members/MembersPage.tsx) and the top bar's
+ * three pills (the search trigger, the readout capsule and the Request a
+ * Feature pill; App.tsx, components/FeedbackPill.tsx) wear the SAME
+ * material, from the SAME primitive:
  * `--glass-tint` over a blurred backdrop, an even top/bottom light band in
  * `--glass-band`, a 1px `--glass-edge` line down each side and a half-pixel
  * `--glass-hairline` just outside the top and bottom edges. No ring: the
@@ -32,13 +38,15 @@
  * session composer included), plus `approval-glow` stacked on it while a
  * decision is pending — because which shadow a pane wears at this instant is
  * the caller's state, not the material's. A hue is mixed INTO the tint with `glass-accent`
- * (picked chip, tip card) or `glass-warn` (incognito chip), and `glass-hover`
- * brightens an interactive pane a step on hover — all three swap `--glass-tint`
- * on the host (index.css), so the pane stays the same material. Focus is the
- * shared `.glass-shadow:focus-within` step — the tint and the side lines step
- * up, the shadow deepens — on every pane alike: the material never lights up
- * in the theme color. The optics are not open for override here — change the
- * recipe, not the call site.
+ * (picked chip, tip card), `glass-warn` (incognito chip) or `glass-danger` (the
+ * offline readout capsule), and `glass-hover`
+ * brightens an interactive pane a step on hover — all four swap `--glass-tint`
+ * on the host (index.css), so the pane stays the same material. Focus changes
+ * NOTHING on the pane — no theme colour, no brighter tint, no darker side
+ * lines, no deeper shadow (maintainer decision): a focused pane is the same
+ * glass as a resting one, and the focus indicator is the caret, or the app's
+ * own `:focus-visible` ring on a pane that is itself the control. The optics
+ * are not open for override here — change the recipe, not the call site.
  */
 import { forwardRef, type ReactElement, type Ref } from 'react'
 import { LiquidGlass, type GlassHostTag, type LiquidGlassOwnProps, type LiquidGlassProps } from './ui/liquid-glass'

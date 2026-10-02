@@ -368,6 +368,8 @@ class TestLinuxUnitRendering:
             return_value="/home/u/.toolbox/bin/kirocrew",
         ), patch(
             "kiro_crew.service.linux.subprocess.run", return_value=gid_result
+        ), patch(
+            "kiro_crew.service.linux.trusted_system_bin", return_value="/usr/bin/id"
         ):
             unit = svc_linux.render_unit()
         # ExecStart executable is double-quoted (systemd tokenizes on
@@ -629,6 +631,47 @@ class TestLinuxUnitRendering:
         ):
             with pytest.raises(svc_linux.ServiceInstallError):
                 svc_linux.install()
+
+    def test_linger_warning_fires_when_linger_is_off(self, monkeypatch):
+        """A system unit parents every runtime scope under ``user@<uid>.service``
+        (the baked ``XDG_RUNTIME_DIR`` / ``DBUS_SESSION_BUS_ADDRESS``), so with
+        ``Linger=no`` the account's manager stops at logout and takes the
+        runtimes down with it. The install path must say so and name the fix."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(svc_linux, "trusted_system_bin", lambda _n: "/usr/bin/loginctl")
+
+        def _loginctl(argv, *_a, **_k):
+            assert argv == ["/usr/bin/loginctl", "show-user", "tester", "-p", "Linger"], argv
+            return subprocess.CompletedProcess(argv, 0, "Linger=no\n", "")
+
+        monkeypatch.setattr(svc_linux.subprocess, "run", _loginctl)
+        warning = svc_linux.linger_warning_for_service_account()
+        assert warning is not None
+        assert "linger" in warning.lower()
+        assert "loginctl enable-linger tester" in warning
+
+    def test_linger_warning_silent_when_linger_is_on(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(svc_linux, "trusted_system_bin", lambda _n: "/usr/bin/loginctl")
+
+        def _loginctl(argv, *_a, **_k):
+            return subprocess.CompletedProcess(argv, 0, "Linger=yes\n", "")
+
+        monkeypatch.setattr(svc_linux.subprocess, "run", _loginctl)
+        assert svc_linux.linger_warning_for_service_account() is None
+
+    def test_linger_warning_silent_when_undeterminable(self, monkeypatch):
+        """No ``loginctl``, an unknown user, or an unrecognised value stays quiet
+        rather than guessing — the install still succeeds unqualified."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(svc_linux, "trusted_system_bin", lambda _n: None)
+        assert svc_linux.linger_warning_for_service_account() is None
 
     def test_uninstall_is_idempotent_when_unit_missing(self, tmp_path, monkeypatch):
         from kiro_crew.service import linux as svc_linux
@@ -1257,6 +1300,42 @@ class TestControllerDispatch:
             rc = controller.install_service()
         assert rc == 0
         mock_install.assert_called_once()
+
+    def test_install_systemd_prints_linger_warning(self, capsys):
+        from kiro_crew.service import apparmor, controller
+        from kiro_crew.service import linux as svc_linux
+
+        with (
+            patch(
+                "kiro_crew.service.controller.current_platform",
+                return_value=Platform.SYSTEMD,
+            ),
+            patch.object(svc_linux, "install", return_value=apparmor.ProfileOutcome(False, "")),
+            patch.object(
+                svc_linux,
+                "linger_warning_for_service_account",
+                return_value="linger is off for tester: ...",
+            ),
+        ):
+            rc = controller.install_service()
+        assert rc == 0
+        assert "linger is off for tester" in capsys.readouterr().out
+
+    def test_install_systemd_silent_when_linger_ok(self, capsys):
+        from kiro_crew.service import apparmor, controller
+        from kiro_crew.service import linux as svc_linux
+
+        with (
+            patch(
+                "kiro_crew.service.controller.current_platform",
+                return_value=Platform.SYSTEMD,
+            ),
+            patch.object(svc_linux, "install", return_value=apparmor.ProfileOutcome(False, "")),
+            patch.object(svc_linux, "linger_warning_for_service_account", return_value=None),
+        ):
+            rc = controller.install_service()
+        assert rc == 0
+        assert "linger" not in capsys.readouterr().out
 
     def test_uninstall_unsupported_returns_2(self):
         from kiro_crew.service import controller
@@ -1969,12 +2048,21 @@ class TestLinuxControlPaths:
         guess wrong here."""
         from kiro_crew.service import linux as svc_linux
 
-        # FileNotFoundError simulates `id` not being on PATH.
+        # `id` resolves to a trusted path, but the exec itself errors.
+        monkeypatch.setattr(svc_linux, "trusted_system_bin", lambda _n: "/usr/bin/id")
         with patch(
             "kiro_crew.service.linux.subprocess.run",
             side_effect=FileNotFoundError("id"),
         ):
             assert svc_linux._current_group("alice") == "alice"
+
+    def test_current_group_falls_back_when_id_not_in_trusted_dirs(self, monkeypatch):
+        """When `id` is not in a trusted system directory the probe never shells
+        out (a PATH shim must not run as root); it falls back to the username."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux, "trusted_system_bin", lambda _n: None)
+        assert svc_linux._current_group("alice") == "alice"
 
 
 class TestLinuxServiceScopes:

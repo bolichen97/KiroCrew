@@ -64,7 +64,7 @@ import secrets
 import shutil
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -858,8 +858,11 @@ def _read_json_record(path: Path, *, strict: bool = False) -> Any | None:
         if strict:
             raise
         return None
-    except (ValueError, UnicodeDecodeError):
-        # ``ValueError`` already covers ``json.JSONDecodeError``.
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        # ``ValueError`` already covers ``json.JSONDecodeError``. A record nested
+        # deeper than the parser follows (a 20 KB file of ten thousand nested
+        # arrays is well under the ceiling) raises ``RecursionError`` from inside
+        # ``json.loads``, and reads the same way: content this reader cannot trust.
         return None
 
 
@@ -1018,7 +1021,11 @@ def _read_events_unlocked(path: Path, *, strict: bool = False) -> list[WorkEvent
             continue
         try:
             parsed = json.loads(stripped)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # ``ValueError`` covers ``JSONDecodeError`` and the parser's other
+            # refusals (an integer past the interpreter's digit limit is one). A
+            # line nested deeper than the parser follows is as unreadable as a torn
+            # one. One bad line must not cost the rest of the log.
             continue
         event = WorkEvent.from_dict(parsed)
         if event is None:
@@ -1343,6 +1350,7 @@ def is_stale(
     item: WorkItem,
     *,
     worker_running: bool,
+    worker_closed: bool = False,
     now: datetime | None = None,
     window_secs: float = DEFAULT_STALE_WINDOW_SECS,
 ) -> bool:
@@ -1352,6 +1360,19 @@ def is_stale(
     in a thirty-minute build is running, so it is never flagged however long it stays
     silent. The window exists only to cover the gap between binding and the first
     report, and to catch a session that ended without reporting.
+
+    ``worker_closed`` SKIPS THE WINDOW for an item that has REPORTED AT LEAST ONCE, and
+    skips only the window. The window is there because "not running" is true of a worker
+    thinking between turns as well as of one that is gone, so time is what tells the two
+    apart. A session that spoke and then ended is not ambiguous: there is no turn coming,
+    however recently that report landed. An item with NO report keeps the window, because
+    a caller answers this question by failing to find a session, and for a worker that has
+    never reported an absence is as likely to mean "not registered yet" -- the
+    bind-to-first-report gap -- as "gone". Every other clause still holds: a terminal item
+    is not stale, and neither is one whose next move belongs to the conductor, which is
+    what keeps a ``done`` item's close from waking anyone. Defaults to ``False``, so a
+    caller that cannot answer the question gets exactly the behaviour it had before the
+    field existed.
 
     A terminal item is never stale — there is nothing left to report. Neither is one
     whose last report was ``done``: the ball is in the conductor's court (verify,
@@ -1373,15 +1394,30 @@ def is_stale(
         return False
     if not _worker_owns_next_move(item):
         return False
+    if worker_closed and item.last_report_at:
+        # Past both guards above, so this is an OPEN item whose next move is the
+        # worker's -- and its worker is gone. Nothing the window measures can change
+        # that answer, so it is not measured.
+        #
+        # ``last_report_at`` is REQUIRED, and it is what keeps this honest. A caller
+        # answers "closed" by failing to find the worker's session, and an absence has
+        # two causes: a session that existed and ended, or one that was never registered
+        # where that caller could see it -- the bind-to-first-report gap this window was
+        # written for, a slot table still rehydrating, a worker bound under a key that
+        # table does not carry. A report PROVES the first: the worker was there, it spoke,
+        # and now it is not. With no report the two are indistinguishable, so the window
+        # decides as it did before, which is the behaviour that gap always had.
+        return True
     reference = item.last_report_at or item.created_at
     if not reference:
         return True
-    stamped = _parse_iso(reference)
+    # Through ``parse_stamp``, whose UTC fallback covers a stamp at either end of
+    # the calendar: a hand-edited ``created_at`` of year 1 is a sentinel, not a
+    # moment, and the flag derived from it must not be what fails the read.
+    stamped = parse_stamp(reference)
     if stamped is None:
         return True
     moment = now or datetime.now().astimezone()
-    if stamped.tzinfo is None:
-        stamped = stamped.astimezone()
     if moment.tzinfo is None:
         moment = moment.astimezone()
     return moment - stamped > timedelta(seconds=max(window_secs, 0.0))
@@ -1487,6 +1523,35 @@ def _parse_iso(value: str) -> datetime | None:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+def parse_stamp(value: str) -> datetime | None:
+    """An ISO-8601 stamp as an AWARE datetime, or ``None`` when it is not one.
+
+    :func:`_now_iso` writes local time with an offset, so a stamp read back
+    compares directly; a stamp without an offset — a caller's ``since``, an older
+    record — is taken as local time, the same reading :func:`is_stale` gives its
+    reference. Comparing a naive datetime with an aware one raises, and a read
+    filter must never be the thing that raises.
+
+    Nor may the local-time reading itself. A naive stamp at either end of the
+    calendar — ``0001-01-01T00:00:00``, ``9999-12-31T23:59:59``, which is what a
+    caller spells for "since the beginning of time" — cannot be shifted into a
+    zone whose offset would carry it past year 1 or year 9999, and the platform
+    reports that as ``OverflowError`` or ``ValueError`` (which zone trips which end
+    depends on the host). Such a stamp is a sentinel, not a moment anyone measured
+    in local time, so it is read as UTC: ``since=0001-01-01T00:00:00`` means
+    "everything", never a refusal and never a failed read.
+    """
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed
+    try:
+        return parsed.astimezone()
+    except (OverflowError, ValueError, OSError):
+        return parsed.replace(tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------- #

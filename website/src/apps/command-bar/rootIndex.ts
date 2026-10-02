@@ -217,14 +217,26 @@ const PER_GROUP_LIMIT = 6
 const IDLE_DEMOTION = 1
 
 /**
- * Tighter cap for the settings group on an EMPTY query.
+ * Cap on WEAK settings matches, applied whether or not a query is present.
  *
  * Settings are a long searchable tail, not what a launcher opens on: the codegen
- * registry contributes hundreds of rows, and at the normal cap six alphabetical
- * toggles fill the first page before the user has typed anything. They still rank
- * normally the moment a query narrows them.
+ * registry contributes hundreds of rows. On an empty query every row is a "weak"
+ * match (nothing was typed), so six alphabetical toggles would fill the first page;
+ * this holds them to two. Under a query the same hazard returns in a different form:
+ * a word that merely scatters across six long setting titles as a subsequence fills
+ * the cap with rows that do not name the typed word, pushing the overlay's recovery
+ * rows (Ask the agent, Search sessions / artifacts / folders / crewmates) below the
+ * fold — and those rows are the whole answer to "the root does not search content"
+ * for a reader who typed a name.
+ *
+ * The cap is on WEAK matches only, not on settings as a group: a direct hit — the
+ * query is a substring of the title, which is what "the user is naming this setting"
+ * looks like — ranks up to {@link PER_GROUP_LIMIT} like any row, so searching
+ * settings on their own name still surfaces every one of them. What the cap removes
+ * is the scattered subsequence spending a row a recovery path needs. The full
+ * settings corpus stays one `view` row away regardless.
  */
-const SETTINGS_IDLE_LIMIT = 2
+const SETTINGS_WEAK_LIMIT = 2
 
 /**
  * Score of a match on a field the row does not lead with, relative to a title hit.
@@ -360,6 +372,14 @@ export function rankRootRows(
   // Group caps are applied AFTER ranking so a row only loses its place to a
   // better row in its own group, never to the order the sources were listed in.
   const perGroup = new Map<RootGroup, number>()
+  // Settings carry a second, tighter tally for WEAK matches — see SETTINGS_WEAK_LIMIT.
+  // A weak settings match is one that does not name the setting: an empty query (every
+  // row is weak), or a typed query that is not a substring of the title and only
+  // survived as a scattered subsequence. Strong settings hits spend the ordinary
+  // PER_GROUP_LIMIT; weak ones are additionally held to SETTINGS_WEAK_LIMIT so they
+  // cannot bury the recovery rows the overlay appends after the ranked block.
+  let settingsWeakSeen = 0
+  const ql = q.toLowerCase()
   const capped: RankedRow[] = []
   for (const row of ranked) {
     // The `commands` group counts CONTRIBUTIONS only, so no builtin this repository
@@ -368,9 +388,15 @@ export function rankRootRows(
       capped.push(row)
       continue
     }
-    const limit = !q && row.group === 'settings' ? SETTINGS_IDLE_LIMIT : PER_GROUP_LIMIT
+    if (row.group === 'settings') {
+      const weak = !q || !row.title.toLowerCase().includes(ql)
+      if (weak) {
+        if (settingsWeakSeen >= SETTINGS_WEAK_LIMIT) continue
+        settingsWeakSeen += 1
+      }
+    }
     const seen = perGroup.get(row.group) ?? 0
-    if (seen >= limit) continue
+    if (seen >= PER_GROUP_LIMIT) continue
     perGroup.set(row.group, seen + 1)
     capped.push(row)
   }

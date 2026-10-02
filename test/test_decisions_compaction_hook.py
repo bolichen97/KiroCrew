@@ -126,7 +126,7 @@ def _coordinator() -> tuple[sc.CompactionCoordinator, _Owner]:
         context_pct_is_unknown=lambda _p: False,
         unlink_session_queue=lambda _s: None,
         compact_wait_timeout_secs=lambda: 5.0,
-        compact_result_wait_secs=lambda _e: 1.0,
+        compact_result_wait_secs=lambda _e, _budget: 1.0,
         context_warn_margin_pct=10.0,
         compact_result_wait_margin_secs=1.0,
         compact_failure_cooldown_secs=1.0,

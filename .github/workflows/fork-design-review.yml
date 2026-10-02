@@ -49,7 +49,10 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: fork-design-review-${{ github.event.workflow_run.head_sha }}
+  # The upstream run id is immutable across attempts and unique per trigger.
+  # Unlike repository/ref text, it cannot collide under GitHub's
+  # case-insensitive concurrency comparison or exceed the group length limit.
+  group: fork-design-review-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
@@ -108,6 +111,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_HEAD_REF: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -uo pipefail
           # head_sha from the triggering run is set by GitHub and is authoritative.
@@ -140,29 +145,37 @@ jobs:
             return "$rc"
           }
 
-          # Resolve the PR by matching the open PR whose head SHA equals the
-          # trigger head_sha (workflow_run.pull_requests is empty for forks).
-          #
-          # An empty result has TWO causes that need OPPOSITE reporting, and
-          # collapsing them into one message made this abort unfalsifiable: the
-          # same text and the same exit 1 were emitted whether the query FAILED
-          # or whether it SUCCEEDED and matched nothing, while `2>/dev/null`
-          # discarded the only evidence of which.
-          #   * query FAILED -> nothing is known about this head. Retried above;
-          #     if it still fails, say the QUERY failed and fail closed.
-          #   * query SUCCEEDED with no match -> the push was superseded, or its
-          #     PR closed, while CI was queued. There is nothing to review.
-          # Both still exit 1, so the fail-closed finalize step is unchanged and
-          # no verdict is withheld; what changes is that the log names the cause.
-          if ! pr="$(gh_read gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
-            --jq "[.[] | select(.head.sha == \"$head_sha\")][0].number // empty")"; then
+          # workflow_run.pull_requests is empty for forks, so all open-PR pages
+          # are aggregated before matching the trigger's repository, ref and SHA.
+          # Every coordinate is required and reaches jq through --arg. Zero
+          # candidates means the head was superseded or closed; multiple exact
+          # candidates are ambiguous. This advisory lane still fails closed on
+          # identity because selecting another PR would review a different diff.
+          if [ -z "$WR_HEAD_REPO" ] || [ -z "$WR_HEAD_REF" ]; then
+            echo "::error::empty workflow_run head identity (repository/ref); failing closed"
+            exit 1
+          fi
+          if ! candidates="$(gh_read gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
+            | jq -rs --arg sha "$head_sha" --arg repo "$WR_HEAD_REPO" --arg ref "$WR_HEAD_REF" '
+                [.[][]
+                  | select(.state == "open"
+                           and .head.repo.full_name == $repo
+                           and .head.ref == $ref
+                           and .head.sha == $sha)]
+              ')"; then
             echo "::error::could not query open PRs while resolving $head_sha - the query itself failed on all 3 attempts; see the errors above"
             exit 1
           fi
-          if [ -z "$pr" ]; then
-            echo "::error::no open PR has head $head_sha - superseded or closed while CI was queued; nothing to review"
+          candidate_count="$(printf '%s' "$candidates" | jq -r 'length')"
+          if [ "$candidate_count" -eq 0 ]; then
+            echo "::error::no open PR has head $head_sha on $WR_HEAD_REPO:$WR_HEAD_REF - superseded or closed while CI was queued; nothing to review"
             exit 1
           fi
+          if [ "$candidate_count" -ne 1 ]; then
+            echo "::error::more than one open PR matches head $head_sha on $WR_HEAD_REPO:$WR_HEAD_REF; refusing to select one"
+            exit 1
+          fi
+          pr="$(printf '%s' "$candidates" | jq -r '.[0].number')"
 
           # Authoritative base SHA straight from the PR (NOT from the artifact).
           if ! base_sha="$(gh_read gh api "repos/$REPO/pulls/$pr" --jq '.base.sha')"; then
@@ -748,7 +761,24 @@ jobs:
           printf '%s' "$summary" > "$RUNNER_TEMP/design-review-output.md"
           verdict="UNKNOWN"
           if [ -s "$RUNNER_TEMP/design-review-output.md" ]; then
-            v="$(printf '%s\n' "$summary" | grep -iE '^Design-Verdict:' | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+            # ONE awk over a here-string, not a pipeline -- the same shape, for the
+            # same reason, as the two here-strings already in this step. A `grep`
+            # that matches nothing exits 1, and a `head -n1` closes the pipe on a
+            # long summary so its producer dies of SIGPIPE with 141; under this
+            # step's `pipefail` plus the runner's own `-e` either status aborts the
+            # step HERE, one line above the `[ -n ]` fallback written for exactly
+            # the case that produced it. Suppressing the statuses would be worse
+            # than the abort: 141 arrives with a header already in hand, so
+            # silencing it hands this lane a verdict read out of a document the
+            # step never finished reading. awk exits 0 whether or not the header is
+            # there, so the test below decides. No `exit` on the first match
+            # either: the whole summary is read and the FIRST header is printed
+            # from `END`, never taken from a partial read. The anchor is unchanged,
+            # so which headers count is exactly what it was. The class spells out
+            # the five characters `[[:space:]]` matched inside a record, because
+            # the runners' awk is mawk and nothing here should depend on its POSIX
+            # class support.
+            v="$(awk '!found && tolower($0) ~ /^design-verdict:/ { sub(/^[^:]*:[ \t\v\f\r]*/, ""); gsub(/\r/, ""); value = toupper($0); found = 1 } END { if (found) print value }' <<< "$summary")"
             [ -n "$v" ] && verdict="$v"
           fi
           # Require the CURRENT-HEAD proof marker before honouring that verdict.
@@ -1662,6 +1692,16 @@ jobs:
           # a genuine BLOCK whose own PATCH lost both attempts must not be
           # swept into a verdict pr-readiness no longer gates on. With no
           # verdict, $conclusion is already neutral/"review incomplete".
+          #
+          # NEWEST-RUN-WINS GUARD. The concurrency group is keyed to
+          # workflow_run.id, so a close/reopen (or any same-sha retrigger) now
+          # yields two lane runs on one head that do NOT cancel each other. The
+          # PR-dim prefix above spans BOTH, so without this guard the run that
+          # finalizes LATER in wall-clock -- which may be the OLDER trigger --
+          # would overwrite the newer run's row with its own stale verdict. The
+          # external_id's run-id dimension (design-pr-$PR-<run>-<attempt>) is the
+          # tiebreaker: a row whose run id is NEWER than this run's is left
+          # alone; rows from this run or an older one are still swept.
           if [ -n "${HEAD:-}" ] && [ -n "${PR:-}" ]; then
             enc="$(jq -rn '"Design Review" | @uri')"
             stranded="$(gh api --method GET \
@@ -1670,9 +1710,17 @@ jobs:
                     | select(.status != \"completed\")
                     | select(.external_id != null)
                     | select(.external_id | startswith(\"design-pr-$PR-\"))
-                    | .id" 2>/dev/null || true)"
-            for id in $stranded; do
+                    | \"\(.id) \(.external_id)\"" 2>/dev/null || true)"
+            while IFS=' ' read -r id ext; do
+              [ -n "$id" ] || continue
+              rest="${ext#design-pr-$PR-}"
+              row_run="${rest%-*}"
+              if printf '%s' "$row_run" | grep -qE '^[0-9]+$' \
+                 && [ "$row_run" -gt "$WR_RUN_ID" ]; then
+                echo "skipping check-run $id for $HEAD (PR #$PR): row run $row_run is newer than $WR_RUN_ID"
+                continue
+              fi
               echo "completing stranded check-run $id for $HEAD (PR #$PR)"
               complete "$id" "$conclusion" "$title" || true
-            done
+            done <<< "$stranded"
           fi

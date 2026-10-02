@@ -56,9 +56,23 @@ export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKe
      *  whole list to the reorder endpoint, which applies it all-or-none under the
      *  folder-store lock, so a rejected write leaves the stored order untouched
      *  rather than half-applied (issue #10406). */
-    reorderChatFolders: (orders: { id: string; order: number }[]) =>
-      post('/api/chat/folders/reorder', { orders }).then(j),
+    reorderChatFolders: (orders: { id: string; order: number }[], expectedParent?: string) =>
+      // Empty string is a real claim (the root lane); only undefined means the
+      // caller makes no assumption about which container it computed against.
+      post('/api/chat/folders/reorder', expectedParent === undefined ? { orders } : { orders, expected_parent: expectedParent }).then(j),
     deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
+    /** Delete every folder whose subtree holds no live session and no setting.
+     *  `dryRun` lists the ids (and how many archived sessions each one holds)
+     *  without changing anything; top-level folders are spared unless asked.
+     *  A real run passes the previewed `ids` and deletes only those still empty. */
+    cleanupChatFolders: (opts: { dryRun?: boolean; includeTopLevel?: boolean; ids?: string[] }) =>
+      post('/api/chat/folders/cleanup', { dry_run: !!opts.dryRun, include_top_level: !!opts.includeTopLevel, ...(opts.ids ? { ids: opts.ids } : {}) }).then(j) as Promise<{
+        ok: boolean
+        ids?: string[]
+        deleted?: string[]
+        count: number
+        archived?: Record<string, number>
+      }>,
     /** File a channel's EXISTING conversations into the folder its settings name.
      *
      *  On this transport rather than the panel's own `fetch`, which is what every
@@ -83,7 +97,6 @@ export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKe
      *  an index-only null would leave a custom hex behind. */
     clearSlotColor: (slot: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: null, color_hex: null }).then(j),
     setSlotPin: (slot: string, pinned: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/pin', { pinned }).then(j),
-    setSlotMode: (slot: string, mode: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/mode', { mode }).then(j),
     // Tags
     chatTags: () => fetch('/api/chat/tags', { headers: { ..._sk } }).then(j),
     createChatTag: (name: string, color?: string, status?: boolean) => post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),

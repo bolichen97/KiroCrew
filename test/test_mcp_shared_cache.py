@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -108,9 +109,9 @@ class TestSuccessCaching:
         monkeypatch.setattr(mcp_shared, "loopback_urlopen", urlopen)
         assert mcp_shared._resolve_excluded_tools() == {"blocked"}
         request = urlopen.call_args.args[0]
-        assert request.full_url == f"http://localhost:{expected_port}/api/session-tool-policy"
+        assert request.full_url == f"http://127.0.0.1:{expected_port}/api/session-tool-policy"
         assert request.get_header("X-internal-secret") == "synthetic-bound-secret"
-        secret.assert_called_once_with(expected_port)
+        secret.assert_called_once_with(expected_port, dial_host="127.0.0.1")
 
     def test_first_call_queries_gateway_then_caches(
         self, fake_sel, patch_session_setup, monkeypatch
@@ -359,6 +360,10 @@ class TestLongCacheFailures:
         ]
         assert audits, "the identity refusal must have its own audit event"
         assert "token=absent" in audits[0]["resources"]
+        # Which process asked, so a short-lived tokenless server can be traced
+        # to its launcher after it has exited.
+        assert f"pid={os.getpid()}" in audits[0]["resources"]
+        assert f"ppid={os.getppid()}" in audits[0]["resources"]
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.unreadable" not in ops
         assert mcp_shared._last_failure_time == 0.0

@@ -110,12 +110,20 @@ export class HeightIndex {
       rowCount?: number
       keyAt: RowKeyResolver
       estimate: number
+      // Forwarded to the owned HeightCache: fired the first time this scope's
+      // blob is persisted (absent -> present). The per-width family bound keys
+      // off it -- a brand-new width has no blob when this owner is constructed
+      // (construction only loads), so the bound must wait for the first write.
+      onFirstPersist?: () => void
     },
   ) {
     this.sessionId = sessionId
     this.keyAt = options.keyAt
     this.estimate = options.estimate
-    this.cache = new HeightCache(sessionId, { rowCount: options.rowCount })
+    this.cache = new HeightCache(sessionId, {
+      rowCount: options.rowCount,
+      onFirstPersist: options.onFirstPersist,
+    })
     // Built empty and filled by the caller's first sync(), NOT from keyAt here:
     // the resolver reads refs that are assigned after this constructor runs, so
     // resolving a key during construction would read them in their initial

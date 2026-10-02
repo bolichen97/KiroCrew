@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import type React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { BookOpen, ChevronDown, ChevronRight, Folder, Paperclip, Plug } from 'lucide-react'
+import { BookOpen, ChevronDown, ChevronRight, Folder, MessageSquarePlus, Paperclip, Plug } from 'lucide-react'
 
 import { api } from '../../api/client'
 import Clickable from '../../components/Clickable'
@@ -14,6 +14,8 @@ import SessionActionsMenu from '../../components/SessionActionsMenu'
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -40,7 +42,7 @@ import {
 import { findTokenRanges, recollapsePastes, type PasteBlock } from '../../utils/pasteTokens'
 import McpToolsPanel from './McpToolsPanel'
 
-export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTitle, mode, sidebarOnScreen, omitPopout, triggerLabel }: {
+export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTitle, mode, sidebarOnScreen, omitPopout, triggerLabel, newSessionHere }: {
   activeSlot: string | null; agent?: string; onReveal?: () => void; onRename?: () => void; onAutoTitle?: () => void; mode?: string
   /** Whether the sidebar (and its folder-order banner) is on screen -- see SessionActionsMenu. */
   sidebarOnScreen?: boolean
@@ -51,6 +53,10 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTi
    *  flush after the last character). Absent, the trigger is the bare chevron
    *  the desktop title row places beside its own rename control. */
   triggerLabel?: React.ReactNode
+  /** Phone only: a first item that opens a sibling session in the on-screen
+   *  session's folder. It lives in this menu, not beside it, because the phone
+   *  bar's centre cell holds two controls (AUTOSDE `max-two-buttons-per-row`). */
+  newSessionHere?: { label: string; disabled?: boolean; onSelect: () => void }
 }) {
   // Controlled open state: lets the colour-swatch row (not a Radix menu item)
   // close the menu after a pick, via the onColorPicked hook passed below.
@@ -116,6 +122,14 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTi
         )}
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-[180px]">
+        {newSessionHere && (
+          <>
+            <DropdownMenuItem data-testid="mobile-new-session-here" disabled={newSessionHere.disabled} onSelect={newSessionHere.onSelect}>
+              <MessageSquarePlus size={13} className="shrink-0 text-muted" /> {newSessionHere.label}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         {activeSlot && (
         <SessionActionsMenu
           variant="dropdown"
@@ -163,12 +177,12 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTi
 
 /** Per-message identity key with row-id tie-break. `msgKey` alone is NOT
  *  unique — a coarse OS clock can stamp two rows appended in one tick with the
- *  same `ts` (see isRedeliveredMessage in chatSlice on why row identity is
- *  `meta.mid`, not a ts tuple). `mid` is stamped once per row and survives
- *  every delivery door (HTTP rebuild, WS broadcast, JSONL round trip), so the
- *  suffix is as reload-stable as the key it disambiguates. Rows without a
- *  `mid` (locally-minted streaming/optimistic bubbles) fall back to `msgKey`
- *  alone, which is exactly the uniqueness they had before. */
+ *  same `ts` (see isRedeliveredMessage in transcript.ts under store/chat on
+ *  why row identity is `meta.mid`, not a ts tuple). `mid` is stamped once per
+ *  row and survives every delivery door (HTTP rebuild, WS broadcast, JSONL
+ *  round trip), so the suffix is as reload-stable as the key it disambiguates.
+ *  Rows without a `mid` (locally-minted streaming/optimistic bubbles) fall
+ *  back to `msgKey` alone, which is exactly the uniqueness they had before. */
 /** Client-generated one-shot correlation id for an optimistic user bubble; see
  *  `mintSendId` in `utils/sendDelivery`. Re-exported so the page and the tests
  *  keep their import path. */
@@ -246,9 +260,10 @@ export function KnowledgeBubbleChip({ knowledge }: { knowledge: { items: number;
  *  Shared by every dashboard surface that draws a user row: ChatPage hands
  *  it directly, and the app-sdk registry's default `user` entry (ChatPane,
  *  member DMs, embeds) calls it too, so the two can no longer drift on how an
- *  attachment renders. `onFileOpen` is therefore optional: a host without a
- *  file viewer (the pane) still shows every attachment — an image inline, a
- *  file as a card with its path in the tooltip — it just cannot open one. */
+ *  attachment renders. `onFileOpen` is optional: a host without a file viewer
+ *  still shows every attachment — an image inline, a file as a card — it just
+ *  has no opener to call. Every host with a viewer (main chat, split panes,
+ *  member DMs) supplies it (#9487). */
 export type UserContentRenderOpts = {
   content: string
   meta?: Record<string, unknown>
@@ -512,10 +527,9 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
 }
 
 /** Inline chip for a file reference in a sent message: `@label`, the full path
- *  in the tooltip. With a handler it opens the file (ChatPage's side-panel
- *  viewer); without one — a host that has no file viewer, such as a split
- *  pane or a member DM — it is an inert span, the same degrade DirChip makes,
- *  so a chip never LOOKS clickable on a surface where clicking does nothing. */
+ *  in the tooltip, opening the file in the host's viewer. Every host that can
+ *  show a user row supplies the handler (#9487); a host without one still
+ *  renders the chip as an inert span (#9921 kept the base's #13855 a11y pin). */
 /** The transcript's mention split. A `:line` suffix rides INSIDE its pill
  *  (fork UX review): `(@src/main.ts:42)` draws `(` + pill `@src/main.ts:42` +
  *  `)`, one reference as the user typed it, instead of stranding `:42` as
@@ -540,10 +554,12 @@ function mentionPart(part: string, known: (key: string) => boolean): { key: stri
 function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath: string; onOpen?: (path: string) => void }) {
   const base = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono'
   if (!onOpen) {
-    // Same reason as DirChip's inert branch: `title` is pointer-only, so the
-    // full path rides along as visually-hidden text, the visible label is
-    // aria-hidden so the basename is not spoken twice, and `select-none` keeps
-    // the path out of a copied selection.
+    // No file viewer on this host (a split pane or member DM without an
+    // opener): the same degrade DirChip makes, so the chip never LOOKS
+    // clickable where clicking does nothing. `title` is pointer-only, so the
+    // full path rides along as visually-hidden text; the visible label is
+    // aria-hidden so the basename is not spoken twice; `select-none` keeps the
+    // path out of a copied selection. Pinned by pointerOnlyPath.a11y.test.tsx.
     return <span className={base} title={fullPath}><span aria-hidden="true">@{label}</span><span className="sr-only select-none">{fullPath}</span></span>
   }
   return (
@@ -552,10 +568,10 @@ function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath:
 }
 
 /** Block card for a single user-attached (non-image) file. Clickable to open
- *  the file via the shared onFileOpen callback; without a handler it is an
- *  inert card (see FileMentionChip for why). Styled after the agent-side
- *  download card (see components/FileCard.tsx) but carries no size/mime — a
- *  user attachment only has a path here. */
+ *  the file in the host's viewer; without a handler it is an inert card (see
+ *  FileMentionChip for why). Styled after the agent-side download card (see
+ *  components/FileCard.tsx) but carries no size/mime — a user attachment only
+ *  has a path here. */
 function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string; label: string; onFileOpen?: (path: string) => void }) {
   const base = 'flex items-center gap-2.5 max-w-full bg-card border border-border rounded-lg px-3 py-2 text-sm no-underline text-text animate-scale-in'
   const body = (
@@ -570,7 +586,8 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
     // The same sentence rides along as visually-hidden text, since `title`
     // opens on pointer hover only. The visible body is aria-hidden: the
     // sentence already contains the path, so reading both would say the
-    // filename twice per card. `select-none` keeps it out of a copied selection.
+    // filename twice per card. `select-none` keeps it out of a copied
+    // selection. Pinned by pointerOnlyPath.a11y.test.tsx (#13855).
     const inert = i18nT('pages.chatPage.attached_file_inert', { path: fullPath })
     return (
       <span className={base} title={inert}>

@@ -67,7 +67,8 @@ Two facts about this table decide several rows below.
 
 **There is no app-declarable agent hook.** `backend.hooks` are Python callables inside
 the app's own process; they are not agent lifecycle hooks. The agent hook surface is
-`agent.kiro_hooks` plus autoimport from the kiro hooks dir (`kiro_crew.agent`), it
+`agent.kiro_hooks` plus autoimport from the kiro hooks dir
+(`kiro_crew.agent_materialization.kiro_hooks`, reached through `kiro_crew.agent`), it
 accepts five events -- `preToolUse`, `postToolUse`, `userPromptSubmit`, `agentSpawn`,
 `stop` -- and each entry is `{command, matcher}` where `command` must be an absolute
 path to an existing file with no shell metacharacters. It is operator config, not an
@@ -239,13 +240,20 @@ declared-with-no-events.
 
 Two platform findings came out of that run, neither a converter question:
 
-- An app MCP server with an `http` url is not registered at all when the app has no
-  live backend port (`_register_mcp_servers` skips and scrubs it, `_live_port_for`
-  returns `None`). The fail-safe exists for a url pointing at the app's OWN backend,
-  whose illustrative port would otherwise be a dead address that breaks every session
-  -- but it also drops an EXTERNAL endpoint that has no relationship to any backend
-  port. A converted package whose server is a hosted `https` endpoint therefore
-  installs clean with its tools missing, and the only trace is one INFO line.
+- An app MCP server with an `http` url is scrubbed from the agent config only when the
+  app runs a GATEWAY-MANAGED backend (`backend.entryPoint` set) that has no live port
+  yet (`_register_mcp_servers` skips and scrubs it, `_live_port_for` returns `None`).
+  The fail-safe exists for a url pointing at the app's OWN backend, whose illustrative
+  port would otherwise be a dead address that breaks every session. A SELF-MANAGED app
+  (empty `backend.entryPoint` -- which is also every converted package, since a
+  converted app emits no `backend`) has an AUTHORITATIVE fixed endpoint that never gets
+  a live registration, so the registrar now PRESERVES its url rather than dropping it.
+  This mirrors `_collect_app_mcp_servers` in `agent_materialization/mcp_sources.py`, the
+  other writer of this config, which already kept a self-managed url: the two writers
+  must agree, or registration scrubs an entry the next rebuild writes straight back.
+  (Resolved: #15826 initially moved the fix to the converter, which `@buluoray`'s review
+  blocked because the rebuild path deliberately carries these servers; the fix belongs
+  in the registrar, scrubbing only when a backend port is expected.)
 - The dashboard app card reads `mcpServers` from the MANIFEST, so it shows a server
   the agent config does not carry. The two surfaces disagree by construction.
 

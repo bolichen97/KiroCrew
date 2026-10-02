@@ -4752,6 +4752,33 @@ class TestTheBriefsOwnTargetListDecidesTheWatchedSubject:
         assert subject is not None, "the instruction's own pull request still decides"
         assert subject.subject == self.SUBJECT
 
+    def test_a_work_ledger_watch_ignores_a_brief_that_names_a_pull_request(self) -> None:
+        """A ``watch="work-ledger"`` subject is the conductor's own session, not a brief PR.
+
+        The judge brief may still point a collector at a pull request, but that must not
+        retarget the watch: without the early return the one-entry brief would be read as
+        the subject and the loop would arm on -- and poll -- the PR instead of the
+        conductor's ledger, silently, with no error to the caller. The watch's subject is
+        resolved from ``slot_key`` and nothing else.
+        """
+        conductor = "chat-conductor-7"
+        spec = {"wake_when": "a worker reports", "targets": [self.URL]}
+        # The instruction even NAMES the pull request; the watch must still be the ledger.
+        message = f"Patrol the fleet; worker is driving {self.URL}."
+        subject = infer_subject(message, spec, watch=probe_targets.WORK_LEDGER, slot_key=conductor)
+        assert subject is not None, "a work-ledger watch always resolves its own session"
+        assert subject.kind == probe_targets.WORK_LEDGER
+        assert subject.subject == conductor, "the subject is the conductor's slot, not the PR"
+
+    def test_a_work_ledger_watch_with_no_brief_still_resolves_its_session(self) -> None:
+        """The early return holds with no brief at all -- the common conductor shape."""
+        conductor = "chat-conductor-9"
+        subject = infer_subject(
+            "Patrol the fleet.", None, watch=probe_targets.WORK_LEDGER, slot_key=conductor
+        )
+        assert subject is not None and subject.subject == conductor
+        assert subject.kind == probe_targets.WORK_LEDGER
+
     def test_the_blocker_is_never_the_watched_subject(self) -> None:
         """Named separately because watching the blocker is the specific harm."""
         blocker = "https://github.com/kirodotdev/KiroCrew/pull/14017"

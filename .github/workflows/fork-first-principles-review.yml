@@ -49,18 +49,11 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # Keyed on (head repository, head branch, head sha), NOT the sha alone: two fork
-  # PRs can share a commit -- the same fork commit pushed under two branch names --
-  # and a sha-only group makes one run cancel the other. The survivor then posts a
-  # check-run keyed to that sha, which BOTH pull requests read, so one of them shows
-  # a verdict computed from the other's diff and intent. Same reason the resolver
-  # below disambiguates on those fields.
-  group: >-
-    fork-first-principles-review-${{
-      github.event.workflow_run.head_repository.full_name
-    }}-${{ github.event.workflow_run.head_branch }}-${{
-      github.event.workflow_run.head_sha
-    }}
+  # A workflow run id is unique per triggering Fast Gate run, including sibling
+  # PRs whose repository/ref/SHA text differs only by case. GitHub retains that
+  # id across run attempts, so reruns still collapse without putting unbounded,
+  # case-sensitive ref text into a case-insensitive concurrency namespace.
+  group: fork-first-principles-review-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
@@ -556,7 +549,24 @@ jobs:
           printf '%s' "$summary" > "$RUNNER_TEMP/first-principles-output.md"
           verdict="UNKNOWN"
           if [ -s "$RUNNER_TEMP/first-principles-output.md" ]; then
-            v="$(printf '%s\n' "$summary" | grep -iE '^First-Principles-Verdict:' | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+            # ONE awk over a here-string, not a pipeline -- the same shape, for the
+            # same reason, as the here-strings already in this step. A `grep` that
+            # matches nothing exits 1, and a `head -n1` closes the pipe on a long
+            # summary so its producer dies of SIGPIPE with 141; under this step's
+            # `pipefail` plus the runner's own `-e` either status aborts the step
+            # HERE, one line above the `[ -n ]` fallback written for exactly the
+            # case that produced it. Suppressing the statuses would be worse than
+            # the abort: 141 arrives with a header already in hand, so silencing it
+            # hands this lane a verdict read out of a document the step never
+            # finished reading. awk exits 0 whether or not the header is there, so
+            # the test below decides. No `exit` on the first match either: the
+            # whole summary is read and the FIRST header is printed from `END`,
+            # never taken from a partial read. The anchor is unchanged, so which
+            # headers count is exactly what it was. The class spells out the five
+            # characters `[[:space:]]` matched inside a record, because the
+            # runners' awk is mawk and nothing here should depend on its POSIX
+            # class support.
+            v="$(awk '!found && tolower($0) ~ /^first-principles-verdict:/ { sub(/^[^:]*:[ \t\v\f\r]*/, ""); gsub(/\r/, ""); value = toupper($0); found = 1 } END { if (found) print value }' <<< "$summary")"
             # The marker is the proof-of-commit: a verdict without the exact
             # current-head marker is not a verdict for this revision.
             if [ -n "$v" ] && ! grep -qF "[FIRST-PRINCIPLES-REVIEWED] $HEAD_SHA" <<<"$summary"; then
@@ -1608,6 +1618,12 @@ jobs:
           # swept into a verdict pr-readiness no longer gates on. With no
           # verdict, $conclusion is already neutral/"review incomplete".
           if [ -n "${HEAD:-}" ] && [ -n "${PR:-}" ]; then
+            # NEWEST-RUN-WINS GUARD: the concurrency group is keyed to
+            # workflow_run.id, so a close/reopen yields two uncancelled lane runs
+            # on one head. The PR-dim prefix spans both, so without this guard the
+            # run finalizing later -- which may be the OLDER trigger -- would
+            # overwrite the newer run's row with a stale verdict. A row whose
+            # run-id dimension is NEWER than this run's is left alone.
             enc="$(jq -rn '"First Principles Review" | @uri')"
             stranded="$(gh api --method GET \
               "repos/$REPO/commits/$HEAD/check-runs?check_name=$enc&per_page=100" \
@@ -1615,9 +1631,17 @@ jobs:
                     | select(.status != \"completed\")
                     | select(.external_id != null)
                     | select(.external_id | startswith(\"first-principles-pr-$PR-\"))
-                    | .id" 2>/dev/null || true)"
-            for id in $stranded; do
+                    | \"\(.id) \(.external_id)\"" 2>/dev/null || true)"
+            while IFS=' ' read -r id ext; do
+              [ -n "$id" ] || continue
+              rest="${ext#first-principles-pr-$PR-}"
+              row_run="${rest%-*}"
+              if printf '%s' "$row_run" | grep -qE '^[0-9]+$' \
+                 && [ "$row_run" -gt "$WR_RUN_ID" ]; then
+                echo "skipping check-run $id for $HEAD (PR #$PR): row run $row_run is newer than $WR_RUN_ID"
+                continue
+              fi
               echo "completing stranded check-run $id for $HEAD (PR #$PR)"
               complete "$id" "$conclusion" "$title" || true
-            done
+            done <<< "$stranded"
           fi

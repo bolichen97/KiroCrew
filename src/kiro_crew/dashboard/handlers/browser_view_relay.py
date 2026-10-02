@@ -557,6 +557,11 @@ async def api_browser_view_relay(request: web.Request) -> web.StreamResponse:
         name: request.headers[name] for name in _FORWARD_REQUEST_HEADERS if name in request.headers
     }
     session = _client(request.app)
+    # Hoisted above the ``try`` so the ``except`` can tell a failure BEFORE the
+    # head went out (nothing streamed yet — a fresh 502 is correct) from one
+    # AFTER ``response.prepare`` (the 200 head and some body are already on the
+    # wire — a second status head must not be written into that body).
+    response: web.StreamResponse | None = None
     try:
         async with session.get(
             target, headers=headers, allow_redirects=False, timeout=_HTTP_TIMEOUT
@@ -625,4 +630,21 @@ async def api_browser_view_relay(request: web.Request) -> web.StreamResponse:
             return response
     except (aiohttp.ClientError, OSError) as exc:
         logger.warning("browser view relay could not reach the view server: %s", exc)
+        if response is not None and response.prepared:
+            # The 200 head and some body are already on the wire. Writing a
+            # fresh 502 ``json_response`` here would make aiohttp serialize a
+            # second ``HTTP/1.1 502`` head INTO that streaming body and leave
+            # the connection keep-alive, so the browser reads the status line
+            # as body bytes and the next request reuses a poisoned socket.
+            # Drop the connection instead: ``abort`` discards buffered writes
+            # before aiohttp's post-handler ``write_eof`` can emit a
+            # terminating chunk, and ``force_close`` takes the socket off
+            # keep-alive. The client is left with a body short of what a full
+            # relay would send — the correct signal that the upstream died
+            # mid-stream.
+            transport = request.transport
+            if transport is not None and not transport.is_closing():
+                transport.abort()
+            response.force_close()
+            return response
         return _bad_gateway("browser_view_unreachable", "the browser view did not answer")

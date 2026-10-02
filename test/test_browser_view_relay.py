@@ -14,12 +14,15 @@ upstream died).
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import errno
 import inspect
 import pathlib
 import socket
+import struct
 import textwrap
+import threading
 import time
 from typing import Any, AsyncIterator, Callable, Iterator
 
@@ -496,13 +499,137 @@ def test_dead_upstream_port_cannot_be_taken_by_a_concurrent_worker() -> None:
         assert refused.value.errno == errno.EADDRINUSE
 
 
+@contextlib.contextmanager
+def _upstream_that_cuts_mid_body() -> Iterator[int]:
+    """A raw-socket upstream that sends a 200 head, a little body, then RSTs.
+
+    aiohttp's ``TestServer`` cannot express this: it owns ``write_eof`` and
+    will not leave a body truncated against its announced length. The relay's
+    chunk loop must see the connection drop AFTER ``response.prepare`` — that
+    is the only way to reach the ``except`` with the head already on the wire.
+
+    The listener answers one request: ``HTTP/1.1 200 OK`` with a
+    ``Content-Length`` far larger than the handful of body bytes it then
+    writes, and immediately closes with ``SO_LINGER`` 0 so the kernel sends a
+    RST. The relay reads the first chunk, writes it downstream (head out), and
+    the next read raises ``aiohttp.ClientPayloadError`` (a ``ClientError``) —
+    the body ended before its declared length.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+
+    def _serve() -> None:
+        with contextlib.suppress(OSError):
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(65536)  # drain the request line + headers
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/octet-stream\r\n"
+                    b"Content-Length: 1048576\r\n"
+                    b"\r\n"
+                    b"partial-"
+                )
+                # RST rather than FIN: discard the socket's buffers and abort,
+                # so the peer's next read fails instead of seeing a clean EOF.
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+    worker = threading.Thread(target=_serve, daemon=True)
+    worker.start()
+    try:
+        yield port
+    finally:
+        with contextlib.suppress(OSError):
+            listener.close()
+        worker.join(timeout=5)
+
+
+async def test_a_mid_body_cut_closes_the_body_instead_of_writing_a_second_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upstream failure after the head is out drops the connection.
+
+    The regression: the ``except`` returned a fresh 502 ``json_response`` after
+    ``response.prepare`` had already sent the 200 head and some body, so
+    aiohttp serialized a second ``HTTP/1.1 502`` head INTO the streaming body
+    and left the socket keep-alive — a browser reads the status line as body
+    bytes, and the next request on the reused socket is corrupt.
+
+    Asserted on the raw wire (no ``TestClient``, which would parse the head
+    away): exactly ONE status head crosses, it is the 200 (never a second
+    ``502``), and the connection is closed rather than offered for reuse.
+    """
+    with _upstream_that_cuts_mid_body() as upstream_port:
+        monkeypatch.setattr(
+            browser_cli_view, "relay_authorize", _stub_authorize("ok", upstream_port)
+        )
+        relay = TestServer(_relay_app(), host="127.0.0.1")
+        await relay.start_server()
+        try:
+            relay_port = relay.port
+            assert relay_port is not None
+
+            def _drive() -> tuple[bytes, bool]:
+                # The recv timeout is deliberately SHORTER than any server
+                # keep-alive window: on the bug the relay leaves the socket
+                # open, so the only thing that can end the read is this
+                # timeout — and ``saw_eof`` then stays False, which the
+                # assertion below rejects. A real EOF (an empty ``recv``) is
+                # the fix aborting the transport and closing the connection.
+                recv_timeout = 2.0
+                with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as sock:
+                    sock.sendall(
+                        f"GET /browser-view/{TOKEN}/bin HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{relay_port}\r\n"
+                        "Connection: keep-alive\r\n"
+                        "\r\n".encode()
+                    )
+                    sock.settimeout(recv_timeout)
+                    chunks: list[bytes] = []
+                    saw_eof = False
+                    while True:
+                        try:
+                            data = sock.recv(65536)
+                        except (TimeoutError, OSError):
+                            # Socket still open past the keep-alive-shorter
+                            # window: NOT an EOF — leave ``saw_eof`` False.
+                            break
+                        if not data:
+                            saw_eof = True  # peer closed — the connection ended
+                            break
+                        chunks.append(data)
+                    return b"".join(chunks), saw_eof
+
+            wire, saw_eof = await asyncio.to_thread(_drive)
+        finally:
+            await relay.close()
+
+    # Exactly one HTTP head crossed, and it is the 200 — never a second head
+    # (the 502 the bug wrote into the body) at all.
+    assert wire.count(b"HTTP/1.1") == 1, wire[:400]
+    assert wire.startswith(b"HTTP/1.1 200"), wire[:200]
+    assert b"502" not in wire.split(b"\r\n\r\n", 1)[0], wire[:400]
+    assert b"browser_view_unreachable" not in wire, wire[:400]
+    # The relay streams chunked (no up-front Content-Length), and the abort
+    # discards buffered writes before aiohttp can emit the terminating
+    # ``0\r\n\r\n`` chunk — the truncated body is the signal the upstream died.
+    assert not wire.endswith(b"0\r\n\r\n"), wire[-80:]
+    # And the socket is closed, not offered for reuse: we observed a real EOF
+    # within a window shorter than the server keep-alive. On the bug the relay
+    # leaves the connection keep-alive, so this would be False.
+    assert saw_eof, "relay left the connection open instead of closing it"
+
+
 _FENCE = "proof_not_before"
 _RELAY_AUTHORIZE = "relay_authorize"
 # The exact number of ``relay_authorize`` doubles this module installs. Pinned,
 # so adding or deleting one is a deliberate edit here: a count that only has a
 # lower bound lets a double drop out of the checked population while the
 # self-check stays green.
-_RELAY_AUTHORIZE_INSTALLS = 9
+_RELAY_AUTHORIZE_INSTALLS = 10
 
 
 def _declares_fence(node: ast.AST) -> bool:

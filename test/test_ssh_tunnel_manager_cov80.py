@@ -4,8 +4,9 @@
 the ssh error classifier. What it leaves unobserved is everything that runs when
 a tunnel goes DOWN, plus the whole SSM error vocabulary:
 
-* ``_port_reachable`` — the one-second loopback probe both the readiness wait and
-  the health loop are built on, in both directions;
+* ``_port_reachable`` — the one-second loopback probe the readiness wait
+  (``_wait_until_ready``) is built on, in both directions; the health loop
+  instead checks ``_forward_alive`` (an end-to-end request through the forward);
 * ``_monitor`` — the unexpected-exit path: it must drain stderr, land ERROR with a
   classified message, and notify the manager's ``on_exit`` seam, while a
   DELIBERATE stop stays silent (no ERROR, no self-heal notification);
@@ -144,6 +145,163 @@ class TestPortReachable:
 
         monkeypatch.setattr(asyncio, "open_connection", _accepted)
         assert await _tunnel()._port_reachable() is True
+
+
+class _FakeHealthSession:
+    """An ``aiohttp.ClientSession`` stand-in for ``GET /api/health``.
+
+    ``get_raises`` drives the zombie/dead-forward paths (a bytes-less stall that
+    the client times out on surfaces here as an exception, exactly as it would
+    in ``_forward_alive``'s except arm); ``status`` drives the answered-response
+    paths. Records the requested URL so a test can assert the probe went through
+    the local forward.
+    """
+
+    def __init__(self, *, status: int = 200, get_raises: BaseException | None = None) -> None:
+        self._status = status
+        self._get_raises = get_raises
+        self.requested_url = ""
+
+    def __call__(self, *_a: Any, **_kw: Any) -> "_FakeHealthSession":
+        return self
+
+    async def __aenter__(self) -> "_FakeHealthSession":
+        return self
+
+    async def __aexit__(self, *_a: Any) -> bool:
+        return False
+
+    def get(self, url: str, **_kw: Any) -> Any:
+        self.requested_url = url
+        if self._get_raises is not None:
+            raise self._get_raises
+        status = self._status
+
+        class _Resp:
+            def __init__(self) -> None:
+                self.status = status
+
+            async def __aenter__(self) -> "_Resp":
+                return self
+
+            async def __aexit__(self, *_a: Any) -> bool:
+                return False
+
+        return _Resp()
+
+
+class TestForwardAlive:
+    """``_forward_alive`` — the steady-state end-to-end liveness probe.
+
+    A bare TCP connect is answered by whatever holds the local listening socket,
+    so a zombie SSM forward — ``session-manager-plugin`` alive but relaying
+    nothing — passes ``_port_reachable`` forever and the tunnel is reported
+    CONNECTED while every request through it stalls. ``_forward_alive`` requires
+    a completed ``GET /api/health`` response, which the far end cannot produce
+    when the forward is dead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_zombie_forward_that_never_answers_is_not_alive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gap this probe closes: the connect is accepted, then the far end
+        sends zero bytes and the client times out. That stall must read as NOT
+        alive — a connect-only probe answers True here and misses the zombie
+        entirely."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(get_raises=asyncio.TimeoutError())
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        t = _tunnel()
+        assert await t._forward_alive() is False
+        assert fake.requested_url == "http://127.0.0.1:53997/api/health"
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_forward_that_answers_200_is_alive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(status=200)
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        assert await _tunnel()._forward_alive() is True
+
+    @pytest.mark.asyncio
+    async def test_a_non_2xx_answer_is_still_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A completed response of ANY status proves the far end sent bytes back,
+        so a non-2xx answer still reads as a live forward and is NOT torn down."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(status=404)
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        assert await _tunnel()._forward_alive() is True
+
+    @pytest.mark.asyncio
+    async def test_a_fargate_forward_is_probed_at_the_container_liveness_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fargate tunnel (its ``turn_url`` is set) must probe the container's
+        own ``/health``, not the gateway's ``/api/health`` — the container
+        authorises before routing and would log a control deny for every probe
+        aimed at a path it does not serve."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(status=200)
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        t = _tunnel()
+        t.status.turn_url = "http://127.0.0.1:53997/v1/chat/completions"  # marks fargate
+        assert await t._forward_alive() is True
+        assert fake.requested_url == f"http://127.0.0.1:53997{stm.FARGATE_HEALTH_PATH}"
+
+    @pytest.mark.asyncio
+    async def test_a_connection_error_is_not_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(get_raises=OSError(111, "Connection refused"))
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        assert await _tunnel()._forward_alive() is False
+
+    @pytest.mark.asyncio
+    async def test_an_unallocated_port_is_not_alive(self) -> None:
+        """No forward end to probe — a zero port is refused before any request."""
+        t = _SshTunnel("cd-1", "cd-1-alias", 0, 7777)
+        assert await t._forward_alive() is False
+
+    @pytest.mark.asyncio
+    async def test_the_probe_loop_checks_the_forward_end_to_end_not_just_the_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wiring guard: the health loop must consult ``_forward_alive``, not
+        ``_port_reachable``. A zombie whose local socket is bound
+        (``_port_reachable`` True) but whose far end is dead (``_forward_alive``
+        False) has to tear the tunnel down."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        monkeypatch.setattr(stm, "_PROBE_INTERVAL", 0.01)
+        called = {"port_reachable": 0, "forward_alive": 0}
+
+        t = _tunnel(probe_failure_threshold=2)
+        t._proc = _FakeProc(returncode=None)
+        t.status.state = TunnelState.CONNECTED
+
+        async def _socket_bound() -> bool:
+            called["port_reachable"] += 1
+            return True  # a zombie: the listener is still bound
+
+        async def _far_end_dead() -> bool:
+            called["forward_alive"] += 1
+            return False  # but nothing traverses to the remote gateway
+
+        t._port_reachable = _socket_bound  # type: ignore[assignment]
+        t._forward_alive = _far_end_dead  # type: ignore[assignment]
+        await asyncio.wait_for(t._probe_loop(), timeout=2)
+        await asyncio.sleep(0.05)
+
+        assert called["forward_alive"] >= 2  # the loop consulted the end-to-end check
+        assert called["port_reachable"] == 0  # never the connect-only check
+        assert t._probe_failed is True
+        assert "health probe failed" in t._exit_error(-15)
 
 
 class TestCaptureStderr:

@@ -1124,13 +1124,17 @@ class SlackRenderer(Renderer):
 
         def _bounded() -> list[str]:
             chunks = split_markdown_safe(text, limit, reserve=reserve, redactor=_redact_all)
+            cap = SLACK_MSG_LIMIT - reserve
+
+            def capped(chunk: str) -> list[str]:
+                return chunk_text(chunk, cap) or [chunk]
+
             out: list[str] = []
             for chunk in chunks:
-                cap = SLACK_MSG_LIMIT - reserve
-                pieces = chunk_text(chunk, cap) or [chunk]
-                repaired = repaired_for_delivery(chunk, pieces, _redact_all)
+                pieces = capped(chunk)
+                repaired = repaired_for_delivery(chunk, pieces, _redact_all, capped)
                 if repaired is not None:
-                    pieces = chunk_text(repaired, cap) or [repaired]
+                    pieces = capped(repaired)
                 out.extend(pieces)
             return out
 
@@ -1171,6 +1175,11 @@ class SlackRenderer(Renderer):
                 await self.slack.post_message(self.channel, part, self.thread_ts)
             except Exception:
                 logger.debug("slack: posting a continuation chunk failed", exc_info=True)
+                continue
+            # Recorded like every other confirmed send: the ledger IS the subject
+            # the redaction notice counts, so a continuation left out of it makes an
+            # over-limit answer announce fewer placeholders than it shipped.
+            self._delivered += part
 
     async def _append_task(self, task_id: str, title: str, status: str, details: str = "") -> bool:
         """Append a task card. Never rotates (native ``_append_task``).

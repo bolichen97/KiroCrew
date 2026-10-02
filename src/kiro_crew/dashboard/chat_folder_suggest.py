@@ -313,6 +313,10 @@ async def _pick_via_llm(
                 state.sessions,
                 prompt,
                 sel_source="chat_folder_suggest",
+                # Name the session this call is for. Without it the usage row
+                # falls back to ``_bg``, so every suggestion persists anonymously
+                # and a wrong pick cannot be traced to the session it filed.
+                sel_session_key=slot.key,
                 timeout=_SUGGEST_TIMEOUT_SECS,
             )
         except Exception:  # noqa: BLE001 — best-effort background task

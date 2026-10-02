@@ -45,15 +45,21 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
   // placeholder tab; any other failure is REPORTED rather than shown as the
   // file's text. Bypassed entirely when the IntelliJ plugin handles file opens
   // — the user wanted IDE-native, not in-dashboard.
-  const openFile = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => {
-    try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* ignore */ }
+  const openFile = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean; slot?: string | null }) => {
+    try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* the IDE bridge is optional; the dashboard path below still runs */ }
     if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
     // Capture the slot BEFORE awaiting the read — the same discipline as
     // `saveFile`. `tabsCtl` was bound at the click, so the tab lands in the
     // INITIATING slot's bucket; stamping it with whatever slot is active once
     // the read resolves would route its comment submissions to a chat the user
-    // switched to mid-load.
-    const slot = slotRef.current ?? null
+    // switched to mid-load. In split view every pane shares ONE host opener but
+    // has its OWN slot, so a pane passes `opts.slot` to stamp the tab with the
+    // slot that owns the transcript the file was opened FROM, not whichever
+    // pane the host currently treats as active (#9487 / #9921). An `undefined`
+    // override falls back to the ref, keeping the single-chat and member-DM
+    // hosts byte-for-byte unchanged; an explicit `null` is a deliberate
+    // "no slot" and is honoured.
+    const slot = opts?.slot !== undefined ? opts.slot : (slotRef.current ?? null)
     try {
       const [read] = await Promise.all([
         queryClient.fetchQuery({
@@ -111,7 +117,14 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           // Re-run the involvement scan so the row moves sections live.
           queryClient.invalidateQueries({ queryKey: ['session-artifact-records', slot] })
         })
-        .catch(() => { /* best-effort breadcrumb */ })
+        .catch((e) => {
+          // An incognito slot answers 403 by design; anything else -- an
+          // auth-required 403 included -- is a real failure that leaves the
+          // session's artifact list stale.
+          const r = e as { status?: unknown; authRequired?: unknown; edgeChallenge?: unknown } | null
+          if (r?.status === 403 && !r.authRequired && !r.edgeChallenge) return
+          showActionError(i18nT('pages.chatPage.artifact_reference_failed_reason', { reason: errMessage(e) || i18nT('pages.chatPage.unknown_error') }))
+        })
     }
     // Seed the tab from the artifact list cache when it is already warm so the
     // body paints immediately; ArtifactPanel's own query is authoritative and
@@ -130,7 +143,7 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
     } catch { /* fall through — the panel's own query renders the error state */ }
     tabsCtl.openArtifact({ slug, kind }, content, slot)
     onOpened?.()
-  }, [queryClient, tabsCtl, slotRef, onOpened])
+  }, [queryClient, tabsCtl, slotRef, showActionError, onOpened])
 
   const saveFile = useCallback(async (filePath: string, content: string) => {
     // Capture the slot BEFORE awaiting: if the user switches chats mid-save, the

@@ -88,7 +88,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import stat
 import time
 from pathlib import Path
@@ -222,11 +221,16 @@ def _refuse_linked(path: Path, what: str) -> None:
 
 
 def _is_plain_dir(path: Path) -> bool:
+    """A real directory: not a symlink, not a Windows junction, not a file, not absent.
+
+    ``lstat`` reports a junction as a directory, so a name-surrogate reparse
+    tag is checked too (:func:`platform_compat.lstat_is_name_surrogate`).
+    """
     try:
         info = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISDIR(info.st_mode)
+    return stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info)
 
 
 def _tree_newest_mtime(root: Path, fallback: float) -> float:
@@ -243,6 +247,10 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
     *fallback* turns every tree larger than the cap into a permanently
     active-looking one, so a genuinely abandoned clone could never be
     reclaimed. The walk runs off the event loop on an hourly cadence.
+
+    A Windows junction is not descended either: ``lstat`` reports it as a plain
+    directory, and a dangling one makes ``scandir`` raise, which would read the
+    whole tree as active for good. Its own mtime still counts.
     """
     newest = 0.0
     try:
@@ -254,7 +262,8 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
                 info = os.lstat(entry.path)
                 if info.st_mtime > newest:
                     newest = info.st_mtime
-                if stat.S_ISDIR(info.st_mode):  # lstat: symlinks never descend
+                # lstat: symlinks never descend, nor do Windows junctions.
+                if stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info):
                     stack.append(Path(entry.path))
     except OSError:
         return fallback
@@ -412,12 +421,19 @@ def _reclaim_if_idle(child: Path, reference: float, grace: float) -> bool:
         return False
     if idle < grace:
         return False
+    if platform_compat.rmtree_force(child):
+        return True
+    # rmtree reaches the allocation marker before a file it cannot delete, and an
+    # entry with no marker is never swept again: put it back so a later wake
+    # retries once *grace* has passed again (the rewrite refreshes the tree's
+    # mtime) instead of leaving the remainder forever.
+    logger.warning("work-root: could not fully remove %r; will retry", child.name)
     try:
-        shutil.rmtree(child)
-    except OSError:
-        logger.debug("work-root: could not remove %s", child, exc_info=True)
-        return False
-    return True
+        if os.path.lexists(child):
+            _write_allocation_marker(child)
+    except (OSError, WorkRootBoundaryError):
+        logger.warning("work-root: could not restore the marker of %r", child.name)
+    return False
 
 
 def sweep_work_root(now: float | None = None, *, grace: float = IDLE_GRACE_SECONDS) -> int:

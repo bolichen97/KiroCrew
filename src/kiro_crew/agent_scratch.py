@@ -803,11 +803,16 @@ def _write_rotated(dir_fd: int, name: str, data: bytes) -> None:
 
 
 def _is_plain_dir(path: Path) -> bool:
+    """A real directory: not a symlink, not a Windows junction, not a file, not absent.
+
+    ``lstat`` reports a junction as a directory, so a name-surrogate reparse
+    tag is checked too (:func:`platform_compat.lstat_is_name_surrogate`).
+    """
     try:
         info = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISDIR(info.st_mode)
+    return stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info)
 
 
 def _pgroup_alive(pid: int) -> bool:
@@ -846,6 +851,13 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
     (``asyncio.to_thread``) on an hourly cadence, and its size is bounded
     by what one runtime wrote into its OWN scratch dir, so a full metadata
     walk is the right trade (see ``mcp_gateway.backend_tmp``).
+
+    A Windows junction is not descended either. ``lstat`` reports a junction
+    as a plain directory, so testing ``S_ISDIR`` alone walks into its target:
+    a tree outside scratch, or, once a test deletes that target, nothing --
+    and the ``scandir`` of a dangling junction raises, which pinned every
+    tree holding one as active for good. The junction's own mtime still
+    counts, like a symlink's.
     """
     newest = 0.0
     try:
@@ -857,11 +869,31 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
                 info = os.lstat(entry.path)
                 if info.st_mtime > newest:
                     newest = info.st_mtime
-                if stat.S_ISDIR(info.st_mode):  # lstat: symlinks never descend
+                # lstat: symlinks never descend, nor do Windows junctions.
+                if stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info):
                     stack.append(Path(entry.path))
     except OSError:
         return fallback
     return newest
+
+
+def _restore_owner_after_partial_delete(child: Path, pids: tuple[int, ...]) -> None:
+    """Put the owner marker back over a tree the sweep could not fully remove.
+
+    ``rmtree`` reaches the marker long before a file it cannot delete (a name
+    that sorts first, beside a file still held open), so a partial delete leaves
+    a tree with no marker -- and an ownerless tree is never deleted, so the
+    leftover would stay on disk for good. Writing back the same dead pids
+    restores exactly the evidence the sweep already judged. The rewrite and the
+    deletions refresh the tree's mtime, so the retry comes once the grace window
+    has passed again. Best effort: a failure here is logged, never raised.
+    """
+    logger.warning("agent-scratch: could not fully remove %r; will retry", child.name)
+    try:
+        if os.path.lexists(child):
+            _write_owner_marker(child, pids)
+    except (OSError, ScratchBoundaryError):
+        logger.warning("agent-scratch: could not restore the owner of %r", child.name)
 
 
 def sweep_dead_scratch(now: float | None = None) -> int:
@@ -947,7 +979,9 @@ def sweep_dead_scratch(now: float | None = None) -> int:
                     continue
             except OSError:
                 continue
-            shutil.rmtree(child, ignore_errors=True)
+            if not platform_compat.rmtree_force(child):
+                _restore_owner_after_partial_delete(child, pids)
+                continue
         removed += 1
     if removed:
         logger.info("agent-scratch: sweep removed %d dead idle scratch dir(s)", removed)

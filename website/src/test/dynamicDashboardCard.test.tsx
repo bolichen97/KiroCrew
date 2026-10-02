@@ -98,6 +98,16 @@ describe('host-owned card freshness and cost controls', () => {
     expect(get).not.toHaveBeenCalled()
   })
 
+  it('never requests a card for an adopted worker, whose only parent edge is the session tree', () => {
+    const get = vi.spyOn(api, 'dashboardCard')
+    const store = createTestStore()
+    store.dispatch(sseSlots([{ key: 'root', messages: 2, running: false },
+      { key: 'adopted', messages: 2, running: false, parent: { slot: 'root', key: 'root' } }]))
+    renderWithProviders(<SessionStatusFrame slot="adopted" title="Adopted" active />, { store })
+    expect(screen.getByRole('status')).toHaveTextContent('Content generation is unavailable for this session.')
+    expect(get).not.toHaveBeenCalled()
+  })
+
   it('drops an already displayed card immediately when its slot becomes private', async () => {
     const get = vi.spyOn(api, 'dashboardCard').mockResolvedValue({
       card: { html: '<p>Earlier content</p>', data: {} }, status: 'published',

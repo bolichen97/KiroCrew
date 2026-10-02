@@ -26,7 +26,7 @@ from kiro_crew.dashboard.handlers.taskrunner import (
     api_taskrunner_execute_plan,
     api_taskrunner_start,
 )
-from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, ToolHookResult
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import reset_singleton, safety_override
 from kiro_crew.task_models import Project
@@ -332,7 +332,9 @@ class TestAutoApproveRespectsHookDeny:
         ctx.conversation_log.get_metadata_status.return_value = ({}, True)
         ctx.memory_mode_for_session = AsyncMock(return_value="persistent")
         ctx.build_message = MagicMock(return_value=("prompt", {}))
-        ctx.hooks.on_tool_call = MagicMock(return_value=MagicMock(action=TOOL_DENY))
+        # A real ToolHookResult: the deny path now steers the hook's reason
+        # (a str) into the turn, which a bare MagicMock double cannot stand in for.
+        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_DENY))
 
         runner = TaskRunner(
             sessions=sessions, context_builder=ctx, auto_test=False, work_dir=tmp_path

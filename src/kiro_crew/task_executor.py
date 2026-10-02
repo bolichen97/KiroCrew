@@ -30,6 +30,7 @@ from kiro_crew.agent_sdk.spec_hooks import (
     turn_spec_hooks,
 )
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.constants import DENY_CAUSE_POLICY, DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import (
     TOOL_AUTO_APPROVE,
@@ -39,7 +40,11 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
     permission_pre_tool_block,
 )
-from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
+from kiro_crew.llm_helpers import (
+    _steer_host_deny,
+    provider_last_turn_usage,
+    stream_and_collect_json,
+)
 from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
 from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
@@ -75,6 +80,16 @@ if TYPE_CHECKING:
     from kiro_crew.taskq.adapters.runner import Admitted
 
 _MID_STREAM_COMPACT_PCT = 90.0
+
+#: What the model is told when an unattended task run refuses a tool call it has
+#: no positive authorization for. Says what the surface permits (the
+#: surface-policy notice tells the model to read exactly that) and nothing
+#: about the call itself, which was never judged.
+_HEADLESS_DENY_REASON = (
+    "this task run is unattended: no approval handler is attached and no hook "
+    "auto-approve trusts this tool, so only tools listed in hooks.auto_approve_tools "
+    "can run here"
+)
 
 
 class _ContextOverflow(Exception):
@@ -369,19 +384,62 @@ async def execute_single_task(
     return success
 
 
-async def _reject_and_log(client, history, session_key, agent, event, *, metadata=None):
-    """Reject a tool call and log the rejection."""
-    await client.reject_tool(event.request_id)
+async def _reject_and_log(
+    client,
+    history,
+    session_key,
+    agent,
+    event,
+    *,
+    cause: str | None,
+    reason: str = "",
+    outcome: str = "rejected",
+    error: str | None = None,
+    metadata=None,
+):
+    """Audit a tool rejection, tell the model WHO refused it, then answer the wire.
+
+    The task runner's single reject funnel: every ``reject_tool`` in this module
+    goes through here so a path added later cannot deny by omission
+    (``test_taskrunner_deny_notice`` walks the file to keep that true).
+
+    *cause* is REQUIRED and says whether the HOST refused this call. A rejected
+    permission reaches the model as kiro-cli's fixed "User denied tool
+    execution"; for a host deny that is a refusal that never happened, and the
+    model abandons or routes around a call nobody objected to. So a host cause
+    (``DENY_CAUSE_POLICY`` for a hook or policy verdict on the call itself,
+    ``DENY_CAUSE_SURFACE_POLICY`` for the unattended run refusing every
+    un-trusted call) steers the in-band notice through ``llm_helpers``'
+    ``_steer_host_deny`` BEFORE the reject -- while the permission request is
+    still unanswered the turn is provably in flight, which is what gets the
+    notice queued rather than dropped (see ``kiro_crew.deny_notice``). ``None``
+    is the explicit verdict that this is NOT a host deny and must stay bare:
+    the interactive handler said no (kiro-cli's wording is then the truth, and
+    "this was NOT a user action" would be a lie), or the turn is being torn
+    down for a mid-stream compaction and re-run, so there is no continuing turn
+    for a notice to correct. A caller has to write one or the other; there is
+    no default to inherit the wrong answer from.
+
+    The SEL row is written FIRST, before the steer and the reject, as on every
+    other deny surface: the steer is one more bounded await on the ACP pipe, and
+    a backend that stops reading stdin cancels this coroutine at the turn
+    deadline with the decision acted on and never audited if the row came last.
+    ``outcome`` / ``error`` let a hook deny keep the row shape it always wrote.
+    """
     history.log_tool_invocation(
         session_key=session_key,
         agent=agent or "kirocrew",
         source="taskrunner",
         tool_name=event.title,
         tool_kind=event.tool_kind,
-        outcome="rejected",
+        outcome=outcome,
         request_id=event.request_id,
+        **({"error": error} if error else {}),
         **({"metadata": metadata} if metadata else {}),
     )
+    if cause is not None:
+        await _steer_host_deny(client, event, reason, cause=cause)
+    await client.reject_tool(event.request_id)
 
 
 async def execute_task(
@@ -587,12 +645,18 @@ async def execute_task(
                         )
                     if _spec_block is not None:
                         logger.warning("task step PreToolUse hook blocked a tool: %s", _spec_block)
+                        # A PreToolUse gate verdict on the call itself (a
+                        # delivered deny, or a gate with no verdict, which
+                        # blocks) -- the policy cause, as the chat runner
+                        # steers the same BLOCKED strings.
                         await _reject_and_log(
                             client,
                             sel(),
                             session_key,
                             agent,
                             event,
+                            cause=DENY_CAUSE_POLICY,
+                            reason=_spec_block,
                             metadata={"reason": "spec_hook_deny"},
                         )
                         continue
@@ -610,15 +674,18 @@ async def execute_task(
                             **hook_gate_kwargs(event),
                         )
                         if tool_result.action == TOOL_DENY:
-                            await client.reject_tool(event.request_id)
-                            sel().log_tool_invocation(
-                                session_key=session_key,
-                                agent=agent or "kirocrew",
-                                source="taskrunner",
-                                tool_name=event.title,
-                                tool_kind=event.tool_kind,
+                            # The hook judged the call itself: a policy
+                            # verdict, with the hook's own reason so the class
+                            # remediation can key off it.
+                            await _reject_and_log(
+                                client,
+                                sel(),
+                                session_key,
+                                agent,
+                                event,
+                                cause=DENY_CAUSE_POLICY,
+                                reason=tool_result.reason or "",
                                 outcome="denied",
-                                request_id=event.request_id,
                                 error="hook_deny",
                             )
                             continue
@@ -701,12 +768,16 @@ async def execute_task(
                     # would be skipped whenever a tool is about to be rejected.
                     pct = client.context_usage_pct()
                     if pct >= _MID_STREAM_COMPACT_PCT:
+                        # Not a verdict on the call: the turn is abandoned
+                        # here and re-run after compaction, so there is no
+                        # continuing turn for a deny notice to correct.
                         await _reject_and_log(
                             client,
                             sel(),
                             session_key,
                             agent,
                             event,
+                            cause=None,
                             metadata={"reason": "context_overflow", "pct": pct},
                         )
                         raise _ContextOverflow(pct)
@@ -719,7 +790,12 @@ async def execute_task(
                         run.last_task_time = _time.time()
                         approved = await on_tool_approval(event)
                         if not approved:
-                            await _reject_and_log(client, sel(), session_key, agent, event)
+                            # The person (or the surface answering for them)
+                            # said no: kiro-cli's "user denied" is the truth
+                            # here, so no notice -- interactive_rejected.
+                            await _reject_and_log(
+                                client, sel(), session_key, agent, event, cause=None
+                            )
                             continue
                         approve_reason = "interactive_approved"
                     else:
@@ -733,12 +809,18 @@ async def execute_task(
                         # would bypass the SafetyOverride 24h TTL, and honoring the
                         # override would reintroduce the global-YOLO dependency this
                         # change deliberately avoids.
+                        # The SURFACE refuses the call, not a rule about the
+                        # call itself: nothing here can approve it, so the
+                        # notice names what this run permits instead of a
+                        # sanctioned alternative the model should run.
                         await _reject_and_log(
                             client,
                             sel(),
                             session_key,
                             agent,
                             event,
+                            cause=DENY_CAUSE_SURFACE_POLICY,
+                            reason=_HEADLESS_DENY_REASON,
                             metadata={"reason": "headless_no_authorization"},
                         )
                         continue

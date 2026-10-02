@@ -49,6 +49,7 @@ vi.mock('../api/client', () => ({
     chatSlots: vi.fn().mockResolvedValue([]),
     chatSlotDetail: vi.fn(async () => ({ messages: detail.messages, running: false, has_more: false, total: detail.messages.length })),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
+    dashboardConfig: vi.fn().mockResolvedValue({}),
     models: vi.fn().mockResolvedValue([]),
     agents: vi.fn().mockResolvedValue([]),
     agentDetail: vi.fn().mockResolvedValue({}),
@@ -209,7 +210,7 @@ describe('unresumable-resume notice on the chat pane (#5925)', () => {
     await renderWith({ key: 'member-ada', title: 'Ada', surface: 'member', reason: 'surface' })
 
     const notice = await screen.findByTestId('unresumable-resume-error')
-    expect(notice.textContent).toContain('Crew Members')
+    expect(notice.textContent).toContain('Crewmates')
     expect(notice.textContent).not.toContain('member session')
   })
 })

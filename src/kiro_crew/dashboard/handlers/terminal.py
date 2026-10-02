@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -26,6 +27,7 @@ from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.origin import check_origin, mark_audit_claimed
 from kiro_crew.executors import discovery_executor, subprocess_executor
 from kiro_crew.hooks import validate_file_path
+from kiro_crew.notifications.bus import NotificationBus, NotificationPayload
 from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, RLIMIT_PROFILE_NONE, spawn_shim_argv
 from kiro_crew.security import (
     is_sensitive_path,
@@ -85,6 +87,16 @@ _OWNER_CONTROL_SEND_TIMEOUT_S = 2.0
 # that socket: two live windows must not displace each other in a loop.
 _STALE_OWNER_ERROR_MESSAGE = "Another connection owns this terminal session"
 _STALE_OWNER_ERROR_CODE = "displaced"
+# Private-use WebSocket close code: the shell is gone, so clients must close the
+# tab instead of treating the close as a transient drop and redialing.
+_TERMINAL_WS_CLOSE_SHELL_EXITED = 4001
+# Ceiling on the wait for the child to be reaped after reader EOF. Set by
+# ConPTY, which took 3.08s to report a clean ``cmd.exe`` exit dead on
+# windows-latest; POSIX resolves in well under 20ms, so there the bound only
+# matters for a child that never goes.
+_CHILD_REAP_TIMEOUT_S = 10.0
+# ConPTY has no child watcher, so its liveness is polled at this interval.
+_CONPTY_STATUS_POLL_S = 0.05
 
 
 def _sel():
@@ -285,6 +297,7 @@ async def _close_terminal_ws_bounded(
     *,
     error_message: str | None = None,
     error_code: str | None = None,
+    close_code: int | None = None,
 ) -> None:
     """Best-effort terminal WebSocket cleanup with bounded transport waits."""
     if ws.closed:
@@ -303,8 +316,9 @@ async def _close_terminal_ws_bounded(
     if ws.closed:
         return
     try:
+        close = ws.close() if close_code is None else ws.close(code=close_code)
         await asyncio.wait_for(
-            ws.close(),
+            close,
             timeout=_TERMINAL_WS_CLEANUP_TIMEOUT_S,
         )
     except (ConnectionResetError, RuntimeError, OSError, asyncio.TimeoutError):
@@ -1139,6 +1153,127 @@ def _sess_pid(sess: "_TerminalSession") -> int | None:
     return sess.proc.pid if sess.proc is not None else None
 
 
+async def _child_exit_status(sess: _TerminalSession) -> int | None:
+    """Wait, bounded, for the session's child to go; return its exit status.
+
+    ``None`` when the status is unavailable: the child outlived
+    ``_CHILD_REAP_TIMEOUT_S``, or it ran under ConPTY, whose wrapper reports
+    liveness but no exit code. Callers tell those apart with ``_sess_alive``.
+    """
+    wp = sess.winpty
+    if wp is not None:
+        # Poll the non-blocking ``isalive()`` rather than pywinpty's ``wait()``,
+        # whose executor thread cannot be cancelled at the deadline.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CHILD_REAP_TIMEOUT_S
+        while wp.isalive():
+            if loop.time() >= deadline:
+                return None
+            await asyncio.sleep(_CONPTY_STATUS_POLL_S)
+        return None
+    proc = sess.proc
+    if proc is None:
+        return None
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_CHILD_REAP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return None
+    return proc.returncode
+
+
+def _shell_failure_note(status: int) -> tuple[str, str]:
+    """Title and body of the bell note for a shell that exited non-zero.
+
+    The title is fixed; the body says how the shell ended, and asyncio reports
+    a death by signal as a negative code, so that case names the signal
+    instead. The note carries
+    nothing about the session itself -- no id, shell path or directory --
+    because the notification feed reaches every dashboard session, including
+    ones that are not the terminal's owner.
+    """
+    if status < 0:
+        try:
+            how = f"was killed by {signal.Signals(-status).name}"
+        except ValueError:
+            how = f"was killed by signal {-status}"
+    else:
+        how = f"exited with code {status}"
+    return "Terminal exited abnormally", f"The shell {how}."
+
+
+def _notify_shell_failed(bus: NotificationBus, sess: _TerminalSession, status: int) -> None:
+    """Push one bell-feed note for a shell that exited with a non-zero code.
+
+    The tab closes with the shell, so this note is the only place the code is
+    left to read. One ``group_key`` for all sessions, so a shell dying in a
+    loop stacks. Best-effort: a refusing bus is logged and the reap goes on.
+    """
+    title, body = _shell_failure_note(status)
+    try:
+        bus.push(
+            NotificationPayload(
+                source="system",
+                channel="system.terminal",
+                title=title,
+                body=body,
+                group_key="terminal-exit",
+                meta={"status": status},
+            )
+        )
+    except Exception:  # noqa: BLE001 -- the reap must not depend on the feed
+        logger.warning(
+            "terminal %s: could not publish the exit notification", sess.session_id, exc_info=True
+        )
+
+
+async def _handle_pty_reader_end(
+    registry: dict[str, _TerminalSession | None],
+    sess: _TerminalSession,
+    *,
+    bus: NotificationBus | None = None,
+) -> None:
+    """Close the tab of a session whose shell exited on its own, then reap it.
+
+    The reader also ends on a deliberate teardown (``DELETE``, the orphan
+    sweep, a dial replacing a dead entry), which raises the same ``OSError``.
+    Each of those pops the registry entry or cancels this task before closing
+    the fd, so the identity check below tells them apart from an exit.
+
+    The attached window gets ``{"type": "exit", "status": N|null}`` and a 4001
+    close, and removes the tab. A detached window learns nothing here: its next
+    dial finds no entry, which the client already reads as a fresh session.
+    """
+    if registry.get(sess.session_id) is not sess:
+        return  # deliberate teardown, already accounted for by its own path
+    status = await _child_exit_status(sess)
+    if registry.get(sess.session_id) is not sess:
+        return  # teardown or replacement took the slot while status resolved
+    if status is None and _sess_alive(sess):
+        return  # the fd closed under a child that is still running: not an exit
+    if bus is not None and status is not None and status != 0:
+        # Published before any transport await so owner churn cannot lose it.
+        _notify_shell_failed(bus, sess, status)
+    async with sess.replace_lock:
+        # Serialized with reconnect publication: a reconnect that won the lock
+        # is the owner told below; one queued behind it finds the entry gone.
+        if registry.get(sess.session_id) is not sess:
+            return
+        ws = sess.ws
+        if ws is not None:
+            await _send_owner_control_frame(sess, ws, {"type": "exit", "status": status})
+            if sess.ws is ws:
+                await _close_terminal_ws_bounded(ws, close_code=_TERMINAL_WS_CLOSE_SHELL_EXITED)
+        if registry.get(sess.session_id) is not sess:
+            return
+        registry.pop(sess.session_id, None)
+    # We run inside reader_task. On ConPTY, _kill_session cancels and awaits the
+    # reader before terminating the child, which from inside that task would
+    # abort the teardown before the pseudo-console is closed.
+    sess.reader_task = None
+    await _kill_session(sess)
+
+
 async def _kill_session(sess: _TerminalSession) -> None:
     """Kill PTY process and close FDs for a session."""
     # Windows ConPTY backend: terminate the pseudo-console child and close its
@@ -1279,6 +1414,10 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         - Client→Server: {"type":"resize","cols":N,"rows":N}
         - Client→Server: {"type":"ping"}
         - Server→Client: {"type":"pong"}
+        - Server→Client: {"type":"exit","status":N|null} -- the shell exited on
+          its own; the socket closes with 4001 and the session is reaped, so
+          the client closes the tab instead of redialing. ``status`` is null
+          when the exit code is unavailable.
     """
     # A WebSocket upgrade is a GET, and `csrf_middleware` validates the origin
     # only for unsafe methods, so the handshake would otherwise arrive
@@ -1367,9 +1506,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         )
     existing = registry.get(session_id)
     if existing and not _sess_alive(existing):
-        # Process died — clean up stale entry
+        # Process died — clean up stale entry. The reader is cancelled first:
+        # the kill's awaits would otherwise let it reach its exit handling and
+        # reap this entry as a shell exit under the teardown.
+        if existing.reader_task is not None:
+            existing.reader_task.cancel()
         await _kill_session(existing)
-        del registry[session_id]
+        registry.pop(session_id, None)  # type: ignore[arg-type]
         existing = None
 
     # Reserve slot synchronously before any await to prevent race condition
@@ -1413,6 +1556,22 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             )
             return ws
         sess = existing
+        if registry.get(session_id) is not sess:
+            # A shell exit reaped this session while the reconnect queued on
+            # replace_lock, so the socket was published on a dead entry. The
+            # 4001 close tells this window what the exit already told the last
+            # one: the shell is gone, close the tab rather than redial.
+            _sel().log_api_access(
+                caller=caller,
+                operation="terminal.ws.reconnect",
+                outcome="error",
+                source="dashboard",
+                resources=f"session={session_id},reaped_during_reconnect=1",
+            )
+            await _close_terminal_ws_bounded(
+                ws, close_code=_TERMINAL_WS_CLOSE_SHELL_EXITED
+            )
+            return ws
         _sel().log_api_access(
             caller=caller,
             operation="terminal.ws.reconnect",
@@ -1594,7 +1753,12 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 pass
 
     # --- Read loop: PTY → WebSocket ---
+    notification_bus: NotificationBus | None = getattr(
+        request.app.get("state"), "notification_bus", None
+    )
+
     async def read_pty():
+        reader_ended = False
         try:
             loop = asyncio.get_running_loop()
             if sess.winpty is not None:
@@ -1604,10 +1768,15 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             while True:
                 data = await loop.run_in_executor(None, reader)
                 if not data:
+                    reader_ended = True
                     break
                 await _record_and_forward_terminal_output(sess, data)
         except OSError:
-            pass
+            # EIO: the child exited, or a teardown closed the fd under us.
+            # _handle_pty_reader_end tells those apart.
+            reader_ended = True
+        if reader_ended:
+            await _handle_pty_reader_end(registry, sess, bus=notification_bus)
 
     if sess.reader_task is None or sess.reader_task.done():
         sess.reader_task = asyncio.ensure_future(read_pty())
