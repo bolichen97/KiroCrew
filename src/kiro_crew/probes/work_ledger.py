@@ -122,12 +122,14 @@ class WorkLedgerProbe(irq.Probe):
     def __init__(
         self,
         *,
+        standby: bool = False,
         worker_running: Callable[[str], bool] | None = None,
         worker_closed: Callable[[str], bool] | None = None,
     ) -> None:
         self._worker_running = worker_running or _always_idle
         self._worker_closed = worker_closed or _always_open
         self._conductor = ""
+        self._standby = standby
 
     # -- Probe contract ---------------------------------------------------
 
@@ -168,7 +170,13 @@ class WorkLedgerProbe(irq.Probe):
         watch.
         """
         key = self._conductor or _conductor_key(getattr(ctx, "message", ""))
-        record = work_ledger.read_conductor(key)
+        record = (
+            work_ledger.read_conductor(key, strict=True)
+            if self._standby
+            else work_ledger.read_conductor(key)
+        )
+        if record is None and self._standby:
+            return irq.Tick()
         if record is None:
             # No ledger, or one that could not be read. Deliberately NOT the same
             # answer as "a ledger with no items": a conductor that has not opened
@@ -197,7 +205,9 @@ class WorkLedgerProbe(irq.Probe):
                 newest[item.item_id] = events[-1].id
         epoch = ledger_wake.revision(newest)
 
-        if items and all_readable and all(item.is_terminal for item in items):
+        if self._standby and not all_readable:
+            return irq.Tick(fetch_ok=False, detail="work ledger incomplete")
+        if not self._standby and items and all_readable and all(item.is_terminal for item in items):
             # Every item closed means the goal this ledger serves is finished, so
             # the watch has nothing left to observe. Requires at least one item on
             # purpose: "all of nothing" is vacuously true, and a watch armed
@@ -331,6 +341,10 @@ class WorkLedgerProbe(irq.Probe):
         costing one extra wake. Refusing costs the conductor its event-driven wakes
         while the file cannot be written, and its plain timer still runs the goal.
         """
+        if self._standby:
+            # Standby counts accepted turns in its protected wake window, not
+            # observations during ordinary program checks.
+            return True
         if not ledger_wake.within_rate_limit(conductor_key, item_id, token=token):
             logger.debug(
                 "work-ledger probe: item %s is over its wake budget; folding forward",

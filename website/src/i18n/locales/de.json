@@ -6118,7 +6118,15 @@
       "judge_outcome_fallback": "keine Bewertung",
       "judge_outcome_unknown": "unbekannt",
       "judge_no_verdict": "noch kein Urteil",
-      "default_goal": "Dein Nordstern steht in {{northStar}}, die Roadmap in {{roadmap}}, die Aufgaben in {{tasks}}. Wähle den einen nächsten Schritt mit der größten Wirkung auf das Ziel und führe ihn aus. Aktualisiere {{tasks}}. Melde eine Blockade nur EINMAL, wenn du wirklich festsitzt. Wenn das Ziel erreicht ist, rufe das Tool {{stopTool}} auf, um die Schleife zu beenden."
+      "default_goal": "Dein Nordstern steht in {{northStar}}, die Roadmap in {{roadmap}}, die Aufgaben in {{tasks}}. Wähle den einen nächsten Schritt mit der größten Wirkung auf das Ziel und führe ihn aus. Aktualisiere {{tasks}}. Melde eine Blockade nur EINMAL, wenn du wirklich festsitzt. Wenn das Ziel erreicht ist, rufe das Tool {{stopTool}} auf, um die Schleife zu beenden.",
+      "standby": "Bereitschaft für das Arbeitsprotokoll",
+      "standby_help": "Warten ohne Modellaufrufe. Ereignisse oder geplante Prüfungen lösen bis zu 12 Runden pro Stunde aus. Stopp pausiert die Bereitschaft; erledigte Aufgaben lassen sie aktiv.",
+      "probe_interval": "Sekunden zwischen Protokollprüfungen",
+      "standby_instruction": "Lies das Arbeitsprotokoll, prüfe erledigte Arbeit und benachrichtige mich einmal. Plane eine Prüfung für ausstehende Abnahmen. Bleibe danach in Bereitschaft.",
+      "standby_paused_auth": "Bereitschaft pausiert: Berechtigung fehlt. Prüfen Sie die Freigabe vor dem Fortsetzen.",
+      "standby_paused_failure": "Bereitschaft nach wiederholten Lese- oder Ausführungsfehlern pausiert. Prüfen Sie das Dienstprotokoll.",
+      "standby_paused_interrupted": "Bereitschaft nach unterbrochener Ausführung pausiert. Prüfen Sie vor dem Fortsetzen bereits ausgeführte Aktionen.",
+      "standby_rate_limit": "Aufwecklimit erreicht. Ausstehende Arbeit wird fortgesetzt, sobald das Stundenfenster frei wird."
     },
     "bottomTerminalPanel": {
       "close_terminal": "Terminal schließen",

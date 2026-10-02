@@ -739,6 +739,14 @@ def schemas() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "check_after_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 2592000,
+                        "description": "Schedule one check on an owner-authorized work-ledger standby. "
+                        "Use alone; 0 cancels. Minimum effective delay is 15 seconds. "
+                        "Does not authorize standby or resume a stopped loop.",
+                    },
                     "message": {
                         "type": "string",
                         "description": (
@@ -2021,6 +2029,8 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
             f"Discord session (current session_key={sk!r}).",
         )
     patch: dict[str, Any] = {}
+    if args.get("check_after_secs") is not None:
+        patch["check_after_secs"] = args["check_after_secs"]
     if args.get("message") is not None:
         new_message = str(args["message"]).strip()
         if not new_message:

@@ -3893,18 +3893,28 @@ it.
 
 ## Patrol
 
-Arm a loop on your own session with `monitor_start`, carrying the cycle
-instructions AND the exit condition, then end the turn. Take its bounds from
-the goal-conductor skill's `patrol_budget.py check`, and on every cycle whose
-nudge's `[patrol budget: ...]` line ends `10% or less left`, run `patrol_budget.py
-renew` and apply what it prints with `monitor_update` — a spent loop cannot be
-renewed later. A reply saying
-*requested* confirms receipt only — do not retry it in the same turn.
-Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If arming is refused outright, say no
-loop is running and drive that one round with `wait`. Call `autonudge_stop` when
-you stop. (The loop is on a timer today. When `monitor_start` accepts a
-`watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
-costing a turn.)
+Inspect existing automation first. If the owner enabled member Perpetual mode,
+keep its existing loop and apply `monitor_update(watch="work-ledger")` before
+considering a finite loop. Only its protected owner grant enables standby.
+
+An owner-authorized work-ledger standby
+stays armed without lifetime renewal. Keep it: do not replace it, change its
+bounds, or call `autonudge_stop` when an individual task completes. Before
+yielding on pending machine-checkable acceptance, register the next check with
+`monitor_update(check_after_secs=300)` (choose an appropriate interval). Cancel
+an obsolete deadline with `check_after_secs=0`. Ask for human input once and
+wait for the reply without periodic reminders. On completion, notify the owner
+once and record the notification in the ledger, then remain in standby.
+
+Only when standby is absent, arm a finite loop on your own session with
+`monitor_start`, `watch="work-ledger"`, cycle instructions and an exit condition.
+Take its bounds from the goal-conductor skill's `patrol_budget.py check`. When
+its `[patrol budget: ...]` line ends `10% or less left`, run `patrol_budget.py
+renew` and apply the result with `monitor_update` before the finite loop expires.
+A reply saying *requested* confirms receipt only; do not retry in the same turn.
+Confirm activation from the gateway notice or `monitor_inspect` on a later turn.
+If arming is refused, say no loop is running and drive that one round with
+`wait`. Stop a finite loop when its goal ends. Never grant yourself standby authority or resume after a user Stop.
 
 Each cycle, `work_ledger_read` with `compact=true` FIRST. It returns every
 item's status columns and the derived `orphaned` and `stale` flags — small

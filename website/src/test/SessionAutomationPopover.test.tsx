@@ -197,6 +197,23 @@ describe('SessionAutomationPopover', () => {
     expect(screen.queryByRole('button', { name: 'Restart monitor' })).toBeNull()
   })
 
+  it('preserves standby through REST and websocket normalization into the live popover', () => {
+    const wire = { id: 'standby-1', slot_key: 'chat-1', standby: true,
+      message: 'Read the ledger', active: true, idle_secs: 60, max_cycles: 0,
+      cycle_count: 0, last_fire_ts: 0, next_due_ts: 1_900_000_000 }
+    const rest = normalizeAutomationRecord({ ...wire, gate: true,
+      monitor: { version: 1, kind: 'work-ledger', target: 'chat-1' },
+    })!
+    const pushed = normalizeAutomationRecord({ event: 'updated', loop: wire })!
+    expect(pushed).toEqual(rest)
+    const { rerenderAutomation } = renderPopover(rest)
+    expect(screen.getByLabelText('Seconds between ledger checks')).toBeInTheDocument()
+    expect(screen.queryByText(/Next cycle in/)).toBeNull()
+    expect(screen.queryByText(/invokes the agent every cycle/)).toBeNull()
+    rerenderAutomation(pushed)
+    expect(screen.getByLabelText('Seconds between ledger checks')).toBeInTheDocument()
+  })
+
   it('preserves the legacy loop deadline through the compatibility bridge', () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_899_999_880_000)
 

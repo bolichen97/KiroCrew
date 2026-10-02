@@ -1149,10 +1149,12 @@ class TestPerpetualRoute:
                 "idle_secs": None,
                 "max_cycles": None,
                 "active": False,
+                "fresh_run": False,
                 "max_runtime_secs": None,
                 "banner": None,
                 "expect_fingerprint": None,
                 "judge": None,
+                "watch": None,
             }
         ]
         # The AUTHORIZATION went with the pause: the owner entry is the whole

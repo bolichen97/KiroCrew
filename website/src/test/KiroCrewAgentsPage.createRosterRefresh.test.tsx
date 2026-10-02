@@ -111,8 +111,11 @@ describe('NewCrewmateDialog opened from KiroCrewAgentsPage', () => {
     // The host's list was re-read, so `existingNames` now holds radar and a
     // resubmit is refused here instead of posting a second create.
     expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(2)
-    // And the Crewmates-page door is still invalidated by the same reconcile.
-    expect(queryClient.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.isInvalidated).toBe(true)
+    // Perpetual observes this roster too, so invalidation immediately refetches
+    // it. The new contents prove the other door has refreshed.
+    await waitFor(() =>
+      expect(queryClient.getQueryData(MEMBERS_ROSTER_QUERY_KEY)).toEqual([{ name: 'radar', slug: 'radar' }]),
+    )
     // And the crew manager's config-derived list, which the SAME write lands in,
     // is refreshed too: the reconcile must refresh the identical pair the success
     // path does, or a committed-but-lost create stays absent from the config view
@@ -126,7 +129,7 @@ describe('NewCrewmateDialog opened from KiroCrewAgentsPage', () => {
 
   it('refreshes this page\'s roster when a dropped create cannot be reconciled at all', async () => {
     const { queryClient } = await openCreateDialog()
-    queryClient.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [])
+    queryClient.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [{ name: 'stale', slug: 'stale' }])
     expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(1)
 
     // Neither the request nor the roster read answers: whether the create landed
@@ -139,6 +142,8 @@ describe('NewCrewmateDialog opened from KiroCrewAgentsPage', () => {
     await screen.findByTestId('crewmate-create-unconfirmed')
 
     expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(2)
-    expect(queryClient.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.isInvalidated).toBe(true)
+    await waitFor(() =>
+      expect(queryClient.getQueryData(MEMBERS_ROSTER_QUERY_KEY)).toEqual([]),
+    )
   })
 })

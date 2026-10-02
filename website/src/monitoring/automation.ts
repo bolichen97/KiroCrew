@@ -87,6 +87,7 @@ export const MONITOR_STATUS_KEYS: Record<MonitorStatus, string> = {
 
 export interface LegacyGoalLoop {
   kind: 'legacy_goal_loop'
+  standby?: boolean
   id: string
   slotKey: string
   message: string
@@ -351,9 +352,14 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
   const slotKey = dashboardAutomationSlotKey(text(loop.slot_key, text(envelope.slot)))
   if (!id || !slotKey) return null
 
-  if (!owns(loop, 'monitor')) {
+  const standbyMonitor = object(loop.monitor)
+  const knownStandby = loop.standby === true && loop.gate === true
+    && standbyMonitor?.version === 1 && standbyMonitor.kind === 'work-ledger'
+    && standbyMonitor.target === slotKey
+  if (!owns(loop, 'monitor') || knownStandby) {
     return {
       kind: 'legacy_goal_loop',
+      ...(loop.standby === true ? { standby: true } : {}),
       id,
       slotKey,
       message: text(loop.message),
