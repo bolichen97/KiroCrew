@@ -169,6 +169,92 @@ key-space characters. And the cron path's plural batch assembly is a driver
 change, which is the consolidation's own step. Until that step an author adding a
 cron-path kind still subclasses `irq.Probe`.
 
+## Owner-authorized work-ledger standby
+
+The Goal popover can create a `standby: true` work-ledger loop for a dashboard
+session through the
+owner-gated `POST /api/autonudge` route. This is a persistent waiting lifetime,
+not permission supplied by an agent: MCP and directives cannot enable it. The
+owner arm writes an HMAC-authenticated grant and delivery cursor below the
+existing sandbox-hidden `tag-grants/conductor-standby` directory. A row in
+`autonudge.json` alone cannot authorize standby. Existing finite monitors keep
+their bounds, probe gate, judge and persisted shape.
+
+`AutoNudgeService._timer` keeps its sentinel, approval and session-start guards,
+then dispatches standby to `conductor_standby.run_tick`. The existing
+`WorkLedgerProbe` produces typed observations; standby consumes their stable
+keys without the generic IRQ re-alert interval, judge, quiet floor or follow-up
+turn. An absent ledger and an accepted board are quiet. The normal timer is a
+compensating **program check**, never an instruction to a model. Existing
+`conductor_wake` pushes pull that check forward. Reports within a two-second
+window share a turn. A busy session keeps its ledger and pending batch; failed
+reads never fall through to a model. Three failed reads or dispatches pause the
+loop, with persisted exponential retry deadlines. A sliding limit allows at
+most twelve accepted standby turns per hour, without expiring the waiting
+lifetime. User turns and existing per-turn limits remain owned by the gateway.
+
+The calling Conductor can register one durable check with
+`monitor_update(check_after_secs=N)` alone (15-second effective floor,
+30-day ceiling, zero cancels). This does not grant authority or resume a stopped
+loop. The check also advances the persistent timer deadline, so turn completion
+and restart cannot replace it with a later probe interval. A worker's `done`
+report does not mean acceptance: pending CI or another
+machine-checkable condition must register its next check before yielding. Human
+questions use `ask_question` once and await a user message without periodic
+checks. Work and notifications continue in the original session.
+
+Stop revokes the protected grant before persisting the inactive row. Removal
+also revokes it. A late push, stale timer, or replayed active row cannot restore
+authority. Quiet restart reconstructs timers and reads the durable ledger,
+including changes missed while down. A claim is persisted before dispatch and
+retained until an authoritative completion settles that delivery. A stopped
+worker without completion evidence, including a provider-process death or a
+service restart, pauses as `interrupted_cycle`. Only explicit owner resume acknowledges that ambiguity.
+Resuming preserves the delivered-event cursor. Operator recovery must inspect
+side effects before resuming an interrupted turn; exactly-once external effects
+are not promised. Agent processes and network connections need not stay alive.
+
+Program probes and accepted wakes are counted in the protected cursor; dispatch
+logs correlate the loop, session, cause and event count. These counters are not
+provider token usage. Real token measurements must use the existing usage
+records and separate Conductor, worker and judge requests. Tests with mocked
+fire callbacks establish scheduling behavior only.
+
+Standby delivery uses the dashboard's existing monitor admission hook both after
+background concurrency admission and immediately before provider entry. It
+rechecks the protected grant, live loop identity and configuration generation;
+a Stop or resumed generation cannot authorize an older queued wake. Completion
+logs correlate loop/session with provider-reported input/output counts; missing
+usage remains unavailable, not zero. The normal session usage pipeline remains
+the source of totals.
+
+The installed Conductor prompt and `goal-conductor` skill both preserve an
+existing standby, schedule pending acceptance checks explicitly, and reserve
+budget renewal for finite loops. Direct channel-bound standby arms are refused;
+this owner entry point and its Stop lifecycle are dashboard-session scoped.
+
+An authoritative failed model turn schedules a bounded retry of the same
+session after 30, then 60 seconds. Three consecutive failed turns revoke the
+standby grant and show `standby_execution_failed`; owner resume acknowledges the
+pause. Repeated completion callbacks are deduplicated by the delivery identity.
+Dispatch, probe and model failures retain separate accounting. No missing usage
+is synthesized as token consumption or as zero.
+
+A retained protected record also selects the standby gate when the writable
+loop row loses its mode bit; it cannot fall through to periodic prompt delivery.
+Replacing a standby requires owner removal first; ordinary edits retain its
+cursor and permission. Legacy nested monitor counters and default budgets are
+not the standby scheduler's accounting. Their `token_usage_known` is false;
+standby waiting lifetime, execution window and check deadlines are described
+above, and actual provider usage stays in the session usage pipeline.
+
+REST, websocket updates, the frontend automation normalizer and agent-facing
+inspection retain the standby marker. The Goal popover describes code probes
+and event waiting rather than a periodic model-turn countdown for this mode.
+Known gated work-ledger records retain this view on REST reload as well as live
+updates; unknown monitor versions remain inert. Persisted standby failures use
+the shared error notice without discarding the editor's unsaved inputs.
+
 ## Runtime bounds and activation evidence
 
 `monitoring.max_runtime_secs` supplies the operator's finite runtime ceiling,

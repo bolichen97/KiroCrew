@@ -6953,9 +6953,7 @@ class GatewayOrchestrator:
                 return authorized
 
             def _accept_dashboard_turn() -> None:
-                callback = base_hook.acceptance_callback
-                if callback is not None:
-                    callback()
+                base_hook.mark_accepted()
                 _append_nudge()
                 _settle_admission(MonitorDispatchResult.DISPATCHED)
 
@@ -7094,6 +7092,10 @@ class GatewayOrchestrator:
 
     def _monitor_completion_hook(self, loop: NudgeLoop) -> MonitorCompletionHook | None:
         """Bind a structured loop's in-flight identity to controller accounting."""
+        if getattr(loop, "standby", False) is True and self.autonudge_svc is not None:
+            from kiro_crew.conductor_standby import completion_hook
+
+            return completion_hook(self.autonudge_svc, loop)
         state = getattr(loop, "monitor", None)
         if state is None:
             return None
@@ -7314,6 +7316,7 @@ class GatewayOrchestrator:
                     # REST list already.
                     "next_due_ts": loop.next_due_ts,
                     "stopped_reason": loop.stopped_reason,
+                    **({"standby": True} if getattr(loop, "standby", False) is True else {}),
                 }
                 if is_structured_monitor_loop(loop):
                     assert loop.monitor is not None

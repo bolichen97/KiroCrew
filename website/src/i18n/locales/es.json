@@ -6186,7 +6186,15 @@
       "judge_outcome_fallback": "sin veredicto",
       "judge_outcome_unknown": "desconocido",
       "judge_no_verdict": "aún sin veredicto",
-      "default_goal": "Tu estrella polar está en {{northStar}}, la hoja de ruta en {{roadmap}} y las tareas en {{tasks}}. Elige el siguiente paso de mayor impacto hacia el objetivo y ejecútalo. Actualiza {{tasks}}. Publica un bloqueo UNA sola vez si de verdad te atascas. Cuando se cumpla el objetivo, llama a la herramienta {{stopTool}} para detener el bucle."
+      "default_goal": "Tu estrella polar está en {{northStar}}, la hoja de ruta en {{roadmap}} y las tareas en {{tasks}}. Elige el siguiente paso de mayor impacto hacia el objetivo y ejecútalo. Actualiza {{tasks}}. Publica un bloqueo UNA sola vez si de verdad te atascas. Cuando se cumpla el objetivo, llama a la herramienta {{stopTool}} para detener el bucle.",
+      "standby": "Espera del registro de trabajo",
+      "standby_help": "Espera sin llamadas al modelo. Los eventos o revisiones programadas activan hasta 12 turnos por hora. Detener pausa la espera; completar tareas la mantiene activa.",
+      "probe_interval": "Segundos entre revisiones del registro",
+      "standby_instruction": "Lee el registro, verifica el trabajo completado y avísame una vez. Programa una revisión para la aceptación pendiente. Mantén la espera tras completar.",
+      "standby_paused_auth": "Espera pausada: autorización no disponible. Revise el permiso antes de reanudar.",
+      "standby_paused_failure": "Espera pausada tras varios fallos de lectura o ejecución. Revise el registro del servicio.",
+      "standby_paused_interrupted": "Espera pausada tras una interrupción. Revise las acciones realizadas antes de reanudar.",
+      "standby_rate_limit": "Límite de activaciones alcanzado. El trabajo pendiente continuará cuando se libere la ventana horaria."
     },
     "bottomTerminalPanel": {
       "close_terminal": "Cerrar la terminal",

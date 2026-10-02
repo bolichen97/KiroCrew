@@ -6186,7 +6186,15 @@
       "judge_outcome_fallback": "sem veredicto",
       "judge_outcome_unknown": "desconhecido",
       "judge_no_verdict": "ainda sem veredicto",
-      "default_goal": "Sua estrela-guia está em {{northStar}}, o roteiro em {{roadmap}} e as tarefas em {{tasks}}. Escolha o próximo passo de maior impacto rumo ao objetivo e execute-o. Atualize {{tasks}}. Publique um bloqueio UMA única vez se realmente travar. Quando o objetivo for alcançado, chame a ferramenta {{stopTool}} para encerrar o loop."
+      "default_goal": "Sua estrela-guia está em {{northStar}}, o roteiro em {{roadmap}} e as tarefas em {{tasks}}. Escolha o próximo passo de maior impacto rumo ao objetivo e execute-o. Atualize {{tasks}}. Publique um bloqueio UMA única vez se realmente travar. Quando o objetivo for alcançado, chame a ferramenta {{stopTool}} para encerrar o loop.",
+      "standby": "Espera do registro de trabalho",
+      "standby_help": "Espera sem chamadas ao modelo. Eventos ou verificações agendadas acionam até 12 turnos por hora. Parar pausa a espera; concluir tarefas a mantém ativa.",
+      "probe_interval": "Segundos entre verificações do registro",
+      "standby_instruction": "Leia o registro, verifique o trabalho concluído e avise uma vez. Agende uma verificação para aceitação pendente. Mantenha a espera após concluir.",
+      "standby_paused_auth": "Espera pausada: autorização indisponível. Verifique a permissão antes de retomar.",
+      "standby_paused_failure": "Espera pausada após repetidas falhas de leitura ou execução. Verifique o registro do serviço.",
+      "standby_paused_interrupted": "Espera pausada após uma interrupção. Verifique as ações já realizadas antes de retomar.",
+      "standby_rate_limit": "Limite de ativações atingido. O trabalho pendente retomará quando a janela horária permitir."
     },
     "bottomTerminalPanel": {
       "close_terminal": "Fechar terminal",

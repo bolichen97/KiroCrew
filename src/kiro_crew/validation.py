@@ -1610,6 +1610,7 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
     tool_name="monitor_update",
     custom_validator=_validate_monitor_runtime,
     fields=[
+        FieldSpec("check_after_secs", int, min_val=0, max_val=2592000),
         FieldSpec("message", str, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=1, max_val=1000),

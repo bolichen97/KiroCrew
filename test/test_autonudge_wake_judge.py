@@ -1694,7 +1694,8 @@ class TestTheStructuredPathRefusesABrief:
         from kiro_crew.dashboard import session_directive_apply
 
         source = inspect.getsource(session_directive_apply)
-        line = next(ln for ln in source.splitlines() if "legacy_only = sorted(" in ln)
+        start = source.index("legacy_only = sorted(")
+        line = source[start : source.index("if legacy_only:", start)]
         return {
             token.strip().strip('"')
             for token in line[line.index("{") + 1 : line.rindex("}")].split(",")

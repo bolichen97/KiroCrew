@@ -6186,7 +6186,15 @@
       "judge_outcome_fallback": "nessun verdetto",
       "judge_outcome_unknown": "sconosciuto",
       "judge_no_verdict": "nessun verdetto ancora",
-      "default_goal": "La tua stella polare è in {{northStar}}, la roadmap in {{roadmap}} e le attività in {{tasks}}. Scegli il prossimo passo con il maggiore impatto verso l'obiettivo ed eseguilo. Aggiorna {{tasks}}. Segnala un blocco UNA sola volta se sei davvero bloccato. Quando l'obiettivo è raggiunto, chiama lo strumento {{stopTool}} per fermare il ciclo."
+      "default_goal": "La tua stella polare è in {{northStar}}, la roadmap in {{roadmap}} e le attività in {{tasks}}. Scegli il prossimo passo con il maggiore impatto verso l'obiettivo ed eseguilo. Aggiorna {{tasks}}. Segnala un blocco UNA sola volta se sei davvero bloccato. Quando l'obiettivo è raggiunto, chiama lo strumento {{stopTool}} per fermare il ciclo.",
+      "standby": "Attesa del registro di lavoro",
+      "standby_help": "Attesa senza chiamate al modello. Eventi o controlli pianificati attivano fino a 12 turni all’ora. Stop sospende l’attesa; le attività completate la mantengono attiva.",
+      "probe_interval": "Secondi tra i controlli del registro",
+      "standby_instruction": "Leggi il registro, verifica il lavoro completato e avvisami una volta. Pianifica un controllo per le approvazioni in sospeso. Mantieni l’attesa dopo il completamento.",
+      "standby_paused_auth": "Attesa sospesa: autorizzazione non disponibile. Verifica il permesso prima di riprendere.",
+      "standby_paused_failure": "Attesa sospesa dopo ripetuti errori di lettura o esecuzione. Controlla il registro del servizio.",
+      "standby_paused_interrupted": "Attesa sospesa dopo un’interruzione. Verifica le azioni già eseguite prima di riprendere.",
+      "standby_rate_limit": "Limite di attivazioni raggiunto. Il lavoro riprenderà quando la finestra oraria lo consentirà."
     },
     "bottomTerminalPanel": {
       "close_terminal": "Chiudi il terminale",

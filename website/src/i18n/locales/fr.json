@@ -6186,7 +6186,15 @@
       "judge_outcome_fallback": "sans verdict",
       "judge_outcome_unknown": "inconnu",
       "judge_no_verdict": "pas encore de verdict",
-      "default_goal": "Ton étoile polaire est dans {{northStar}}, la feuille de route dans {{roadmap}} et les tâches dans {{tasks}}. Choisis la prochaine étape la plus utile vers l'objectif et exécute-la. Mets à jour {{tasks}}. Signale un blocage UNE seule fois si tu es vraiment bloqué. Quand l'objectif est atteint, appelle l'outil {{stopTool}} pour arrêter la boucle."
+      "default_goal": "Ton étoile polaire est dans {{northStar}}, la feuille de route dans {{roadmap}} et les tâches dans {{tasks}}. Choisis la prochaine étape la plus utile vers l'objectif et exécute-la. Mets à jour {{tasks}}. Signale un blocage UNE seule fois si tu es vraiment bloqué. Quand l'objectif est atteint, appelle l'outil {{stopTool}} pour arrêter la boucle.",
+      "standby": "Veille du registre de travail",
+      "standby_help": "Attente sans appel au modèle. Les événements ou contrôles prévus déclenchent au plus 12 tours par heure. Arrêter suspend la veille ; les tâches terminées la laissent active.",
+      "probe_interval": "Secondes entre les contrôles du registre",
+      "standby_instruction": "Lis le registre, vérifie le travail terminé et préviens-moi une fois. Programme un contrôle pour la validation en attente. Garde la veille après la fin.",
+      "standby_paused_auth": "Attente suspendue : autorisation indisponible. Vérifiez-la avant de reprendre.",
+      "standby_paused_failure": "Attente suspendue après plusieurs échecs de lecture ou d’exécution. Vérifiez le journal du service.",
+      "standby_paused_interrupted": "Attente suspendue après une interruption. Vérifiez les actions déjà effectuées avant de reprendre.",
+      "standby_rate_limit": "Limite de réveils atteinte. Le travail en attente reprendra dès que la fenêtre horaire le permettra."
     },
     "bottomTerminalPanel": {
       "close_terminal": "Fermer le terminal",

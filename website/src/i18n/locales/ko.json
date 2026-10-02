@@ -5992,7 +5992,15 @@
       "judge_outcome_fallback": "판정 불가",
       "judge_outcome_unknown": "알 수 없음",
       "judge_no_verdict": "아직 판정 없음",
-      "default_goal": "북극성은 {{northStar}}, 로드맵은 {{roadmap}}, 작업은 {{tasks}}에 있습니다. 목표를 향해 가장 효과가 큰 다음 단계 하나를 골라 실행하세요. {{tasks}}을(를) 업데이트하세요. 정말 막혔을 때만 블로커를 한 번 게시하세요. 목표를 달성하면 {{stopTool}} 도구를 호출해 루프를 멈추세요."
+      "default_goal": "북극성은 {{northStar}}, 로드맵은 {{roadmap}}, 작업은 {{tasks}}에 있습니다. 목표를 향해 가장 효과가 큰 다음 단계 하나를 골라 실행하세요. {{tasks}}을(를) 업데이트하세요. 정말 막혔을 때만 블로커를 한 번 게시하세요. 목표를 달성하면 {{stopTool}} 도구를 호출해 루프를 멈추세요.",
+      "standby": "작업 원장 대기",
+      "standby_help": "대기 중에는 모델을 호출하지 않습니다. 작업 이벤트나 예약된 확인으로 시간당 최대 12회 실행합니다. 중지하면 대기가 멈추고, 작업 완료 후에는 대기를 유지합니다.",
+      "probe_interval": "원장 확인 간격(초)",
+      "standby_instruction": "작업 원장을 읽고 완료된 작업을 검수한 뒤 한 번 알려 주세요. 보류 중인 검수를 위한 확인을 예약하고 완료 후에도 대기를 유지하세요.",
+      "standby_paused_auth": "대기가 일시 중지되었습니다. 재개하기 전에 소유자 권한을 확인하세요.",
+      "standby_paused_failure": "읽기 또는 실행 실패가 반복되어 대기가 중지되었습니다. 재개 전에 서비스 로그를 확인하세요.",
+      "standby_paused_interrupted": "실행이 중단되었습니다. 재개 전에 이미 수행된 작업을 확인하세요.",
+      "standby_rate_limit": "시간당 실행 한도에 도달했습니다. 한도가 해제되면 보류 중인 작업을 재개합니다."
     },
     "bottomTerminalPanel": {
       "close_terminal": "터미널 닫기",
