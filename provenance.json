@@ -1,0 +1,80 @@
+{
+  "purpose": "Small authentic Pod screenshots and unedited recordings for PRs 3 and 4; evidence only, not a source-code branch.",
+  "limits": "No model-run worker workflow or actual usage comparison. No 8-hour soak. Original capture commit/time retained.",
+  "files": [
+    {
+      "file": "dependent-cold-refresh.mp4",
+      "bytes": 89730,
+      "sha256": "c5e59cb037abe0996b021f7cd97dce3195daece172ff3a05a2a7b98ce9879561",
+      "source": "dependency/cold-refresh-unedited.mp4"
+    },
+    {
+      "file": "dependent-cold-refresh.png",
+      "bytes": 121274,
+      "sha256": "82dd79dd9e949f1735cb19a15d443af45fee3f665928c51509ecb5e6e0d264eb",
+      "source": "dependency/cold-refresh.png"
+    },
+    {
+      "file": "independent-cold-refresh.mp4",
+      "bytes": 98680,
+      "sha256": "26de3359957b92880cd9a390cd511c7845e3be71ca02ea73e1550e1fdf6e0e32",
+      "source": "independent/cold-refresh-unedited.mp4"
+    },
+    {
+      "file": "independent-cold-refresh.png",
+      "bytes": 134757,
+      "sha256": "aba13099bba593b5d213641caafb187fab7a6c2a58d6bff5b3c0d0436b2f9ef7",
+      "source": "independent/cold-refresh.png"
+    }
+  ],
+  "captures": [
+    {
+      "path": "independent/cold-refresh.png",
+      "scene": "Fresh browser and full page reload preserve stopped standby",
+      "commit": "5de6d11910a97c49b01744e9cdc6391bdd1c8584",
+      "tree": "cc6bc0b018a859db823d8143d9c2972aca18803b",
+      "time_utc": "2026-10-02T12:40:51.675764+00:00",
+      "expected": "Paused header, persisted goal message, ledger check interval; no model request or monitor mutation",
+      "actual": "PASS: cold refresh preserves paused standby record and its real persisted goal message"
+    },
+    {
+      "path": "independent/cold-refresh-unedited.mp4",
+      "scene": "Actual navigation, full reload, and opening the existing standby popover",
+      "commit": "5de6d11910a97c49b01744e9cdc6391bdd1c8584",
+      "tree": "cc6bc0b018a859db823d8143d9c2972aca18803b",
+      "started_at": "2026-10-02T12:40:36.274581+00:00",
+      "ended_at": "2026-10-02T12:40:51.678423+00:00",
+      "duration_seconds": 12.08,
+      "dimensions": {
+        "width": 800,
+        "height": 500
+      },
+      "edits": "No cuts or speedup; WebM transcoded to MP4",
+      "actual": "PASS: cold refresh preserves paused standby record and its real persisted goal message"
+    },
+    {
+      "path": "dependency/cold-refresh.png",
+      "scene": "Fresh browser and full page reload preserve stopped standby",
+      "commit": "0fccdc5210a4368446512f990ae943486d098fff",
+      "tree": "fe8af698c574b32abc5d3aedb3bb9e32032f2367",
+      "time_utc": "2026-10-02T12:40:54.003035+00:00",
+      "expected": "Paused header, persisted goal message, ledger check interval; no model request or monitor mutation",
+      "actual": "PASS: cold refresh preserves paused standby record and its real persisted goal message"
+    },
+    {
+      "path": "dependency/cold-refresh-unedited.mp4",
+      "scene": "Actual navigation, full reload, and opening the existing standby popover",
+      "commit": "0fccdc5210a4368446512f990ae943486d098fff",
+      "tree": "fe8af698c574b32abc5d3aedb3bb9e32032f2367",
+      "started_at": "2026-10-02T12:40:38.344470+00:00",
+      "ended_at": "2026-10-02T12:40:54.004905+00:00",
+      "duration_seconds": 12.84,
+      "dimensions": {
+        "width": 800,
+        "height": 500
+      },
+      "edits": "No cuts or speedup; WebM transcoded to MP4",
+      "actual": "PASS: cold refresh preserves paused standby record and its real persisted goal message"
+    }
+  ]
+}
