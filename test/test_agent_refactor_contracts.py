@@ -67,7 +67,7 @@ BASE_SURFACE: dict[str, str] = {
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
     "_CONDUCTOR_CORE_GRANTS": "value tuple 9ef89fe81974156e",
     "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 0b859d2b54e84503",
-    "_CONDUCTOR_SYSTEM_PROMPT": "value str d81489d16ba34dcd",
+    "_CONDUCTOR_SYSTEM_PROMPT": "value str 4218a795575843d2",
     "_CREW_ONLY_HOOK_EVENTS": "value frozenset 9d900cfb866f983a",
     "_DEFAULT_KIRO_HOOKS_DIR": "value host",
     "_DEFAULT_SPEC_OBSERVATION_ATTEMPTS": "value int 4e07408562bedb8b",
@@ -892,7 +892,13 @@ _PATROL_RECEIPT = (
 )
 def test_every_conductor_prompt_carries_the_patrol_receipt_rule(prompt: str) -> None:
     """The monitor-arm wording, line break included, in each conductor charter."""
-    assert _PATROL_RECEIPT in getattr(agent, prompt)
+    receipt = (
+        "*requested* confirms receipt only; do not retry in the same turn.\n"
+        "Confirm activation from the gateway notice or `monitor_inspect` on a later turn."
+        if prompt == "_CONDUCTOR_SYSTEM_PROMPT"
+        else _PATROL_RECEIPT
+    )
+    assert receipt in getattr(agent, prompt)
 
 
 def test_the_member_grants_extend_the_conductor_grants_in_order() -> None:

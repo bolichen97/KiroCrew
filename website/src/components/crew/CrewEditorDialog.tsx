@@ -18,6 +18,7 @@
  * because the bindings are read only inside render, the same shape as the
  * existing MembersPage -> NewCrewmateDialog -> KiroCrewAgentsPage cycle.
  */
+import { useState } from 'react'
 import { Loader2, MessageSquare, UserPen } from 'lucide-react'
 import { Btn, SendBtn } from '../ui'
 import {
@@ -34,6 +35,8 @@ import CrewWakeSection from '../CrewWakeSection'
 import CrewWebhookSection from '../CrewWebhookSection'
 import CrewEditorRail from './CrewEditorRail'
 import CrewOverviewPane from './CrewOverviewPane'
+import CrewPerpetualSection from './CrewPerpetualSection'
+import { useCrewPerpetual } from './useCrewPerpetual'
 import AgentTemplateDetail from './AgentTemplateDetail'
 import CrewCapabilitiesPane from './CrewCapabilitiesPane'
 import { SourceBadge } from '../SourceBadge'
@@ -54,6 +57,8 @@ import {
 import { INHERIT_MODEL, type CrewEditorController } from './useCrewEditor'
 
 export default function CrewEditorDialog({ ctl }: { ctl: CrewEditorController }) {
+  const perpetual = useCrewPerpetual(ctl.open ? ctl.editing : '')
+  const [perpetualCanSwitch, setPerpetualCanSwitch] = useState(false)
   if (!ctl.open) {
     // The pill was clicked but the roster read has not resolved the record yet.
     // Render a minimal loading dialog so the click is not a silent dead one (a
@@ -194,6 +199,8 @@ export default function CrewEditorDialog({ ctl }: { ctl: CrewEditorController })
                     resolvedModel={resolved?.model || ''}
                     activeSchedules={wakeJobs.filter(j => j.enabled).length}
                     schedulesUnknown={wakeUnknown}
+                    perpetual={perpetual.state}
+                    perpetualUnknown={!perpetual.loaded || perpetual.failed}
                     routingWords={routingWords}
                     sharingCrews={collidingCrews.length}
                     workspaceShared={sharingWorkspace.length > 0}
@@ -350,7 +357,10 @@ export default function CrewEditorDialog({ ctl }: { ctl: CrewEditorController })
               )}
 
               {pane === 'schedules' && (
-                <CrewWakeSection crew={editing} memberId={ctl.memberId} agentTemplate={kiroAgent} isDefaultCrew={ctl.isDefaultCrew} onDraftChange={setSchedDraft} onSavingChange={setSchedSaving} onRequestCancel={requestCancelDraft} onNavigateAway={ctl.guardedNavigate} />
+                <>
+                  <CrewPerpetualSection key={editing} crew={editing} onCanSwitchChange={setPerpetualCanSwitch} />
+                  <CrewWakeSection crew={editing} memberId={ctl.memberId} agentTemplate={kiroAgent} isDefaultCrew={ctl.isDefaultCrew} onDraftChange={setSchedDraft} onSavingChange={setSchedSaving} onRequestCancel={requestCancelDraft} onNavigateAway={ctl.guardedNavigate} />
+                </>
               )}
 
               {pane === 'webhook' && <CrewWebhookSection crew={editing} onNavigateAway={ctl.guardedNavigate} />}
@@ -422,6 +432,11 @@ export default function CrewEditorDialog({ ctl }: { ctl: CrewEditorController })
                   : schedDraft
                     ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first')
                     : i18nT('components.crewEditor.unsaved_changes')}
+              </span>
+            )}
+            {pane === 'schedules' && perpetualCanSwitch && (
+              <span className="max-w-64 text-right text-[11px] leading-relaxed text-muted" data-testid="crew-perpetual-save-split">
+                {i18nT('components.crewPerpetualSection.save_split')}
               </span>
             )}
             <Btn onClick={requestClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>

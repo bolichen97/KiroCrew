@@ -3487,6 +3487,18 @@ works as documented in `src/kiro_crew/docs/agents.md`; a crew bound to a name
 whose file is gone falls back to the default spec at session start until it is
 repointed, which is exactly the state the guard exists to prevent reaching.
 
+### Work-ledger standby in the Goal popover
+
+Before creating a goal, the owner can select **Work-ledger standby**. The
+popover explains the zero-model waiting path and rolling execution limit,
+labels the interval as ledger checks, and disables the lifetime cycle cap.
+The owner-only start route accepts boolean `standby`; it fixes the watch to the
+session's work ledger and removes lifetime bounds. Existing loops retain their
+mode. Pause/Stop revokes standby; Play explicitly resumes it. A stopped or
+unreadable grant never resumes through model output. See
+[monitor architecture](monitor-architecture.md#owner-authorized-work-ledger-standby)
+for delivery, recovery and one-shot check semantics.
+
 ### Monitor runtime ceiling
 
 The shared policy is `monitoring.max_runtime_secs` (see [config](config.md)).
@@ -4866,3 +4878,7 @@ Installed skill discovery resolves the signed session's active agent mapping and
 project. Search/list/read share that scope, return stable full keys, and use offset
 pagination. Search responses include an incomplete flag while bounded body indexing
 is still progressing; the MCP renderer makes this visible rather than claiming absence.
+
+The shared `CrewEditorDialog` used on the Crewmates page reads the same
+Perpetual state and mounts the same Schedules control as the older inline
+editor. Its Save footer distinguishes that immediate switch from draft edits.

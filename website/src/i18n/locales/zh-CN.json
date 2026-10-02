@@ -6021,7 +6021,15 @@
       "judge_outcome_fallback": "无法判定",
       "judge_outcome_unknown": "未知",
       "judge_no_verdict": "尚无判定",
-      "default_goal": "你的北极星在 {{northStar}}，路线图在 {{roadmap}}，任务在 {{tasks}}。选出朝目标推进最有价值的下一步并执行。更新 {{tasks}}。如果真的卡住，只发一次阻塞说明。目标达成后，调用 {{stopTool}} 工具停止循环。"
+      "default_goal": "你的北极星在 {{northStar}}，路线图在 {{roadmap}}，任务在 {{tasks}}。选出朝目标推进最有价值的下一步并执行。更新 {{tasks}}。如果真的卡住，只发一次阻塞说明。目标达成后，调用 {{stopTool}} 工具停止循环。",
+      "standby": "工作账本待命",
+      "standby_help": "等待时不调用模型。工作事件或到期检查唤醒，每小时最多 12 回合。停止会暂停待命；任务完成后继续待命。",
+      "probe_interval": "账本检查间隔（秒）",
+      "standby_instruction": "读取工作账本，验收已完成的工作，并通知我一次。为待定验收登记复查。完成后保持待命。",
+      "standby_paused_auth": "待命已暂停：授权不可用，请检查所有者授权后再恢复。",
+      "standby_paused_failure": "待命因连续读取或执行失败而暂停，请检查服务日志后再恢复。",
+      "standby_paused_interrupted": "执行中断后待命已暂停，请检查已发生的操作后再恢复。",
+      "standby_rate_limit": "已达待命唤醒上限，小时窗口释放后会继续处理待办事项。"
     },
     "bottomTerminalPanel": {
       "close_terminal": "关闭终端",

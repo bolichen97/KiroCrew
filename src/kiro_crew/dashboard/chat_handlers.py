@@ -5883,6 +5883,19 @@ async def stop_slot_turn(
         # the mirrored chat_done. Nothing local to tear down.
         return {"ok": True}
 
+    from kiro_crew.conductor_standby import stop_for_slot
+
+    try:
+        await stop_for_slot(name)
+    except Exception:
+        # A failed durable stop must still cancel the current turn, but cannot
+        # tell the owner that standby will remain stopped after a restart.
+        logger.exception("Could not persist standby Stop for %s", name)
+        await state.sessions.stop_turn(cancel_key, force=force)
+        raise web.HTTPServiceUnavailable(
+            text="Could not persist standby Stop; check the service log."
+        )
+
     # Escalation path: a second stop press while a cooperative cancel is
     # already pending hard-kills. We escalate on ANY second press — not only
     # when the client computed force=true — because the client derives force

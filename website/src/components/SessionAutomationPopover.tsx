@@ -118,6 +118,7 @@ function monitorDraft(monitor: StructuredMonitor): Draft {
  * and their absence reads to it as a loop armed with no judge at all. */
 function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
   return {
+    ...(loop.standby === true ? { standby: true } : {}),
     id: loop.id,
     slot_key: loop.slotKey,
     message: loop.message,

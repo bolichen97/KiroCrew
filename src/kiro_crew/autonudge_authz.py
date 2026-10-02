@@ -594,6 +594,7 @@ async def authorize_and_update_nudge(
     #: no clear spelling, for the reason the tool surface gives: a loop that silently lost
     #: its watch through a metadata edit would look armed and observe nothing.
     watch: Any = None,
+    check_after_secs: Any = None,
     expect_fingerprint: Any = None,
     source: str,
     caller: str = "",
@@ -768,6 +769,7 @@ async def authorize_and_update_nudge(
                         ("active", active),
                         ("banner", banner),
                         ("watch", watch),
+                        ("check_after_secs", check_after_secs),
                     )
                     if v is not None
                 ),
@@ -781,6 +783,37 @@ async def authorize_and_update_nudge(
         logger.error("autonudge update denied: SEL audit unavailable", exc_info=True)
         return None, "audit log unavailable — nudge loop not updated", 503
     try:
+        if check_after_secs is not None:
+            from kiro_crew import conductor_standby
+
+            if row is None:
+                return _deny("loop not found", 404)
+            if any(
+                value is not None
+                for value in (
+                    message,
+                    idle_secs,
+                    max_cycles,
+                    active,
+                    max_runtime_secs,
+                    banner,
+                    judge,
+                    watch,
+                )
+            ):
+                return _deny("schedule a check separately from other monitor edits", 400)
+            await conductor_standby.schedule_check(svc, row, check_after_secs)
+            _audit("success", session_key=row.slot_key)
+            return row, None, 200
+        if (
+            row is not None
+            and getattr(row, "standby", False) is True
+            and active is True
+            and source == "dashboard"
+        ):
+            from kiro_crew import conductor_standby
+
+            await conductor_standby.resume(svc, row)
         loop = await svc.update(
             loop_id,
             message=message,
@@ -811,6 +844,9 @@ async def authorize_and_update_nudge(
         raise
     if loop is None:
         return _deny("loop not found", 404)
+    from kiro_crew.conductor_standby import enable_perpetual
+
+    await enable_perpetual(svc, loop)
     _audit("success", session_key=loop.slot_key)
     return loop, None, 200
 
@@ -875,6 +911,7 @@ async def authorize_and_add_nudge(
     #: allowed set, for the reason the judge brief is bounded there: a refusal should name
     #: a field the caller can fix.
     watch: str = "",
+    standby: bool = False,
     monitor: MonitorState | None = None,
     replace_existing: bool = True,
     # Opt-in for the session-directive re-arm path ONLY: with
@@ -1198,6 +1235,16 @@ async def authorize_and_add_nudge(
     # ordering and exception propagation. The terminal success event below is
     # then best-effort: if it fails, the armed loop is still covered by this
     # invoked record.
+    if standby and (
+        source != "dashboard"
+        or is_channel_key(slot_key)
+        or watch != "work-ledger"
+        or monitor is not None
+    ):
+        return _deny("standby requires an owner dashboard work-ledger session", 403)
+    if standby:
+        max_cycles = max_runtime_secs = 0
+
     def _audit_metadata() -> dict[str, Any]:
         if monitor is not None:
             return {
@@ -1221,6 +1268,7 @@ async def authorize_and_add_nudge(
             "caller": caller,
             "self_armed": self_armed,
             "owner_armed": owner_armed,
+            **({"standby": True} if standby else {}),
         }
 
     def _critical_invoked_audit() -> None:
@@ -1275,7 +1323,7 @@ async def authorize_and_add_nudge(
     ):
         return _deny("monitor authorization requires a rollback-capable loop store", 503)
     reserved_loop_id: str | None = None
-    if self_armed or owner_armed or owner_credentials_grant:
+    if self_armed or owner_armed or owner_credentials_grant or standby:
         # Reserve a COLLISION-FREE id before touching the trust record. The
         # record is an upsert keyed by loop id, so an id already held by a live
         # loop would overwrite that loop's entry -- and the add's conflict
@@ -1294,6 +1342,17 @@ async def authorize_and_add_nudge(
                 break
         if reserved_loop_id is None:
             return _deny("could not reserve a loop id — loop not armed", 503)
+    if standby:
+        from kiro_crew import conductor_standby
+
+        assert reserved_loop_id is not None
+        try:
+            await conductor_standby.joined_io(conductor_standby.grant, reserved_loop_id, slot_key)
+        except asyncio.CancelledError:
+            await conductor_standby.joined_io(conductor_standby.revoke, reserved_loop_id)
+            raise
+        except OSError:
+            return _deny("standby authorization could not be persisted", 503)
     if self_armed:
         try:
             assert reserved_loop_id is not None
@@ -1353,6 +1412,8 @@ async def authorize_and_add_nudge(
     def _forget_orphaned_trust() -> None:
         if reserved_loop_id is None:
             return
+        if standby:
+            conductor_standby.revoke(reserved_loop_id)
         if self_armed or owner_armed:
             forget_self_arm(reserved_loop_id)  # never raises
         if owner_credentials_grant:
@@ -1400,6 +1461,8 @@ async def authorize_and_add_nudge(
                 # Only when there IS one, so a caller that armed no judge produces the
                 # same call it produced before this field existed.
                 add_kwargs["judge"] = dict(judge)
+            if standby:
+                add_kwargs["standby"] = True
             if watch:
                 # Conditional for the reason ``judge`` is: the contract tests compare
                 # this dict by equality, so a caller that named no watch must produce

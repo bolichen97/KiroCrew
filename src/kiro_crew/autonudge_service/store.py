@@ -192,6 +192,8 @@ class LoopStore:
         from kiro_crew import autonudge as seams
 
         payload["judge_pr_seen"] = seams._bounded_judge_pr_seen(payload.get("judge_pr_seen"))
+        if not loop.standby:
+            payload.pop("standby", None)
         if loop.monitor is None:
             # Preserve the legacy wire shape instead of eagerly migrating every
             # record the next time an unrelated loop is saved.

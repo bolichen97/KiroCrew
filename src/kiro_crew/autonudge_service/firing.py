@@ -267,6 +267,17 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
     # is documented to avoid ("every uncertain path resolves toward
     # spending"). Firing keeps the loop doing its job with the gate's
     # saving lost for that tick, and the traceback makes the defect loud.
+    from kiro_crew.conductor_standby import enable_perpetual
+
+    await enable_perpetual(self, loop)
+    if not loop.active:
+        return
+    from kiro_crew import conductor_standby
+
+    if loop.standby or await asyncio.to_thread(conductor_standby.has_record, loop.id):
+        await conductor_standby.run_tick(self, loop)
+        return
+
     try:
         tick_is_quiet = await self._monitor_tick_is_quiet(loop)
     except Exception:  # noqa: BLE001 - any escape here used to kill the timer

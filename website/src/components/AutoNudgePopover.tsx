@@ -2,7 +2,7 @@ import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from 'rea
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Goal, Pause, Play, Radar, X, Zap } from 'lucide-react'
 import { Popover, PopoverTrigger, PopoverContent } from './ui/popover'
-import { Btn } from './ui'
+import { Btn, Checkbox } from './ui'
 import ErrorNotice from './ErrorNotice'
 import { cronJobsQuery } from '../api/cronJobsQuery'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
@@ -68,6 +68,12 @@ const defaultMsg = () => i18nT('components.autoNudgePopover.default_goal', {
 /** The paused line per persisted `stopped_reason` (`autoNudgeLoop.ts` lists
  *  the codes). An unlisted or absent reason renders the bare "Paused". */
 const PAUSED_STATUS_KEY: Record<string, string> = {
+  standby_authorization_unavailable: 'components.autoNudgePopover.standby_paused_auth',
+  standby_probe_failed: 'components.autoNudgePopover.standby_paused_failure',
+  standby_delivery_failed: 'components.autoNudgePopover.standby_paused_failure',
+  standby_execution_failed: 'components.autoNudgePopover.standby_paused_failure',
+  standby_storage_failed: 'components.autoNudgePopover.standby_paused_failure',
+  interrupted_cycle: 'components.autoNudgePopover.standby_paused_interrupted',
   manual: 'components.autoNudgePopover.paused_manual',
   autonudge_stop: 'components.autoNudgePopover.paused_agent',
   cycle_cap: 'components.autoNudgePopover.paused_cycle_cap',
@@ -102,6 +108,8 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   // unparseable value falls back to the field default — 60 idle, 0 cycles.
   const [idleInput, setIdleInput] = useState(() => String(loop?.idle_secs || 60))
   const [maxCyclesInput, setMaxCyclesInput] = useState(() => String(loop?.max_cycles || 0))
+  const [standby, setStandby] = useState(loop?.standby === true)
+  const isStandby = loop ? loop.standby === true : standby
   const [saving, setSaving] = useState(false)
   /* Two-step on the clear only. The erase is irreversible and sits beside the
      primary CTA, so one press asks and the second performs. */
@@ -432,7 +440,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
     const fields = formFields()
     return runControl(async () => {
       await writeLoop(
-        { url: '/api/autonudge', method: 'POST', body: { slot_key: slotKey, ...fields } },
+        { url: '/api/autonudge', method: 'POST', body: { slot_key: slotKey, ...fields, ...(standby ? { standby: true, max_cycles: 0 } : {}) } },
         fields,
       )
     })
@@ -475,6 +483,8 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
         ? i18nT(PAUSED_STATUS_KEY[loop.stopped_reason], { cycles: loop.cycle_count, max: loop.max_cycles })
         : i18nT('components.autoNudgePopover.loop_paused')
     : ''
+  const standbyError = isStandby && !loop?.active && !!loop?.stopped_reason
+    && (loop.stopped_reason.startsWith('standby_') || loop.stopped_reason === 'interrupted_cycle')
   /** The title names the state: the goal's cycle while running, Paused while
    *  not, and the invitation when there is no loop. */
   const titleText = !loop
@@ -552,7 +562,10 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
             <X size={14} />
           </button>
         </div>
-        {loop && (
+        {loop && (standbyError ? (
+          /* No hand-off: the popover holds unsaved goal message and interval inputs. */
+          <ErrorNotice message={statusText} testId="auto-nudge-status" className="mb-2" />
+        ) : (
           /* Boxed in the state's tone (ok while running, warn while paused) so
              the state reads before the form does -- except while writes are
              disabled, where a green box beside the capability note would assert
@@ -570,7 +583,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           >
             {statusText}
           </p>
-        )}
+        ))}
         {onSetUpBoundedMonitor ? (
           <>
             {/* An OFFER, not a way back: this editor is the view the popover
@@ -598,11 +611,11 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
                 the surface carries, and dropping its colour weakened that cue
                 in the same change that made the surface the default. */}
             <p role="note" className="mb-2 rounded-md border border-warn/30 bg-warn-subtle px-2 py-1.5 text-[11px] text-warn-fg">
-              {i18nT('components.sessionAutomationPopover.legacy_notice')}
+              {i18nT(isStandby ? 'components.autoNudgePopover.standby_help' : 'components.sessionAutomationPopover.legacy_notice')}
             </p>
           </>
         ) : null}
-        <p className="text-muted text-[11px] mb-3 leading-relaxed">{i18nT('components.autoNudgePopover.give_the_agent_a_goal_and_it_will_keep_working_t')}</p>
+        <p className="text-muted text-[11px] mb-3 leading-relaxed">{i18nT(isStandby ? 'components.autoNudgePopover.standby_help' : 'components.autoNudgePopover.give_the_agent_a_goal_and_it_will_keep_working_t')}</p>
 
         {watchesFailed && (
           <div className="flex items-center justify-between gap-2 mb-3">
@@ -694,12 +707,26 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           </p>
         ) : null}
 
+        {!loop && (
+          <label className="flex items-center gap-2 mb-3 text-[12px]">
+            <Checkbox checked={standby} disabled={writeDisabled}
+              onChange={e => {
+                setStandby(e.target.checked)
+                if (e.target.checked && message === defaultMsg()) {
+                  hasEdited.current = true
+                  setMessage(i18nT('components.autoNudgePopover.standby_instruction'))
+                }
+              }} />
+            {i18nT('components.autoNudgePopover.standby')}
+          </label>
+        )}
+
         <div className="flex flex-col gap-3 mb-3 sm:flex-row">
           <div className="flex-1">
-            <div className="text-muted text-[11px] mb-1">{i18nT('components.autoNudgePopover.seconds_between_nudges')}</div>
+            <div className="text-muted text-[11px] mb-1">{i18nT(isStandby ? 'components.autoNudgePopover.probe_interval' : 'components.autoNudgePopover.seconds_between_nudges')}</div>
             <input
               type="number"
-              aria-label={i18nT('components.autoNudgePopover.seconds_between_nudges')}
+              aria-label={i18nT(isStandby ? 'components.autoNudgePopover.probe_interval' : 'components.autoNudgePopover.seconds_between_nudges')}
               min={15}
               max={86400}
               value={idleInput}
@@ -715,8 +742,8 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
               type="number"
               aria-label={i18nT('components.autoNudgePopover.max_cycles_0_infinite')}
               min={0}
-              value={maxCyclesInput}
-              disabled={writeDisabled}
+              value={isStandby ? "0" : maxCyclesInput}
+              disabled={writeDisabled || isStandby}
               onChange={e => { hasEdited.current = true; setMaxCyclesInput(e.target.value) }}
               onBlur={() => setMaxCyclesInput(String(parseCycles(maxCyclesInput)))}
               className="w-full bg-bg border border-border rounded px-2 py-1 text-[12px] text-text"

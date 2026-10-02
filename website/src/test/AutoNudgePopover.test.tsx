@@ -43,6 +43,29 @@ describe('AutoNudgePopover goal persistence', () => {
   })
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
+  it.each(['standby_probe_failed', 'standby_storage_failed', 'standby_execution_failed',
+    'standby_authorization_unavailable', 'interrupted_cycle'])(
+    'shows persisted standby failure %s through the shared error notice', stopped_reason => {
+      renderPopover(makeLoop({ standby: true, active: false, stopped_reason }))
+      expect(screen.getByTestId('auto-nudge-status')).toHaveAttribute('role', 'alert')
+      expect(screen.getByLabelText('Goal description')).toHaveValue('active loop goal')
+      expect(screen.queryByRole('button', { name: 'Ask the agent' })).toBeNull()
+    },
+  )
+
+  it('arms work-ledger standby without a lifetime cap through the owner route', async () => {
+    renderPopover(null)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Work-ledger standby' }))
+    expect(screen.getByLabelText('Max cycles (0 = infinite)')).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: /Start/i }))
+    await waitFor(() => {
+      const calls = vi.mocked(fetch).mock.calls
+      const create = calls.find(([url, options]) => url === '/api/autonudge' && options?.method === 'POST')
+      expect(create).toBeDefined()
+      expect(JSON.parse(String(create![1]!.body))).toMatchObject({ slot_key: SLOT, standby: true, max_cycles: 0 })
+    })
+  })
+
   const goalBox = () => screen.getByPlaceholderText(/Describe what you want the agent to accomplish/i) as HTMLTextAreaElement
 
   it('remembers the user-typed goal and restores it after the loop is gone (the reported bug)', () => {

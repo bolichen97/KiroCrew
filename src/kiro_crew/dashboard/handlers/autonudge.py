@@ -205,6 +205,7 @@ def _serialize_monitor(loop: Any) -> dict[str, Any]:
 #: ``goal_token`` is an authorisation a client sends back, not a fact about the subject.
 _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
     {
+        "standby",
         "monitor",
         "message",
         "banner",
@@ -358,6 +359,7 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
         "next_due_ts": loop.next_due_ts,
         "stopped_reason": loop.stopped_reason,
         "has_banner": bool(loop.banner),
+        **({"standby": True} if getattr(loop, "standby", False) is True else {}),
     }
 
 
@@ -1007,6 +1009,9 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
     #
     # A non-boolean is still refused rather than coerced: `"false"` is truthy and
     # would silently gate a loop that asked not to be.
+    standby = body.get("standby", False)
+    if not isinstance(standby, bool):
+        return _monitor_error("standby must be a boolean", "invalid_standby")
     raw_gate = body.get("gate")
     if raw_gate is not None and not isinstance(raw_gate, bool):
         return web.json_response(
@@ -1046,6 +1051,8 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         source="dashboard",
         caller=request.remote or "",
         gate=gate,
+        standby=standby,
+        watch="work-ledger" if standby else "",
         replace_existing=False,
     )
     if error is not None:
@@ -1101,6 +1108,7 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         # revival through it is a resume and runs on a fresh budget; a save on
         # a running loop carries ``active: true`` too and the flag is inert there.
         fresh_run=True,
+        check_after_secs=body.get("check_after_secs"),
         max_runtime_secs=body.get("max_runtime_secs"),
         banner=body.get("banner"),
         source="dashboard",
