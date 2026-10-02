@@ -28,8 +28,9 @@ import { commandFolderName, fileSessionInCommandFolder } from './sessionFolder'
 import type { ChatFolderRow } from './sessionFolder'
 import type { ChatFolder } from '../../types'
 import { appNavTargets } from '../../appNav'
-import { useAppDispatch, useAppSelector } from '../../store'
+import { useAppDispatch, useAppSelector, useAppStore } from '../../store'
 import { createSlot, setPendingInput, switchSlot, requestFolderReveal } from '../../store/chatSlice'
+import { focusComposerForOpenedSession } from '../../pages/chat/composerFocus'
 import { findReport } from '../../utils/errorReport'
 import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -652,6 +653,11 @@ export default function CommandBarOverlay({
   const { resolved } = useLanguage()
   const { cycle: cycleTheme } = useTheme()
   const dispatch = useAppDispatch()
+  // A store HANDLE for the session rows' post-switch focus: by the time a
+  // `switchSlot` settles this bar has closed, so only the store can still say
+  // which slot is active. Read, never subscribed -- the selectors below are the
+  // subscriptions.
+  const store = useAppStore()
   // Live session state, read straight from the store the dashboard already keeps
   // current over its socket. This is what lets the root LEAD with the sessions that
   // owe the user something without issuing a request: the facts are already here,
@@ -989,8 +995,15 @@ export default function CommandBarOverlay({
         // Same activation the sidebar and the recents listing use, so a session
         // opened from here lands exactly where it lands from anywhere else.
         run: async () => {
-          dispatch(switchSlot({ key: slot.key, announceOnMissing: true }))
+          // Not awaited: the bar closes once this promise settles, and a session
+          // open closes it at once -- a failed switch is explained by the pane's
+          // own notice, not by keeping the bar up. The switch is handed on so the
+          // composer is focused only once it has landed (#15732): `pending` enters
+          // the slot synchronously, and a caret placed before the gateway answers
+          // would file the keystrokes typed meanwhile under a slot a 404 then evicts.
+          const switched = dispatch(switchSlot({ key: slot.key, announceOnMissing: true })).unwrap()
           navigate('/chat')
+          focusComposerForOpenedSession(switched, slot.key, store)
         },
       })
     }
@@ -1031,8 +1044,10 @@ export default function CommandBarOverlay({
         // order the root's idle-ordered `recent` group keeps, so the row needs no
         // sort key of its own.
         run: async () => {
-          dispatch(switchSlot({ key: slot.key, announceOnMissing: true }))
+          // See the attention row above (#15732).
+          const switched = dispatch(switchSlot({ key: slot.key, announceOnMissing: true })).unwrap()
           navigate('/chat')
+          focusComposerForOpenedSession(switched, slot.key, store)
         },
       })
     })
@@ -1212,7 +1227,7 @@ export default function CommandBarOverlay({
     // the tree without remounting it, which does not recompute a memo. Omitting it
     // would freeze these rows in whichever language the surface first resolved.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apps, commandById, crewPreview, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
+  }, [apps, commandById, crewPreview, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, store, unreadSlots])
 
   // The root ranks from the LIVE query, not the debounced one. Ranking is pure and
   // local, so there is nothing to throttle, and debouncing it would let a fast Enter
@@ -1335,10 +1350,20 @@ export default function CommandBarOverlay({
     error: foldersSearchError,
     refetch: refetchFolders,
   } = useQuery({
-    // The mode is part of the identity: the same query in a different mode is a
-    // different list, and without it a switch made in the sidebar would be served
+    // Nested UNDER the corpus key, like the artifacts view above, because these rows
+    // are DERIVED from `['chat-folders']` and every folder write ends in
+    // `invalidateQueries({ queryKey: ['chat-folders'] })` (`ChatSidebar` create,
+    // delete and update). React-Query matches that by key PREFIX, so a key outside
+    // the corpus namespace is a cache no folder write can reach — and this view is
+    // unmounted whenever the bar is closed, so its one chance to re-derive is the
+    // remount, which refetches nothing that is still fresh. A folder deleted in that
+    // window would otherwise stay listed and selectable for the whole `staleTime`,
+    // pointing its reveal at an id the sidebar does not hold.
+    //
+    // The sort mode stays part of the identity: the same query in a different mode is
+    // a different list, and without it a switch made in the sidebar would be served
     // from the previous order for the rest of the stale window.
-    queryKey: ['command-bar', 'folders', folderSortMode, folderQuery],
+    queryKey: ['chat-folders', 'command-bar', 'view', folderSortMode, folderQuery],
     queryFn: () => Promise.resolve(folders.search(folderQuery)) as Promise<Result[]>,
     enabled: scope === 'folders',
     staleTime: 15_000,

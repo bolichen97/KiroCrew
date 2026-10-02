@@ -71,11 +71,15 @@ const split = (id: string, children: GridNode[]): GridNode => ({
   sizes: children.map(() => 1 / children.length),
 })
 
-/** Every bounded (warm) fetch the mock saw, by slot key. */
+/** Every warm fetch the mock saw, by slot key. The active slot's own refresh
+ *  asks for the same floor-sized page on an empty view, so warms are told apart
+ *  by slot; `activeCalls` pins that the refresh is the active slot's only read. */
 const warmedSlots = (): string[] =>
   (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls
-    .filter(c => c[1] === PANE_HYDRATE_LIMIT)
+    .filter(c => c[0] !== 'chat-active' && c[1] === PANE_HYDRATE_LIMIT)
     .map(c => c[0] as string)
+const activeCalls = (): unknown[][] =>
+  (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls.filter(c => c[0] === 'chat-active')
 
 describe('useWebSocket reconnect hydrates background split panes', () => {
   let testStore: ReturnType<typeof createTestStore>
@@ -137,10 +141,10 @@ describe('useWebSocket reconnect hydrates background split panes', () => {
 
     // The background pane is re-hydrated through the bounded warm path…
     expect(warmedSlots()).toEqual(['chat-bg'])
-    // …while the active slot keeps its own refresh. With an EMPTY view the
-    // count-matched refresh stays unbounded (no count to match -- see
-    // refreshSlot's doc), so the call carries no limit argument.
-    expect(api.chatSlotDetail).toHaveBeenCalledWith('chat-active')
+    // …while the active slot keeps its own refresh, exactly once. With an EMPTY
+    // view the refresh asks for the floor (see refreshSlot's doc), never the
+    // whole transcript.
+    expect(activeCalls()).toEqual([['chat-active', PANE_HYDRATE_LIMIT]])
 
     unmount()
     vi.useRealTimers()
@@ -171,6 +175,8 @@ describe('useWebSocket reconnect hydrates background split panes', () => {
     // active-slot guard returns before fetching): no bounded call for the
     // active slot can exist on either layer.
     expect(warmedSlots()).not.toContain('chat-active')
+    // The refresh is the active slot's one read: a warm on top would be a second.
+    expect(activeCalls()).toHaveLength(1)
 
     unmount()
     vi.useRealTimers()

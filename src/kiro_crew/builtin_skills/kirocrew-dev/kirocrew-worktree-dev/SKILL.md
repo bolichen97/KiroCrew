@@ -1,7 +1,7 @@
 ---
 name: kirocrew-worktree-dev
-description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not users' projects): develop, build and verify in a git worktree, never against the live gateway. Covers env setup, build/dist ordering, feature flags, isolated previews, cleanup, publish authorization; prepare-pr owns the PR workflow."
-triggers: kirocrew worktree, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo
+description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not users' projects): develop, build and verify in a git worktree, never against the live gateway. Covers env setup, main-clone sync, build/dist ordering, flags, previews, cleanup, publish authorization; prepare-pr owns the PR workflow."
+triggers: kirocrew worktree, kirocrew main clone sync, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo
 repo_scope: src/kiro_crew
 ---
 
@@ -24,6 +24,45 @@ python3 -m venv .venv
 cd website && npm ci && cd ..
 git worktree list
 ```
+
+To bring the main clone itself current (the first path `git worktree list`
+prints), fast-forward it and nothing else:
+
+```bash
+git -C <main clone> symbolic-ref --short HEAD   # must print main
+git -C <main clone> fetch origin main
+git -C <main clone> merge --ff-only --no-autostash --no-overwrite-ignore origin/main
+```
+It refuses, changing nothing, when local `main` has diverged or a local change
+would be overwritten; then stop and report, because that state belongs to whoever
+left it. When the live install runs from that clone, do not sync it yourself: it
+is a live code change, and the operator's dashboard Update does it with the
+rebuild and reinstall. Never overlay a whole tree with `git checkout <ref> -- .`
+or `git restore --source <ref> .`: neither moves HEAD, both overwrite local edits
+without asking, and the checkout form keeps every file upstream deleted. Never
+`git stash`: every worktree shares one stash list, so a pop can apply another
+session's work.
+
+Working from several worktrees? If `uv` resolves in your shell (`command -v uv`
+— it is a declared dependency of the package, so any activated Kiro Crew venv
+has it on `PATH`; a bare shell may not), build the venv with it instead: same
+deps, but site-packages are copy-on-write clones out of one global cache, so on a
+reflink filesystem (XFS with reflink, btrfs, APFS) each extra venv costs ~10 MB
+of unique disk and ~10 s instead of ~400 MB and ~1 min; without reflink uv copies,
+so you keep the speed and lose the disk saving. This is the
+recipe `kirocrew pod provision` runs when `KIROCREW_PROVISION_USE_UV=1` is set
+(opt-in for now; design record: the "Shared Dependency Cache for Worktrees" RFC
+under docs/request-for-change):
+```bash
+uv venv --seed --allow-existing --link-mode clone --python 3.12 .venv
+uv pip install --link-mode clone --python .venv/bin/python --project . -e ".[voice]" --group dev
+```
+`--link-mode clone` must be explicit (uv's Linux default has been seen to copy
+on a reflink-capable filesystem), `--project .` makes `--group` read this
+worktree's `pyproject.toml` from any cwd, and `--seed` keeps `.venv/bin/pip`
+present for `make backend`. Do not use `--link-mode hardlink`: it shares the
+inode, so an in-place edit under `.venv/lib/.../site-packages` would land in every
+sibling venv and in the cache. A clone is safe to edit; the write copies the block.
 
 `dev` is a PEP 735 dependency group, not an extra. `--group` needs pip >= 25.1;
 if unsupported, upgrade the worktree's pip with `.venv/bin/pip install -U pip`.

@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import memory_v2
 from kiro_crew.embeddings import PRIORITY_INTERACTIVE
+from kiro_crew.vector_memory_runtime import episodic_search as _episodic_search
+from kiro_crew.vector_memory_runtime import lessons as _lessons
 from kiro_crew.vector_memory_runtime.embedding import _RecallQuery, _RecallSpaceChanged
-from kiro_crew.vector_memory_runtime.episodic_search import EPISODIC_BLOCK_TEXT_CHARS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -246,7 +247,7 @@ def recall_once(
             truncated = False
             display_id = row["id"]
             if episodic:
-                body = row["text"][:EPISODIC_BLOCK_TEXT_CHARS]
+                body = row["text"][: _episodic_search.EPISODIC_BLOCK_TEXT_CHARS]
             else:
                 body = f"{store._fact_label(row)}: {memory_v2.visible_json(row['value_json'])}"
             line = f"[memory:{display_id}] {body}\n"
@@ -277,11 +278,21 @@ def recall_once(
     # cap, including wrappers. Small caps may safely return no memory.
     # Recall is the only way a private store's or a non-default workspace's
     # lessons reach the model, so they stay in the payload.
+    lessons_share = cap // 3
     lessons = store.get_lessons_context(
-        query_text, cap=cap // 3, project_dir=project_dir, recall_query=query
+        query_text, cap=lessons_share, project_dir=project_dir, recall_query=query
     )
-    if len(lessons) > cap // 3:
-        lessons = ""
+    # Over the share means the one top-ranked lesson alone did not fit, so it
+    # is shortened behind an in-text marker rather than dropped: an empty block
+    # reads the same as "no lesson matched", exactly when the best match is the
+    # long one. That needs the share to hold the block's frame, the marker and
+    # one character of text: 161 characters for one in-scope lesson (a cap of
+    # 483), and from 217 once the counts line appears (a cap of 651), one more
+    # per extra digit in the counts. A query with no recall terms orders the
+    # block "most recent" instead of "most relevant", two characters shorter,
+    # so that floor is 215 (a cap of 645). Below that the block is omitted.
+    if len(lessons) > lessons_share:
+        lessons = _lessons.truncate_explicit_lessons(lessons, lessons_share)
     remainder = cap - len(lessons)
     wrapper_size = memory_recall.CONTEXT_WRAPPER_CHARS
     semantic_chars, facts = fit(facts, max(0, remainder // 2 - wrapper_size), episodic=False)

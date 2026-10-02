@@ -1081,8 +1081,9 @@ class TestMCPRegistration:
         assert data["mcpServers"]["test-app:my-mcp"]["url"] == "http://localhost:9101/mcp"
 
     def test_http_mcp_server_skipped_when_backend_not_yet_up(self, tmp_path, app_env, monkeypatch):
-        # REGRESSION (revert): if the backend isn't running
-        # (port unknown), an HTTP MCP server must NOT be registered at all — registering
+        # REGRESSION (revert): a GATEWAY-MANAGED backend's HTTP server
+        # (backend.entryPoint set) with the backend not running (port unknown) must NOT be
+        # registered at all — registering
         # the manifest's illustrative dead port (:9100) into global ~/.kiro/settings/mcp.json
         # makes kiro-cli try to connect on EVERY session → "backend hiccup" → 3 retries →
         # hard error, breaking all requests. The enable/boot flow re-registers with the
@@ -1096,6 +1097,7 @@ class TestMCPRegistration:
 
         src = _make_app_source(
             tmp_path,
+            backend={"entryPoint": "backend/app.py"},
             mcpServers={
                 "my-mcp": {"url": "http://localhost:9100/mcp"},
             },
@@ -1112,7 +1114,8 @@ class TestMCPRegistration:
     def test_http_mcp_dead_entry_scrubbed_on_reregister_without_backend(
         self, tmp_path, app_env, monkeypatch
     ):
-        # A stale dead-port entry from a prior (now-down) registration must be SCRUBBED
+        # A GATEWAY-MANAGED backend's stale dead-port entry from a prior (now-down)
+        # registration must be SCRUBBED
         # when we re-register and the backend still isn't up — so it can't keep poisoning
         # every kiro session across reboots/disable.
         import kiro_crew.apps.backend as backend_mod
@@ -1123,6 +1126,7 @@ class TestMCPRegistration:
 
         src = _make_app_source(
             tmp_path,
+            backend={"entryPoint": "backend/app.py"},
             mcpServers={
                 "my-mcp": {"url": "http://localhost:9100/mcp"},
             },
@@ -1166,6 +1170,70 @@ class TestMCPRegistration:
         assert registered == ["test-app:my-stdio"]
         assert "test-app:my-stdio" in json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"]
 
+    def test_self_managed_http_url_registered_without_backend(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # A SELF-MANAGED app (no backend.entryPoint) runs no gateway-launched backend, so
+        # its mcpServers url is an AUTHORITATIVE fixed endpoint — not an illustrative port
+        # awaiting a live allocation. It never gets a live registration, so the registrar
+        # must PRESERVE it (not scrub it as a dead default port). This mirrors
+        # _collect_app_mcp_servers (test_app_mcp_scoping::test_self_managed_http_url_is_preserved),
+        # the other writer of this config: the two must agree or one scrubs what the other
+        # writes straight back.
+        import kiro_crew.apps.backend as backend_mod
+        import kiro_crew.apps.bridges as bmod
+
+        mcp_path = tmp_path / "mcp.json"
+        monkeypatch.setattr(bmod, "_mcp_json_path", lambda: mcp_path)
+        # No backend the gateway launches → no live port, ever.
+        monkeypatch.setattr(backend_mod, "get_app_backend_port", lambda _n: None)
+
+        src = _make_app_source(
+            tmp_path,
+            mcpServers={
+                "companion": {"url": "http://127.0.0.1:7778/mcp"},
+            },
+        )
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        assert manifest.backend.entryPoint == ""  # self-managed
+        registered = _register_mcp_servers("test-app", manifest)
+        assert registered == ["test-app:companion"]
+        written = json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"]
+        # The authoritative manifest url is preserved verbatim (no live port to rewrite to).
+        assert written["test-app:companion"]["url"] == "http://127.0.0.1:7778/mcp"
+
+    def test_backend_app_portless_url_still_scrubbed(self, tmp_path, app_env, monkeypatch):
+        # The complement of the self-managed case: an app that DOES declare a backend
+        # (backend.entryPoint set) still has its portless url scrubbed when no live port
+        # is known — the scrub is now conditional on backend.entryPoint, not removed.
+        import kiro_crew.apps.backend as backend_mod
+        import kiro_crew.apps.bridges as bmod
+
+        mcp_path = tmp_path / "mcp.json"
+        monkeypatch.setattr(bmod, "_mcp_json_path", lambda: mcp_path)
+        monkeypatch.setattr(backend_mod, "get_app_backend_port", lambda _n: None)
+
+        src = _make_app_source(
+            tmp_path,
+            backend={"entryPoint": "backend/app.py"},
+            mcpServers={
+                "my-mcp": {"url": "http://localhost:9100/mcp"},
+            },
+        )
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        assert manifest.backend.entryPoint == "backend/app.py"
+        registered = _register_mcp_servers("test-app", manifest)
+        assert registered == []
+        assert "test-app:my-mcp" not in json.loads(mcp_path.read_text(encoding="utf-8")).get(
+            "mcpServers", {}
+        )
+
     def test_reregister_app_mcp_servers_overwrites_with_live_port(
         self, tmp_path, app_env, monkeypatch
     ):
@@ -1180,6 +1248,7 @@ class TestMCPRegistration:
 
         src = _make_app_source(
             tmp_path,
+            backend={"entryPoint": "backend/app.py"},
             mcpServers={
                 "my-mcp": {"url": "http://localhost:9100/mcp"},
             },
@@ -4626,15 +4695,17 @@ class TestDemotionKeepsBackendIndependentServers:
         assert calls == {"app": "app"}
 
     def test_the_registration_path_pops_a_stale_http_entry(self):
-        # Pins the property the fix leans on, in the code that owns it: with no live
-        # port, an HTTP server is removed rather than merely left unwritten — otherwise
-        # the dead url would survive the demotion.
+        # Pins the property the fix leans on, in the code that owns it: for a
+        # gateway-managed backend with no live port, an HTTP server is removed rather than
+        # merely left unwritten — otherwise the dead url would survive the demotion. The
+        # scrub is conditional on backend.entryPoint (a self-managed app's url is kept),
+        # mirroring _collect_app_mcp_servers.
         import inspect
 
         import kiro_crew.apps.bridges as brmod
         src = inspect.getsource(brmod._register_mcp_servers)
         assert "servers.pop(namespaced, None)" in src
-        assert "if is_http and not resolved_port:" in src
+        assert "if is_http and not resolved_port and manifest.backend.entryPoint:" in src
 
 
 class TestScrubFallsBackWhenTheManifestCannotSay:

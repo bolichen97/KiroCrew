@@ -1,6 +1,6 @@
 # Steering Viewer
 
-The Steering tab under Agent Capabilities lists the standard user and workspace steering roots and reads, creates, edits, and deletes their Markdown files; `POST` / `PUT` / `DELETE` are filesystem mutations, not a read-only viewer. `handlers/steering.py:api_steering`, `api_steering_create`, and `api_steering_detail` enforce the surface. It also lets an author set the `inclusion` mode each document declares.
+The Steering tab under Customize lists the standard user and workspace steering roots and reads, creates, edits, and deletes their Markdown files; `POST` / `PUT` / `DELETE` are filesystem mutations, not a read-only viewer. `handlers/steering.py:api_steering`, `api_steering_create`, and `api_steering_detail` enforce the surface. It also lets an author set the `inclusion` mode each document declares.
 
 **Kiro Crew reports and edits the declaration; it does not act on it.** What a mode causes is the harness's own behaviour, it moves between kiro-cli releases (see [kiro-cli steering](../../reference/kiro-cli/steering.md)), and a client that reimplemented any part of it would duplicate whatever the harness does next.
 
@@ -109,6 +109,6 @@ Behavior is pinned by `test/test_steering_api.py`, `website/src/test/SteeringTab
 - Semantic matching of a description. The index hands the model the name and description and lets it decide; there is no embedding step here.
 - Withholding an `always` document, or anything else kiro-cli chose to inject.
 - Editing the agent config's `resources` globs — that already exists at `GET/PUT /api/agent/config`; this tab shows the files those globs reach, not the globs.
-- Showing the truncation state of the context budget enforced by `context.py:_STEERING_CAP`, or a per-session "what was actually injected" trace.
+- Showing the truncation state of the context budget enforced by `context_assembly/budget.py:_STEERING_CAP`, or a per-session "what was actually injected" trace.
 - Steering files outside the two standard roots (arbitrary `file://` resources in an agent config are not browsable here).
 - `AGENTS.md` / `CLAUDE.md` foundational files, which Kiro loads by a separate mechanism.

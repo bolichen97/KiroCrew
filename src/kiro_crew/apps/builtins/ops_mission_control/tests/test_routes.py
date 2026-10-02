@@ -685,6 +685,17 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
             result = routes._index_ledger_safely()
         self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
 
+    async def test_persistence_switch_skips_automatic_ledger_index_write(self):
+        """The nightly app sweep must obey the global automatic-write switch."""
+        cfg = mock.MagicMock()
+        cfg.memory.persistence_enabled = False
+        with mock.patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg):
+            with mock.patch("kiro_crew.vector_memory.VectorMemoryStore") as store_cls:
+                result = routes._index_ledger_safely()
+
+        store_cls.assert_not_called()
+        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
+
     async def test_a_prune_fault_cannot_cost_the_ledger_push(self):
         """`prune_closed` sits before the push, and making the index read strict gave it a
         new way to raise.
@@ -2447,7 +2458,7 @@ class TestACredentialBearingRemoteIsRefused(unittest.IsolatedAsyncioTestCase):
         from kiro_crew.apps.builtins.ops_mission_control.backend.providers import read_config
 
         token = "ghp_ThisIsTheActualTokenValue"
-        app = web.Application()
+        app = TestAStoreThatRefusesToWriteIsReportedNotCrashed._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             async with TestClient(TestServer(app)) as client:
@@ -2468,7 +2479,7 @@ class TestACredentialBearingRemoteIsRefused(unittest.IsolatedAsyncioTestCase):
         """The guard must not break the feature it protects."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = web.Application()
+        app = TestAStoreThatRefusesToWriteIsReportedNotCrashed._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             async with TestClient(TestServer(app)) as client:
@@ -3400,6 +3411,21 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
     def _refuse(*_a, **_kw):
         raise PermissionError(13, "Permission denied")
 
+    @staticmethod
+    def _owner_app() -> web.Application:
+        """An app whose requests read as the dashboard owner (the secret routes are
+        owner-gated): no configured owner, caller ``local-app``."""
+
+        @web.middleware
+        async def _identity(request, handler):
+            request["user"] = "local-app"
+            request["app"] = ""
+            return await handler(request)
+
+        app = web.Application(middlewares=[_identity])
+        app["state"] = mock.MagicMock(owner_id="")
+        return app
+
     async def _client(self, app):
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -3410,7 +3436,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
 
     async def test_a_refused_secret_save_is_a_coded_503_not_a_500(self):
         token = "u+ThisIsTheActualTokenValue"
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "put_secret", self._refuse):
@@ -3431,7 +3457,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """The load-bearing one. The failure this replaces did not 500 — it returned
         ``{"ok": true, "removed": false}``, i.e. "there was nothing to revoke", while the
         live token was still on disk. Anything 2xx here is the bug."""
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "delete_secret", self._refuse):
@@ -3459,7 +3485,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "put_secret", _corrupt):
@@ -3487,7 +3513,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "delete_secret", _corrupt):
@@ -3505,7 +3531,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """The ceiling is the one value where a silent partial apply is a security state."""
         from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(policy_store, "set_ceiling", self._refuse):
@@ -3527,7 +3553,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         so `merge_provider_config` now propagates a failed read and this route needed the
         same coded refusal. Found in review (Opus 4.8, Design Review).
         """
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "merge_provider_config", self._refuse):
@@ -3552,7 +3578,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "merge_provider_config", _corrupt):
@@ -3816,7 +3842,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(policy_store, "set_ceiling", _corrupt):
@@ -3898,7 +3924,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import slack_out
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(slack_out, "set_settings", self._refuse):
@@ -3921,7 +3947,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(policy_store, "set_ceiling", self._refuse):
@@ -3936,7 +3962,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
 
     async def test_an_ordinary_settings_write_still_succeeds(self):
         """Negative control: the guard must not break the route it protects."""
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             client = await self._client(app)

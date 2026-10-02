@@ -156,6 +156,9 @@
   "pages.chat.turnBlock.worked_through_step",
   "pages.chatPage.knowledge_item",
   "pages.chatSidebar.archive_session",
+  "pages.chatSidebar.archived_count",
+  "pages.chatSidebar.archived_sessions_kept",
+  "pages.chatSidebar.delete_empty_folders",
   "pages.chatSidebar.day",
   "pages.chatSidebar.hidden_folder_count",
   "pages.chatSidebar.more_pull_request_in_this_session",
@@ -242,5 +245,6 @@
   "pages.overview.memoryTab.consolidated_sessions_skipped",
   "pages.overview.memoryTab.consolidate_failed_session",
   "pages.overview.memoryTab.skipped_temporary_count",
-  "pages.overview.memoryTab.skipped_incognito_count"
+  "pages.overview.memoryTab.skipped_incognito_count",
+  "pages.chat.crewLog.subagents_unmatched"
 ]

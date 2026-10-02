@@ -30,6 +30,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from dashboard_owner_helpers import as_owner
+from test_update_provider import _UNALLOCATABLE_PID
 
 import kiro_crew.apps.routes as routes_mod
 from conftest import requires_symlinks
@@ -128,7 +129,9 @@ def _make_app(
         middlewares.append(_identity)
     app = web.Application(middlewares=middlewares)
     if dashboard_user is not None:
-        app["state"] = SimpleNamespace(owner_id="owner")
+        app["state"] = SimpleNamespace(
+            owner_id="owner", broadcast_ws=lambda *a, **k: None
+        )
     register_app_routes(app)
     return app
 
@@ -1937,6 +1940,33 @@ class TestEnableRefusesAppTokens:
         assert routes_mod.get_app(APP)["sessionApprovalConsentPending"] is True
 
     @pytest.mark.asyncio
+    async def test_non_owner_dashboard_user_cannot_enable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Enabling registers the app's agents, skills, MCP servers and crons and
+        # starts its backend, so a signed-in non-owner dashboard user is refused
+        # with 403 owner_only even without a consent body, and nothing runs.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onEnable": "echo should-not-run"})
+        reached: list[str] = []
+
+        async def _script(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            reached.append("on_enable_script")
+            return {"output": "", "failed": False}
+
+        monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _script)
+        monkeypatch.setattr(
+            routes_mod, "start_app_backend", lambda n: reached.append("start_app_backend")
+        )
+        async with TestClient(TestServer(_make_app(dashboard_user="guest"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "owner_only"
+        assert reached == []
+        assert routes_mod.get_app(APP)["enabled"] is False
+
+    @pytest.mark.asyncio
     async def test_pending_consent_requires_disclosure_flag(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1991,7 +2021,7 @@ class TestEnableBranches:
 
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _must_not_run)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             body = await resp.json()
@@ -2010,7 +2040,7 @@ class TestEnableBranches:
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _failed)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
         monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 400
             body = await resp.json()
@@ -2031,7 +2061,7 @@ class TestEnableBranches:
 
         monkeypatch.setattr(routes_mod, "on_app_enable", _boom)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             body = await resp.json()
@@ -2055,7 +2085,7 @@ class TestEnableBranches:
 
         monkeypatch.setattr(routes_mod, "on_app_enable", _hooks)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             issues = (await resp.json())["hooks"]["health_status"]["issues"]
@@ -2066,7 +2096,7 @@ class TestEnableBranches:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/enable")
             assert resp.status == 404
 
@@ -2254,7 +2284,7 @@ class TestRepeatedToggleIsIdempotent:
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _script)
         monkeypatch.setattr(routes_mod, "on_app_enable", _hooks)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: calls.append("backend"))
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             first = await client.post(f"/api/apps/{APP}/enable")
             assert first.status == 200
             assert calls == ["backend", "onEnable", "hooks"]
@@ -2345,7 +2375,7 @@ class TestOpenApp:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/open")
             assert resp.status == 404
 
@@ -2355,7 +2385,7 @@ class TestOpenApp:
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path, openCommand="true")
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 409
             assert (await resp.json())["code"] == "app_disabled"
@@ -2367,7 +2397,7 @@ class TestOpenApp:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
         enable_app(APP)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 400
             assert "openCommand" in (await resp.json())["error"]
@@ -2384,7 +2414,7 @@ class TestOpenApp:
             "app_execution_denied",
             lambda name, **kwargs: "third-party app execution is not admitted",
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 403
             body = await resp.json()
@@ -2404,7 +2434,7 @@ class TestOpenApp:
         monkeypatch.setattr(platform_mod, "system", lambda: "Linux")
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 200
             body = await resp.json()
@@ -2434,7 +2464,7 @@ class TestOpenApp:
         monkeypatch.setattr(routes_mod, "wrap_argv", _wrap)
         monkeypatch.setattr(routes_mod, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(routes_mod, "create_subprocess_limited", _spawn)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 200
             body = await resp.json()
@@ -2461,10 +2491,48 @@ class TestOpenApp:
             raise OSError("no such executable")
 
         monkeypatch.setattr(routes_mod, "create_subprocess_limited", _boom)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 500
             assert "failed to launch" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("app_identity", "dashboard_user"),
+        [(None, "channel-user"), (APP, "owner")],
+        ids=["non_owner_dashboard_subject", "app_token"],
+    )
+    async def test_non_owner_cannot_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        app_identity: str | None,
+        dashboard_user: str,
+    ) -> None:
+        # Opening spawns the manifest's openCommand on the host, so it is an
+        # owner action like enable and disable.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, openCommand="open-my-app")
+        enable_app(APP)
+        monkeypatch.setattr(routes_mod, "app_execution_denied", lambda n, **k: None)
+        monkeypatch.setattr(platform_mod, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            routes_mod, "wrap_argv", lambda argv, mode="standard": (argv, None)
+        )
+        monkeypatch.setattr(routes_mod, "cgroup_scope_argv", lambda argv: argv)
+        spawned: list[tuple[str, ...]] = []
+
+        async def _spawn(*argv: str, **kwargs: Any) -> Any:
+            spawned.append(argv)
+            return SimpleNamespace(pid=_UNALLOCATABLE_PID)
+
+        monkeypatch.setattr(routes_mod, "create_subprocess_limited", _spawn)
+        app = _make_app(app_identity=app_identity, dashboard_user=dashboard_user)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(f"/api/apps/{APP}/open")
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "owner_only"
+        assert spawned == []
 
 
 # ---------------------------------------------------------------------------
@@ -4780,8 +4848,9 @@ async def test_enable_does_not_re_register_after_the_backend_starts(
         ),
     )
 
-    async with TestClient(TestServer(_make_app())) as client:
-        await client.post(f"/api/apps/{APP}/enable", json={})
+    async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+        resp = await client.post(f"/api/apps/{APP}/enable", json={})
+        assert resp.status == 200
 
     assert called == [], "enable re-registered after start; the adoption path owns that"
 

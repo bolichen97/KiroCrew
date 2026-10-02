@@ -156,7 +156,6 @@ from kiro_crew.config.section_builders import (  # noqa: F401
     _build_memory_config,
     _build_messaging_config,
     _build_monitoring_config,
-    _build_orchestrator_config,
     _build_publish_config,
     _build_session_summary_config,
     _build_skills_config,
@@ -296,7 +295,6 @@ from kiro_crew.config.sections import (  # noqa: F401
     MemoryStoreConfig,
     MessagingConfig,
     MonitoringConfig,
-    OrchestratorConfig,
     PublishConfig,
     ResolvedBindings,
     ResourceLimitsConfig,
@@ -408,6 +406,8 @@ from kiro_crew.config.validation import (  # noqa: F401
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
 from kiro_crew.constants import (
+    DEFAULT_SPAWN_MIN_MEMORY_GB,
+    DEFAULT_SUBAGENT_COST_GB,
     DEFAULT_SUBAGENT_MAX_TURNS,
     SUBAGENT_TIMEOUT_MAX,
     SUBAGENT_TIMEOUT_MIN,
@@ -901,31 +901,70 @@ def ssh_auth_sock_consent_path() -> Path:
     return config_dir() / "ssh_auth_sock_consent.json"
 
 
-def read_local_secret(port: int) -> str:
+def read_local_secret(port: int, dial_host: str | None = None) -> str:
     """Read the internal-API credential for the gateway on *port*.
 
     Single home for the secret read that callers (cron scripts, MCP tool bridges,
     CLI) need to authenticate to the gateway's internal API. Returns empty string
     when no credential can be read.
 
-    Resolution is per LISTENER first: ``run/gateway-<port>.secret``, then the
-    shared ``.local_secret``. That order is the invariant, and it lives here rather
-    than in each reader because the credential identifies ONE gateway generation
-    while the shared file has one slot per data home, last-writer-wins. A caller
-    that reads the shared file while a different generation owns the port it dials
-    gets 403 on every internal call.
+    Resolution depends on whether the caller can name the ADDRESS it dials:
 
-    *port* is REQUIRED, and deliberately so: the credential is a function of the
-    dial target, so inferring the target here would let a caller dial one gateway
-    while authenticating for another -- the exact desync this helper exists to
-    close, reintroduced one call site at a time and invisible at the call site. A
-    caller with no port must resolve one explicitly and pass it, where the choice
-    is reviewable.
+    * With *dial_host* -- the loopback host the caller is about to send the
+      credential to (``127.0.0.1``, ``localhost``, ``::1``) -- the credential is
+      resolved per LISTENER: :func:`run_marker.read_listener_secret` returns the
+      value published under every loopback family that host reaches. When it
+      returns a value, that value is used. When it returns nothing, the answer
+      turns on WHY:
+
+      - The gateway published NO listener entry for this port at all
+        (:func:`run_marker.has_listener_entries` is false) -- an older gateway,
+        or one that could not name its bound address. There is no OTHER
+        listener's credential on this port to confuse it with, so this falls back
+        to the port-keyed read and then the shared file, exactly as an
+        address-less caller does. This is the pre-per-listener world, not the
+        desync, and withholding the credential here would stop an ordinary
+        install from authenticating at all.
+      - Listener entries EXIST but none covers the family *dial_host* reaches.
+        A gateway bound some address other than the one being dialled, so the
+        port-keyed read could hand back a DIFFERENT listener's credential -- the
+        exact desync this issue closes. This FAILS CLOSED (returns ``""``): no
+        fallback, because the fallback is the bug.
+
+    * Without *dial_host* -- a caller that structurally cannot name an address --
+      resolution is per LISTENER for the port only: ``run/gateway-<port>.secret``,
+      then the shared ``.local_secret``. This is the pre-existing behaviour, kept
+      for the callers section 12.1 names as resolving a port and nothing finer.
+
+    Every reader that constructs a loopback URL a line or two away from this call
+    SHOULD pass that URL's host as *dial_host*, so the credential is paired to the
+    listener it will actually reach. *port* stays REQUIRED regardless: the
+    credential is a function of the dial target, so inferring the target here
+    would let a caller dial one gateway while authenticating for another -- the
+    exact desync, reintroduced one call site at a time and invisible at the call
+    site.
     """
     # Function-local: port_resolution imports this module, so a module-level
     # import would be circular.
     from kiro_crew.instances import run_marker
 
+    if dial_host:
+        try:
+            listener = run_marker.read_listener_secret(int(port), dial_host)
+            if listener:
+                return listener
+            # An empty listener read is a REFUSAL unless the gateway PROVABLY
+            # published no listener entries at all -- only then does this port
+            # predate the per-listener publish and the port-keyed read below is
+            # safe and required. ``has_listener_entries`` is three-valued: a
+            # proven-empty ``False`` re-opens the fallback; ``True`` (entries
+            # exist, none covered the family) and ``None`` (could not enumerate,
+            # so absence is unproven) both FAIL CLOSED here -- an unreadable
+            # ``run/`` must not silently downgrade to the shared credential.
+            if run_marker.has_listener_entries(int(port)) is not False:
+                return ""
+        except Exception:
+            return ""
     try:
         per_port = run_marker.read_secret(int(port))
     except Exception:
@@ -957,7 +996,7 @@ class _PinnedCreateRefusal(Exception):
     """pinned_fs's refusal for the workspace create, mapped by the caller."""
 
 
-def materialize_workspace_dir(validated: Path, *, display: str) -> None:
+def materialize_workspace_dir(validated: Path, *, leaf: Path, display: str) -> None:
     """Make *validated* exist as a directory: adopt one that is there, create one that is not.
 
     One writer-side rule shared by the dashboard handler and the CLI: a published
@@ -987,7 +1026,18 @@ def materialize_workspace_dir(validated: Path, *, display: str) -> None:
     caller's config write later fails. It is reachable only through the entry
     written in the same locked section, and a concurrent create can already have
     adopted it, so deleting it is the unsafe option.
+
+    *leaf* is the same path BEFORE resolution. Resolving follows a link at the
+    final name, so *validated* alone never shows one: the entry the caller
+    registers is the unresolved spelling, and a link or junction there is
+    refused on every platform. It is normalized first, so a ``..`` through a
+    missing component cannot make the probe miss the name resolution lands on.
     """
+    if platform_compat.is_link_or_junction(os.path.normpath(leaf)):
+        raise WorkspaceDirUnusable(
+            "workspace_dir_not_a_directory",
+            f"'{display}' is a link, not a directory; choose another dir or remove it first",
+        )
     if pinned_fs.supports_pinned_walk():
         try:
             parent_fd = pinned_fs.pin_parent(
@@ -1022,16 +1072,19 @@ def materialize_workspace_dir(validated: Path, *, display: str) -> None:
                 f"Directory '{display}' could not be created: {exc.strerror or exc}",
             ) from exc
 
-    if validated.is_dir():
+    # By name here, so a link at the name must be screened out explicitly: a
+    # Windows junction answers is_dir() True and is_symlink() False, and the
+    # pinned arm above refuses every link through its lstat.
+    if not platform_compat.is_link_or_junction(validated) and validated.is_dir():
         return
     try:
         os.mkdir(validated)
     except FileExistsError as exc:
         # EEXIST is the filesystem itself saying something is at the name: a
         # racer's directory is the state this create wanted, while a file, a
-        # socket, a dangling link or a symlink cannot serve as a workspace, and
+        # socket, a dangling link, a symlink or a junction cannot serve as a workspace, and
         # registering one writes back exactly the unusable entry this prevents.
-        if validated.is_dir() and not validated.is_symlink():
+        if not platform_compat.is_link_or_junction(validated) and validated.is_dir():
             return
         raise WorkspaceDirUnusable(
             "workspace_dir_not_a_directory",
@@ -2479,6 +2532,11 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
         CHAT_ENTRY_CACHE_BYTES_MAX,
     ),
     ("session", "pool_size", 0, POOL_SIZE_MAX),
+    # A kill budget belongs in this sweep for the reason the sweep exists: the
+    # value authorizes signals, and a hand-edited config.json never passes the
+    # dashboard's write gate. The floor is 0 because 0 is this field's OFF value, so
+    # a negative clamps toward observe-only rather than toward killing.
+    ("session", "reconcile_max_kills", 0, _sections.RECONCILE_MAX_KILLS_MAX),
 )
 
 
@@ -2767,7 +2825,9 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # default back to true. `_safe_bool` here is the final guard for a real
         # bool.
         crew_panel=_safe_bool(agent_data.get("crew_panel", True), True),
-        subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
+        subagent_cost_gb=_safe_float(
+            agent_data.get("subagent_cost_gb", DEFAULT_SUBAGENT_COST_GB), DEFAULT_SUBAGENT_COST_GB
+        ),
         subagent_cpu_cost_cores=_safe_float(agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0),
         subagent_auto_max=_safe_int(
             agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
@@ -2775,7 +2835,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         subagent_spawn_stagger_secs=_safe_float(
             agent_data.get("subagent_spawn_stagger_secs", 0.25), 0.25
         ),
-        spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
+        spawn_min_memory_gb=_safe_float(
+            agent_data.get("spawn_min_memory_gb", DEFAULT_SPAWN_MIN_MEMORY_GB),
+            DEFAULT_SPAWN_MIN_MEMORY_GB,
+        ),
         resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
         resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
         admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
@@ -2812,7 +2875,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         recovery_backoff_max_secs=_safe_float(
             agent_data.get("recovery_backoff_max_secs", 120.0), 120.0, 1.0, 3600.0
         ),
-        # Session-start gate (acp/runtime.py SessionStartGate).
+        # Session-start gate (acp/runtime_start.py SessionStartGate).
         session_start_concurrency=_safe_int(
             agent_data.get("session_start_concurrency", 2), 2, 1, 64
         ),
@@ -2942,6 +3005,15 @@ def _build_session_config(session_data: dict) -> SessionConfig:
         watchdog_rss_max_mb=_safe_int(
             session_data.get("watchdog_rss_max_mb", _sections.DEFAULT_WATCHDOG_RSS_MAX_MB),
             _sections.DEFAULT_WATCHDOG_RSS_MAX_MB,
+        ),
+        # Clamped HERE as well as in the `_SECURITY_BOUNDED_FIELDS` sweep, for the
+        # reason `_safe_int` states: that sweep runs over the raw dict and skips
+        # non-int values, so a numeric STRING passes it and coerces here.
+        reconcile_max_kills=_safe_int(
+            session_data.get("reconcile_max_kills", _sections.DEFAULT_RECONCILE_MAX_KILLS),
+            _sections.DEFAULT_RECONCILE_MAX_KILLS,
+            0,
+            _sections.RECONCILE_MAX_KILLS_MAX,
         ),
     )
 
@@ -3113,7 +3185,8 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         jira_auth=[
             JiraAuthEntry(
                 host=str(entry.get("host", "")),
-                email=str(entry.get("email", "")),
+                # ``user`` is accepted as an alias; ``email`` wins when both are set.
+                email=str(entry.get("email") or entry.get("user") or ""),
             )
             for entry in (dashboard_data.get("jira_auth") or [])
             if isinstance(entry, dict) and entry.get("host")
@@ -3137,10 +3210,6 @@ class KiroCrewConfig:
     taskrunner: TaskRunnerConfig = field(
         default_factory=TaskRunnerConfig,
         metadata=_meta("Task Runner", "Task runner configuration."),
-    )
-    orchestrator: OrchestratorConfig = field(
-        default_factory=OrchestratorConfig,
-        metadata=_meta("Orchestrator", "Autopilot/orchestrator settings."),
     )
     messaging: MessagingConfig = field(
         default_factory=MessagingConfig,
@@ -3363,7 +3432,12 @@ class KiroCrewConfig:
     )
     auto_update: bool = field(
         default=True,
-        metadata=_meta("Auto Update", "Enable automatic update checks."),
+        metadata=_meta(
+            "Auto Update",
+            "Where the install can apply updates, true installs them once no work is "
+            "running and restarts; false only notifies. Elsewhere it has no effect. "
+            "On those same installs a policy minimum version applies regardless.",
+        ),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
     #: release. A real field rather than an unmodelled top-level key because the
@@ -3937,7 +4011,6 @@ class KiroCrewConfig:
         session_summary_data = _coerced_section(data, "session_summary", _degraded)
         messaging_data = _coerced_section(data, "messaging", _degraded)
         telemetry_data = _coerced_section(data, "telemetry", _degraded)
-        orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
         watchdog_data = _coerced_section(data, "watchdog", _degraded)
         decisions_data = _coerced_section(data, "decisions", _degraded)
         resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
@@ -4100,12 +4173,10 @@ class KiroCrewConfig:
             taskrunner=_build_taskrunner_config(taskrunner_data),
             cron_history=_build_cron_history_config(cron_history_data),
             messaging=_build_messaging_config(messaging_data),
-            # orchestrator/watchdog are advertised in config-baseline.json,
-            # served by /api/config/schema, and read by real consumers
-            # (acp/session_handle.py, dashboard/chat_orchestrator.py), so load()
-            # passes these kwargs — without them config.json values would be
+            # watchdog is advertised in config-baseline.json, served by
+            # /api/config/schema, and read by acp/session_handle.py, so load()
+            # passes this kwarg — without it config.json values would be
             # silently ignored and the dataclass defaults would always win.
-            orchestrator=_build_orchestrator_config(orchestrator_data),
             watchdog=_build_watchdog_config(watchdog_data),
             resource_limits=ResourceLimitsConfig.from_raw(resource_limits_data),
             telemetry=_build_telemetry_config(telemetry_data),
@@ -4425,7 +4496,6 @@ class KiroCrewConfig:
             "mcp_gateway": asdict(self.mcp_gateway),
             "mcp": asdict(self.mcp),
             "taskrunner": asdict(self.taskrunner),
-            "orchestrator": asdict(self.orchestrator),
             "watchdog": asdict(self.watchdog),
             "resource_limits": asdict(self.resource_limits),
             "messaging": asdict(self.messaging),

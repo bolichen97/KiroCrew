@@ -9,7 +9,7 @@
  * is always mounted: toggling it would remount the editor and drop the draft's
  * focus when an approval lands.
  */
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
@@ -21,6 +21,13 @@ import type { RootState } from '../store'
 
 const INDEX_CSS = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
 const CHAT_INPUT_SRC = readFileSync(resolve(process.cwd(), 'src/components/ChatInput.tsx'), 'utf-8')
+// The composer's owners under chat-input/ carry its markup too: a focus form must
+// not come back through any of them.
+const COMPOSER_OWNERS_DIR = resolve(process.cwd(), 'src/components/chat-input')
+const COMPOSER_SRCS = [
+  CHAT_INPUT_SRC,
+  ...readdirSync(COMPOSER_OWNERS_DIR).map(f => readFileSync(resolve(COMPOSER_OWNERS_DIR, f), 'utf-8')),
+]
 const SETTINGS_SEARCH_SRC = readFileSync(resolve(process.cwd(), 'src/pages/settings/SettingsSearch.tsx'), 'utf-8')
 const FOLLOW_UP_BAR_SRC = readFileSync(resolve(process.cwd(), 'src/components/FollowUpBar.tsx'), 'utf-8')
 const DISPLAY_PANEL_SRC = readFileSync(resolve(process.cwd(), 'src/pages/settings/DisplayPanel.tsx'), 'utf-8')
@@ -38,9 +45,9 @@ describe('composer liquid glass', () => {
   })
 
   // With an approval box fused above, the bar and the composer share the ONE
-  // dock pane: the wrapper stays transparent (no seam, no notch), keeps its
-  // focus-within accent brightening, and the dock swaps its halo for the
-  // approval glow so the pending decision is what lights up.
+  // dock pane: the wrapper stays transparent (no seam, no notch), and the dock
+  // swaps its shadow for the approval glow so the pending decision is what
+  // lights up.
   it('keeps the wrapper on the shared pane and lights the approval glow while an approval is attached', () => {
     const store = createTestStore({
       chat: {
@@ -98,9 +105,9 @@ describe('composer liquid glass', () => {
     for (const layer of dock.querySelectorAll<HTMLElement>(':scope > span[aria-hidden="true"]')) expect(layer.style.zIndex).toBe('-1')
   })
 
-  it('defines the glass tokens (tint, band, edge, focus edge, hairline) for both polarities', () => {
-    expect(INDEX_CSS).toMatch(/:root \{ --glass-tint: rgba\(30, 30, 34, 0\.40\); --glass-band: rgba\(255, 255, 255, 0\.22\); --glass-edge: rgba\(255, 255, 255, 0\.14\); --glass-edge-focus: rgba\(255, 255, 255, 0\.55\); --glass-hairline: rgba\(0, 0, 0, 0\.50\); \}/)
-    expect(INDEX_CSS).toMatch(/\[data-mode="light"\] \{ --glass-tint: rgba\(240, 240, 240, 0\.45\); --glass-band: rgba\(255, 255, 255, 1\); --glass-edge: rgba\(0, 0, 0, 0\.24\); --glass-edge-focus: rgba\(0, 0, 0, 0\.60\); --glass-hairline: rgba\(0, 0, 0, 0\.20\); \}/)
+  it('defines the glass tokens (tint, band, edge, hairline) for both polarities, none with a focus form', () => {
+    expect(INDEX_CSS).toMatch(/:root \{ --glass-tint: rgba\(30, 30, 34, 0\.40\); --glass-band: rgba\(255, 255, 255, 0\.22\); --glass-edge: rgba\(255, 255, 255, 0\.14\); --glass-hairline: rgba\(0, 0, 0, 0\.50\); \}/)
+    expect(INDEX_CSS).toMatch(/\[data-mode="light"\] \{ --glass-tint: rgba\(240, 240, 240, 0\.45\); --glass-band: rgba\(255, 255, 255, 1\); --glass-edge: rgba\(0, 0, 0, 0\.24\); --glass-hairline: rgba\(0, 0, 0, 0\.20\); \}/)
   })
 
   it('stands the context shelf on a short fade to page colour', () => {
@@ -140,8 +147,8 @@ describe('composer liquid glass', () => {
     // The material's edges live in the hidden layers, so a solid pane has no
     // edge of its own -- a white card on a white page vanished. One hairline of
     // the app's --border token as an inset outline, the same on the composer
-    // and on a chip, and nothing changes it on focus (the shadow step is the
-    // cue) -- as every card looked before the glass. prefers-contrast paints
+    // and on a chip, and nothing changes it on focus (a pane does not change
+    // on focus in any mode) -- as every card looked before the glass. prefers-contrast paints
     // its own 1px --text outline.
     for (const block of [/@supports not \(\(backdrop-filter[\s\S]*?\n\}/, /@media \(prefers-reduced-transparency: reduce\)\{[\s\S]*?\n\}/]) {
       const rule = INDEX_CSS.match(block)?.[0] ?? ''
@@ -155,9 +162,10 @@ describe('composer liquid glass', () => {
     }
   })
 
-  it('offers a Reduce glass transparency switch that mirrors the OS fallback rule for rule', () => {
-    // The switch (Settings -> Display -> Theme) sets data-reduce-transparency
-    // on <html>; index.css applies exactly the rules it applies under the OS's
+  it('offers an opt-in Translucent panels switch whose off state mirrors the OS fallback rule for rule', () => {
+    // Glass is opt-in. The switch (Settings -> Display -> View) keeps
+    // data-reduce-transparency="on" on <html> until the user turns glass on;
+    // index.css applies exactly the rules it applies under the OS's
     // prefers-reduced-transparency query. A media query and an attribute cannot
     // share a selector, so the block is mirrored -- and this pins that the two
     // bodies are the same rules, so one cannot drift from the other.
@@ -177,32 +185,44 @@ describe('composer liquid glass', () => {
       const expected = selectors.split(',').map(sel => PREFIX + sel.trim()).join(',') + '{' + body
       expect(mirrored[i]).toBe(expected)
     }
-    // The bootstrap applies the stored choice before hydration (no flash), the
-    // hook owns it after, and the Display panel shows the switch.
-    expect(INDEX_HTML).toMatch(/localStorage\.getItem\('mc-reduce-transparency'\) === 'on'\) document\.documentElement\.dataset\.reduceTransparency = 'on'/)
-    expect(DISPLAY_PANEL_SRC).toMatch(/<SettingsToggle\n\s+label=\{i18nT\('pages\.settings\.displayPanel\.reduce_transparency'\)\}\n\s+description=\{i18nT\('pages\.settings\.displayPanel\.reduce_transparency_desc'\)\}\n\s+checked=\{reduceTransparency\}\n\s+onChange=\{setReduceTransparency\}/)
+    // The bootstrap applies the stored choice before hydration (no flash) and
+    // defaults to SOLID -- the attribute goes on unless the key says glass is
+    // on, and an unreadable store counts as off; the hook owns it after, and
+    // the Display panel shows the switch.
+    expect(INDEX_HTML).toMatch(/var lg = false; try \{ lg = localStorage\.getItem\('mc-liquid-glass'\) === 'on'; \} catch \(e\) \{\}\n\s+if \(!lg\) document\.documentElement\.dataset\.reduceTransparency = 'on';/)
+    expect(INDEX_HTML).not.toContain('mc-reduce-transparency')
+    // On the View card beside the interface style, not at the foot of the
+    // Theme card (stacked fields under captions, where a switch row read as a
+    // different kind of control). The user-facing name is never the primitive's.
+    expect(DISPLAY_PANEL_SRC).toMatch(/onChange=\{v => setUIMode\(v as 'chat' \| 'cli'\)\} \/>\n(?:\s+\{\/\*[\s\S]*?\*\/\}\n)?\s+<SettingsToggle\n\s+label=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels'\)/)
+    expect(DISPLAY_PANEL_SRC).toMatch(/<SettingsToggle\n\s+label=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels'\)\}\n\s+description=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels_desc'\)\}\n\s+checked=\{liquidGlass\}\n\s+onChange=\{setLiquidGlass\}/)
+    expect(DISPLAY_PANEL_SRC).not.toMatch(/liquid_glass/)
+    // The live preview follows the row: the real primitive over a skeleton transcript.
+    expect(DISPLAY_PANEL_SRC).toMatch(/onChange=\{setLiquidGlass\}\n\s+\/>\n\s+<TranslucentPanelsPreview placeholder=\{i18nT\('components\.chatInput\.message_placeholder', \{ bot: botName \}\)\} \/>/)
   })
 
   // Every glass surface, the session composer included, wears the neutral
-  // `glass-shadow`: focus is the deeper shadow PLUS the brighter focus tint and
-  // darker side lines, never a theme-colored glow or ring. The tint step is for
-  // neutral panes only: an accent / warn pane keeps its hue while a control
-  // inside it has focus. A pending approval takes the shadow slot for its warm
-  // glow and leaves the focus step on.
-  it('gives every glass pane the same neutral focus cue, no accent glow', () => {
-    expect(INDEX_CSS).toMatch(/\.glass-shadow:focus-within \{ box-shadow: 0 0 18px rgba\(0, 0, 0, 0\.14\); \}/)
-    expect(INDEX_CSS).toMatch(/\.glass-shadow\.approval-glow, \.glass-shadow\.approval-glow:focus-within \{ box-shadow: var\(--approval-shadow\); \}/)
+  // `glass-shadow`, and the material does NOT change when a control inside it
+  // has focus: no accent glow or ring, no brighter tint, no darker side lines,
+  // no deeper shadow (maintainer decision -- a focused pane is the same glass
+  // as a resting one; the caret is the composer's focus indicator). A pending
+  // approval takes the shadow slot for its warm glow.
+  it('leaves every glass pane unchanged on focus, no accent glow', () => {
+    expect(INDEX_CSS).toMatch(/\.glass-shadow \{ box-shadow: 0 0 18px rgba\(0, 0, 0, 0\.06\); transition: box-shadow 0\.18s ease; \}/)
+    expect(INDEX_CSS).toMatch(/\[data-mode="dark"\] \.glass-shadow \{ box-shadow: 0 0 18px rgba\(0, 0, 0, 0\.30\); \}/)
+    expect(INDEX_CSS).toMatch(/\.glass-shadow\.approval-glow \{ box-shadow: var\(--approval-shadow\); \}/)
     expect(INDEX_CSS).toMatch(/@media \(prefers-reduced-motion:reduce\)\{\.approval-glow\{animation:none;--glow-strength:\.6\}\}/)
-    // Focus steps the tint AND darkens the side lines (--glass-edge-focus); the
-    // capsule's neutral focus cue is that pair, never an accent ring.
-    // Focus steps the side lines (--glass-edge-focus) and deepens the shadow;
-    // the tint stays put (a focused pane is the same glass as a resting one).
-    expect(INDEX_CSS).toMatch(/\.glass-shadow:focus-within:not\(\.glass-accent, \.glass-warn\) \{ --glass-edge: var\(--glass-edge-focus\); \}/)
+    // No focus rule of any kind on the pane, and no focus form of any token.
+    expect(INDEX_CSS).not.toMatch(/\.glass-shadow[^{]*:focus-within/)
+    expect(INDEX_CSS).not.toContain('--glass-edge-focus')
     expect(INDEX_CSS).not.toContain('--glass-tint-focus')
     expect(INDEX_CSS).not.toContain('composer-halo')
     expect(INDEX_CSS).not.toMatch(/\.glass-shadow[^{]* \{[^}]*--accent/)
-    expect(CHAT_INPUT_SRC).not.toContain('composer-halo')
-    expect(CHAT_INPUT_SRC).not.toContain('focus-within:border-accent')
+    expect(COMPOSER_SRCS.length).toBeGreaterThan(1)
+    for (const src of COMPOSER_SRCS) {
+      expect(src).not.toContain('composer-halo')
+      expect(src).not.toContain('focus-within:border-accent')
+    }
     // The Settings search bar follows the same rule: its boxed input keeps the
     // shared `focus-ring` shape but swaps the accent for a neutral border + halo.
     expect(SETTINGS_SEARCH_SRC).toMatch(/className="settings-search relative shrink-0"/)
@@ -215,10 +235,12 @@ describe('composer liquid glass', () => {
   // and each step is a `--glass-tint` swap derived once on :root.
   it('has no CSS copy of the material, only tint steps on the host', () => {
     expect(INDEX_CSS).not.toContain('glass-pane')
-    expect(INDEX_CSS).toMatch(/:root \{ --glass-tint-accent: color-mix\(in srgb, var\(--accent\) 14%, var\(--glass-tint\)\); --glass-tint-warn: color-mix\(in srgb, var\(--warn\) 12%, var\(--glass-tint\)\); --glass-tint-hover: color-mix\(in srgb, var\(--text\) 8%, var\(--glass-tint\)\); --glass-tint-faded: color-mix\(in srgb, var\(--glass-tint\) 55%, transparent\); \}/)
+    expect(INDEX_CSS).toMatch(/:root \{ --glass-tint-accent: color-mix\(in srgb, var\(--accent\) 14%, var\(--glass-tint\)\); --glass-tint-warn: color-mix\(in srgb, var\(--warn\) 12%, var\(--glass-tint\)\); --glass-tint-danger: color-mix\(in srgb, var\(--danger\) 12%, var\(--glass-tint\)\); --glass-tint-hover: color-mix\(in srgb, var\(--text\) 8%, var\(--glass-tint\)\); --glass-tint-faded: color-mix\(in srgb, var\(--glass-tint\) 55%, transparent\); \}/)
     expect(INDEX_CSS).toContain('.glass-accent { --glass-tint: var(--glass-tint-accent); }')
     expect(INDEX_CSS).toContain('.glass-faded { --glass-tint: var(--glass-tint-faded); }')
     expect(INDEX_CSS).toContain('.glass-warn { --glass-tint: var(--glass-tint-warn); }')
+    // The top bar's readout capsule while the gateway is offline (App.tsx).
+    expect(INDEX_CSS).toContain('.glass-danger { --glass-tint: var(--glass-tint-danger); }')
     expect(INDEX_CSS).toContain('.glass-hover:hover { --glass-tint: var(--glass-tint-hover); }')
   })
 
@@ -238,8 +260,8 @@ describe('composer liquid glass', () => {
       expect(rule, String(block)).not.toContain('[aria-hidden="true"]{ display:none')
       // No extra ring on focus in any solid mode -- no 2px outline, no accent
       // (the maintainer's rule holds in every mode; the composer had a 1px
-      // border before the glass and that is enough). The shadow step still
-      // applies everywhere.
+      // border before the glass and that is enough). A pane does not change
+      // on focus anywhere.
       expect(rule, String(block)).not.toMatch(/focus-within\{[^}]*var\(--accent\)/)
       expect(rule, String(block)).not.toMatch(/focus-within\{[^}]*outline:2px/)
     }

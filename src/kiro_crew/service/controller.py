@@ -140,6 +140,14 @@ def install_service() -> int:
         # non-fatal: a failure warns and leaves the service running.
         if profile.message:
             print(f"   {'' if profile.ok else '⚠️ '}{profile.message}")
+        # A system unit's runtimes live under the service account's user manager,
+        # which logind stops at logout unless linger is on. Warn here, after the
+        # service is up: without it the gateway survives disconnects but every
+        # agent runtime dies with the account's last login session. Non-fatal —
+        # the install succeeded, and the account may enable linger at any time.
+        linger_warning = linux.linger_warning_for_service_account()
+        if linger_warning:
+            print(f"   ⚠️ {linger_warning}")
         _print_headless_auth_warning()
         print()
         print("   Status: kirocrew service status")

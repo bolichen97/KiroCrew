@@ -35,6 +35,7 @@ import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import {
   HEIGHT_SCHEMA_VERSION,
   SCHEMA_VERSION_KEY,
+  TOUCHED_AT_KEY,
 } from '../hooks/virtualizer/HeightCache'
 import type { UseVirtualChatOptions } from '../hooks/virtualizer/types'
 
@@ -778,13 +779,14 @@ describe('useVirtualChat: height-cache eviction cap is wired to the row count', 
     for (let i = 0; i < n; i++) blob[`m${i}`] = 40 + (i % 5)
     window.localStorage.setItem(`vc_heights_${sessionId}`, JSON.stringify(blob))
   }
-  // HEIGHTS only. The schema stamp shares the blob but is not a row, and
-  // counting it would put every cap assertion one off the cap it names.
+  // HEIGHTS only. The schema stamp and the lastTouched stamp share the blob but
+  // are not rows, and counting them would put every cap assertion off the cap
+  // it names.
   const persistedCount = (sessionId: string) => {
     const raw = window.localStorage.getItem(`vc_heights_${sessionId}`)
     if (!raw) return 0
     return Object.keys(JSON.parse(raw) as Record<string, number>)
-      .filter((k) => k !== SCHEMA_VERSION_KEY).length
+      .filter((k) => k !== SCHEMA_VERSION_KEY && k !== TOUCHED_AT_KEY).length
   }
   // Mount, then push ONE real measurement through the hook's own measure path.
   // That matters: flush() skips when the cache isn't dirty, so without a write

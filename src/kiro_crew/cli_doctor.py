@@ -100,7 +100,13 @@ from kiro_crew.config.paths import (  # noqa: F401
     project_agents_dir,
 )
 from kiro_crew.config.superseded_defaults import render_doctor_section
-from kiro_crew.constants import MIN_NODE_MAJOR
+from kiro_crew.constants import (
+    MIN_NODE_VERSION,
+    format_node_version,
+    node_too_old_message,
+    node_version_meets_floor,
+    parse_node_version,
+)
 from kiro_crew.cron import job_pause_state_from_disk, unhealthy_jobs_from_disk  # noqa: F401
 from kiro_crew.dashboard.crash_dump_store import (  # noqa: F401
     dump_age_seconds,
@@ -1141,29 +1147,12 @@ def _linger_enabled(user: str) -> bool | None:
     """Whether ``user``'s systemd instance lingers past logout.
 
     ``None`` when it cannot be determined (no ``loginctl``, unknown user, or an
-    unrecognised value) so the caller can stay quiet rather than guess.
+    unrecognised value) so the caller can stay quiet rather than guess. Thin
+    delegate to the package's one linger probe,
+    :func:`kiro_crew.service.linux._linger_enabled`, so the ``loginctl`` argv and
+    its parsing live in a single place.
     """
-    if shutil.which("loginctl") is None:
-        return None
-    try:
-        res = subprocess.run(
-            ["loginctl", "show-user", user, "-p", "Linger", "--value"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if res.returncode != 0:
-        return None
-    val = res.stdout.strip().lower()
-    if val in ("yes", "true", "1"):
-        return True
-    if val in ("no", "false", "0"):
-        return False
-    return None
+    return service_linux._linger_enabled(user)
 
 
 def _git_line(repo: Path, *args: str) -> str | None:
@@ -1654,6 +1643,48 @@ def _venv_deps_ok(venv_py: Path) -> bool:
     return proc.returncode == 0
 
 
+def _report_node(issues: list[str]) -> None:
+    """Print the ``node:`` line, judging the full version against ``MIN_NODE_VERSION``.
+
+    A Node below the floor is a failure recorded in *issues*: it lacks APIs the
+    code needs. The same constant drives the startup warning in ``cli.py``. An
+    unreadable version is shown as present rather than guessed at.
+    """
+    node = shutil.which("node")
+    if node:
+        try:
+            node_ver_result = subprocess.run(
+                # The RESOLVED path, as ``cli._node_ok`` does: on Windows ``which``
+                # can answer ``node.CMD``, which a bare ``node`` cannot spawn.
+                [node, "-v"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            version = parse_node_version(node_ver_result.stdout)
+            if version is None:
+                print(f"  node:        ✅ {node}")
+            elif node_version_meets_floor(version, MIN_NODE_VERSION):
+                print(f"  node:        ✅ {node} (v{format_node_version(version)})")
+            else:
+                print(
+                    f"  node:        ❌ v{format_node_version(version)} < "
+                    f"v{format_node_version(MIN_NODE_VERSION)}"
+                )
+                print(f"               Fix: {node_too_old_message(version, MIN_NODE_VERSION)}")
+                issues.append("node")
+        except Exception:
+            print(f"  node:        ✅ {node}")
+    else:
+        floor = format_node_version(MIN_NODE_VERSION)
+        print(f"  node:        ⚠️  not found (Kiro Crew needs Node v{floor}+)")
+        print(
+            f"               Fix: install Node.js >= v{floor} (24 LTS recommended) from https://nodejs.org"
+        )
+
+
 def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
@@ -1794,30 +1825,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("  git:         ❌ not found (needed for kirocrew update)")
         issues.append("git")
 
-    node = shutil.which("node")
-    if node:
-        try:
-            node_ver_result = subprocess.run(
-                ["node", "-v"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            )
-            major = int(node_ver_result.stdout.strip().lstrip("v").split(".")[0])
-            if major >= MIN_NODE_MAJOR:
-                print(f"  node:        ✅ {node} (v{major})")
-            else:
-                print(
-                    f"  node:        ⚠️  v{major} < {MIN_NODE_MAJOR} (frontend needs Node {MIN_NODE_MAJOR}+)"
-                )
-                print(f"               Fix: install Node.js >= {MIN_NODE_MAJOR}")
-        except Exception:
-            print(f"  node:        ✅ {node}")
-    else:
-        print(f"  node:        ⚠️  not found (frontend needs Node {MIN_NODE_MAJOR}+)")
-        print(f"               Fix: install Node.js >= {MIN_NODE_MAJOR}")
+    _report_node(issues)
 
     # venv detection — used by the runtime section below. Windows venvs put the
     # interpreter under .venv\Scripts\python.exe, not .venv/bin/python3, so a

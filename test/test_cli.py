@@ -520,7 +520,9 @@ class TestSetupWorkspaceDir:
 
             _setup_workspace_dir()
         prompt = mock_input.call_args[0][0]
-        assert "/custom/workspace" in prompt
+        # Path() normalizes separators, so the POSIX literal only matches on
+        # POSIX; compare against the normalized form on every platform.
+        assert str(Path("/custom/workspace")) in prompt
 
     def test_shows_configured_label_when_saved(self, tmp_path, monkeypatch, capsys):
         ws_file = tmp_path / "workspace_dir"
@@ -1838,7 +1840,9 @@ class TestLogout:
         """Successful logout prints success message."""
         secret_file = tmp_path / ".local_secret"
         secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
 
         from kiro_crew.cli_server import _logout
 
@@ -1852,7 +1856,7 @@ class TestLogout:
 
     def test_logout_gateway_not_running(self, tmp_path, monkeypatch):
         """Missing secret file means gateway not running."""
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "")
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "")
 
         from kiro_crew.cli_server import _logout
 
@@ -1866,7 +1870,9 @@ class TestLogout:
         """HTTP error from gateway is handled."""
         secret_file = tmp_path / ".local_secret"
         secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
 
         from kiro_crew.cli_server import _logout
 
@@ -1886,7 +1892,9 @@ class TestLogout:
         secret_file.parent.mkdir(parents=True, exist_ok=True)
         secret_file.write_text("test-secret")
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
 
         from kiro_crew.cli_server import _logout
 
@@ -2255,6 +2263,61 @@ class TestComposedEditionGatewayModule:
         monkeypatch.setattr(discovery, "plugin_entry_points", _boom)
         assert _args_look_like_kirocrew("python3 -m kiro_crew gateway") is True
         assert _args_look_like_kirocrew(self.COMPOSED_ARGV) is False
+
+
+class TestDesktopGatewayIdentityParity:
+    """The desktop launcher classifies a port holder from the SAME command line
+    ``kirocrew stop`` does, but in a process with no view of the Python
+    environment, so ``website/electron/gateway-stop.js`` carries its own copy
+    of the two identity constants. This pins the copies together: widening the
+    Python side without the JavaScript side is exactly how the desktop app came
+    to refuse a composed edition's own gateway as a foreign port holder.
+    """
+
+    GATEWAY_STOP = Path(__file__).parent.parent / "website" / "electron" / "gateway-stop.js"
+
+    def _js_constant(self, name: str) -> str:
+        import re
+
+        source = self.GATEWAY_STOP.read_text(encoding="utf-8")
+        match = re.search(rf"^const {name} = (.+?);$", source, re.MULTILINE)
+        assert match, f"{name} not found in {self.GATEWAY_STOP}"
+        return match.group(1)
+
+    def test_server_subcommands_are_the_same_set(self):
+        import re
+
+        from kiro_crew.port_resolution import _KIROCREW_SERVER_SUBCOMMANDS
+
+        expr = self._js_constant("KIROCREW_SERVER_SUBCOMMANDS")
+        js_set = set(re.findall(r'"([^"]+)"', expr))
+        assert js_set == set(_KIROCREW_SERVER_SUBCOMMANDS)
+
+    def test_module_pattern_accepts_every_conventional_entry_point_root(self):
+        """The JS regex must accept the core module and the root
+        ``_gateway_module_roots()`` derives from a conventionally named
+        ``kirocrew.plugins`` entry point, and refuse a dotted submodule. The
+        regex uses only syntax Python's ``re`` shares with JavaScript."""
+        import re
+
+        expr = self._js_constant("KIROCREW_MODULE_RE")
+        assert expr.startswith("/") and expr.endswith("/"), expr
+        pattern = re.compile(expr[1:-1])
+        for entry_point in (
+            "kiro_crew.cli:main",
+            "kirocrew_companion.compose:build_context",
+            "kirocrew_acme2.compose:build",
+        ):
+            root = entry_point.split(":", 1)[0].split(".", 1)[0]
+            assert pattern.fullmatch(root), root
+        for rejected in (
+            "kiro_crew.dashboard",
+            "kirocrew",
+            "kirocrew_",
+            "kirocrew-x",
+            "Kirocrew_X",
+        ):
+            assert pattern.fullmatch(rejected) is None, rejected
 
 
 class TestStop:
@@ -2770,7 +2833,7 @@ class TestRestart:
         These tests mock the gateway lifecycle (``_spawn_detached_gateway`` /
         ``restart_service``); with no real gateway, ``_print_token_url()``'s
         readiness loop polls ``localhost`` once per second for the full
-        ``_RESTART_READY_TIMEOUT`` (15s) before giving up -- ~15s x5 tests. These
+        ``_RESTART_TOKEN_WAIT`` (15s) before giving up -- ~15s x5 tests. These
         tests assert restart/spawn/stop dispatch, not token-URL readiness, so
         pin the timeout to 0 (loop is skipped, function returns immediately).
         Production default is unchanged.
@@ -2784,7 +2847,7 @@ class TestRestart:
         """
         from kiro_crew import cli_server
 
-        monkeypatch.setattr("kiro_crew.cli_server._RESTART_READY_TIMEOUT", 0)
+        monkeypatch.setattr("kiro_crew.cli_server._RESTART_TOKEN_WAIT", 0)
         monkeypatch.setattr(
             "kiro_crew.cli_server._wait_gateway_ready",
             lambda *a, **kw: (cli_server._READY_OK, None),
@@ -3724,7 +3787,9 @@ class TestRestart:
             flags = kw["creationflags"]
             assert flags & subprocess.DETACHED_PROCESS
             assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
-            assert "start_new_session" not in kw
+            # Passed explicitly as False (mypy-safe explicit flags, not **dict
+            # unpack); Windows ignores it, the creationflags do the detaching.
+            assert kw.get("start_new_session") is False
         else:
             assert kw["start_new_session"] is True
         # Must not inherit stdin from the parent — otherwise reading from
@@ -3926,7 +3991,7 @@ class TestRestartReadinessVerdict:
 
     Deliberately a separate class from :class:`TestRestart`: that class's autouse
     ``_fast_restart_ready`` fixture pins ``_wait_gateway_ready`` to ``ready`` (and
-    ``_RESTART_READY_TIMEOUT`` to 0) so its dispatch assertions don't need a live
+    ``_RESTART_TOKEN_WAIT`` to 0) so its dispatch assertions don't need a live
     gateway — which is exactly the behaviour under test here, so inheriting it
     would mask every one of these tests.
 
@@ -3978,7 +4043,10 @@ class TestRestartReadinessVerdict:
                 return_value=MagicMock(pid=4321, poll=MagicMock(return_value=poll)),
             ),
             patch("kiro_crew.cli_server._print_token_url"),
-            patch("kiro_crew.cli_server._RESTART_READY_TIMEOUT", 0 if timeout is None else timeout),
+            patch(
+                "kiro_crew.cli_server._resolve_restart_ready_timeout",
+                return_value=0 if timeout is None else timeout,
+            ),
         ]
         with contextlib.ExitStack() as es:
             patched = [es.enter_context(p) for p in stack]
@@ -5613,7 +5681,7 @@ class TestConfigDirOverride:
 
         with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             _logout(5476)
-        read_secret.assert_called_once_with(5476)
+        read_secret.assert_called_once_with(5476, dial_host="127.0.0.1")
 
     def test_setup_slack_tokens_writes_to_config_dir(self, tmp_path, monkeypatch):
         """_setup_slack_tokens writes .env to config_dir(), not ~/.kirocrew."""
@@ -5850,14 +5918,16 @@ class TestSpawnCliAuth:
     """
 
     def test_internal_secret_reads_local_secret_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port: "abc123")
+        monkeypatch.setattr(
+            "kiro_crew.cli_commands.read_local_secret", lambda _port, **_kw: "abc123"
+        )
 
         from kiro_crew.cli_commands import _internal_secret
 
         assert _internal_secret(5476) == "abc123"
 
     def test_internal_secret_returns_empty_when_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port: "")
+        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port, **_kw: "")
 
         from kiro_crew.cli_commands import _internal_secret
 
@@ -5865,7 +5935,7 @@ class TestSpawnCliAuth:
 
     def test_spawn_list_sends_internal_secret_header(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
-            "kiro_crew.cli_commands.read_local_secret", lambda _port: "test-secret-xyz"
+            "kiro_crew.cli_commands.read_local_secret", lambda _port, **_kw: "test-secret-xyz"
         )
 
         captured: list[urllib.request.Request] = []
@@ -5887,13 +5957,13 @@ class TestSpawnCliAuth:
 
         assert len(captured) == 1
         req = captured[0]
-        assert req.full_url == "http://localhost:5476/api/spawn"
+        assert req.full_url == "http://127.0.0.1:5476/api/spawn"
         headers_lower = {k.lower(): v for k, v in dict(req.headers).items()}
         assert headers_lower["x-internal-secret"] == "test-secret-xyz"
 
     def test_spawn_run_sends_internal_secret_header(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
-            "kiro_crew.cli_commands.read_local_secret", lambda _port: "run-secret-abc"
+            "kiro_crew.cli_commands.read_local_secret", lambda _port, **_kw: "run-secret-abc"
         )
 
         captured: list[urllib.request.Request] = []
@@ -5923,7 +5993,7 @@ class TestSpawnCliAuth:
 
     def test_spawn_list_403_prints_token_required(self, tmp_path, monkeypatch, capsys):
         """A bare 403 from the gateway is reported, not masked as 'not running'."""
-        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port: "")
+        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port, **_kw: "")
 
         def fake_urlopen(*_args: object, **_kwargs: object) -> None:
             raise urllib.error.HTTPError(
@@ -6824,6 +6894,99 @@ class TestDoctorEmbeddings:
         assert "Check network connectivity" in out
 
 
+class TestResolveRestartReadyTimeout:
+    """`KIROCREW_RESTART_READY_TIMEOUT` parsing for the restart readiness deadline."""
+
+    def test_unset_uses_default(self, monkeypatch):
+        from kiro_crew import cli_server
+
+        monkeypatch.delenv("KIROCREW_RESTART_READY_TIMEOUT", raising=False)
+
+        assert cli_server._resolve_restart_ready_timeout() == 60
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("90", 90),
+            ("45.7", 46),
+            ("0.5", 15),
+            ("179.2", 180),
+            ("1", 15),
+            ("14", 15),
+            ("181", 180),
+            ("100000", 180),
+            ("abc", 60),
+            ("", 60),
+            ("0", 60),
+            ("-5", 60),
+            ("inf", 60),
+            ("-inf", 60),
+            ("nan", 60),
+        ],
+    )
+    def test_env_value_is_parsed_and_clamped(self, monkeypatch, raw, expected):
+        from kiro_crew import cli_server
+
+        monkeypatch.setenv("KIROCREW_RESTART_READY_TIMEOUT", raw)
+
+        assert cli_server._resolve_restart_ready_timeout() == expected
+
+    @pytest.mark.parametrize("raw", ["", "   ", "90", "45.7", "15", "180", "179.2"])
+    def test_unset_or_in_range_value_is_silent(self, monkeypatch, capsys, raw):
+        from kiro_crew import cli_server
+
+        monkeypatch.setenv("KIROCREW_RESTART_READY_TIMEOUT", raw)
+
+        cli_server._resolve_restart_ready_timeout()
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert captured.out == ""
+
+    @pytest.mark.parametrize(
+        "raw, message",
+        [
+            ("abc", "KIROCREW_RESTART_READY_TIMEOUT='abc' is not a positive number; using 60s."),
+            ("-5", "KIROCREW_RESTART_READY_TIMEOUT='-5' is not a positive number; using 60s."),
+            ("nan", "KIROCREW_RESTART_READY_TIMEOUT='nan' is not a positive number; using 60s."),
+            ("300", "KIROCREW_RESTART_READY_TIMEOUT='300' is outside 15..180s; using 180s."),
+            ("5", "KIROCREW_RESTART_READY_TIMEOUT='5' is outside 15..180s; using 15s."),
+            ("0.5", "KIROCREW_RESTART_READY_TIMEOUT='0.5' is outside 15..180s; using 15s."),
+        ],
+    )
+    def test_fallback_or_clamp_prints_one_stderr_line(self, monkeypatch, capsys, raw, message):
+        from kiro_crew import cli_server
+
+        monkeypatch.setenv("KIROCREW_RESTART_READY_TIMEOUT", raw)
+
+        cli_server._resolve_restart_ready_timeout()
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.count("\n") == 1
+        assert message in captured.err
+
+    def test_cli_spec_states_the_current_deadline_values(self):
+        from kiro_crew import cli_server
+
+        spec = Path(__file__).resolve().parent.parent / "docs/system-specs/modules/cli.md"
+        text = " ".join(spec.read_text(encoding="utf-8").split())
+
+        default = cli_server._RESTART_READY_TIMEOUT_DEFAULT
+        low = cli_server._RESTART_READY_TIMEOUT_MIN
+        high = cli_server._RESTART_READY_TIMEOUT_MAX
+        checkpoint = cli_server._RESTART_READY_SOFT_CHECKPOINT
+        token_wait = cli_server._RESTART_TOKEN_WAIT
+        for phrase in (
+            f"it defaults to {default} s because",
+            f"clamped to {low}..{high} s",
+            f"When the deadline exceeds {checkpoint} s",
+            f"on the first check after {checkpoint} s",
+            f"keeps its fixed {token_wait} s budget",
+        ):
+            assert phrase in text, f"cli.md no longer states {phrase!r}"
+
+
 class TestWaitGatewayReady:
     """Unit tests for the post-spawn readiness wait (`_wait_gateway_ready`).
 
@@ -6951,6 +7114,95 @@ class TestWaitGatewayReady:
         assert verdict == cli_server._READY_DIED
         assert status == 3
 
+    @staticmethod
+    def _scripted_clock(values):
+        """A cli_server-scoped ``time`` stand-in whose clock walks *values*, then holds."""
+        remaining = list(values)
+
+        def clock() -> float:
+            return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+        return types.SimpleNamespace(monotonic=clock, sleep=lambda _seconds: None)
+
+    def test_slow_boot_prints_the_still_starting_line_once(self, capsys):
+        from kiro_crew import cli_server
+
+        # start=0, then one reading per failed probe: before, at and past the
+        # checkpoint, all inside the 60s deadline. The fourth probe is ready.
+        fake_time = self._scripted_clock([0.0, 5.0, 16.0, 30.0])
+        with (
+            patch("kiro_crew.cli_server._probe_gateway_ready", side_effect=[503, 503, 503, 200]),
+            patch("kiro_crew.cli_server._replacement_is_serving", return_value=True),
+            patch.object(cli_server, "time", fake_time),
+        ):
+            verdict = cli_server._wait_gateway_ready(
+                self._proc([None, None, None, None]), 7777, None, timeout=60
+            )
+
+        assert verdict == (cli_server._READY_OK, None)
+        out = capsys.readouterr().out
+        assert out.count("Still starting") == 1
+        assert "Still starting (16s elapsed), continuing to wait..." in out
+
+    def test_clamp_minimum_deadline_never_prints_the_still_starting_line(self, capsys):
+        from kiro_crew import cli_server
+
+        fake_time = self._scripted_clock([0.0, 5.0, 14.9, 15.0])
+        with (
+            patch("kiro_crew.cli_server._probe_gateway_ready", return_value=503),
+            patch.object(cli_server, "time", fake_time),
+        ):
+            verdict = cli_server._wait_gateway_ready(
+                self._proc([None, None, None, None]), 7777, None, timeout=15
+            )
+
+        assert verdict == (cli_server._READY_TIMEOUT, None)
+        assert "Still starting" not in capsys.readouterr().out
+
+    def test_checkpoint_then_deadline_prints_once_and_times_out(self, capsys):
+        from kiro_crew import cli_server
+
+        fake_time = self._scripted_clock([0.0, 10.0, 20.0, 40.0, 60.0])
+        with (
+            patch("kiro_crew.cli_server._probe_gateway_ready", return_value=503),
+            patch.object(cli_server, "time", fake_time),
+        ):
+            verdict = cli_server._wait_gateway_ready(self._proc([None] * 5), 7777, None, timeout=60)
+
+        assert verdict == (cli_server._READY_TIMEOUT, None)
+        out = capsys.readouterr().out
+        assert out.count("Still starting") == 1
+        assert "Still starting (20s elapsed)" in out
+
+    def test_ready_on_first_probe_prints_nothing(self, capsys):
+        from kiro_crew import cli_server
+
+        fake_time = self._scripted_clock([0.0, 100.0])
+        with (
+            patch("kiro_crew.cli_server._probe_gateway_ready", return_value=200),
+            patch("kiro_crew.cli_server._replacement_is_serving", return_value=True),
+            patch.object(cli_server, "time", fake_time),
+        ):
+            verdict = cli_server._wait_gateway_ready(self._proc([None]), 7777, None, timeout=60)
+
+        assert verdict == (cli_server._READY_OK, None)
+        assert "Still starting" not in capsys.readouterr().out
+
+    def test_early_death_returns_without_probing_or_the_checkpoint_line(self, capsys):
+        from kiro_crew import cli_server
+
+        probe = MagicMock(return_value=0)
+        fake_time = self._scripted_clock([0.0, 100.0])
+        with (
+            patch("kiro_crew.cli_server._probe_gateway_ready", probe),
+            patch.object(cli_server, "time", fake_time),
+        ):
+            verdict = cli_server._wait_gateway_ready(self._proc([1]), 7777, None, timeout=60)
+
+        assert verdict == (cli_server._READY_DIED, 1)
+        probe.assert_not_called()
+        assert "Still starting" not in capsys.readouterr().out
+
     def test_missing_marker_is_never_the_replacement(self):
         """An absent marker is the handover's own state, not proof of a new gateway.
 
@@ -7058,7 +7310,9 @@ class TestPrintTokenUrl:
     def test_prints_token_on_success(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="")),
@@ -7087,7 +7341,9 @@ class TestPrintTokenUrl:
     def test_prints_custom_origin(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="http://kirocrew.dev:7777")),
@@ -7110,19 +7366,50 @@ class TestPrintTokenUrl:
     def test_fallback_on_timeout(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server._RESTART_READY_TIMEOUT", 0)
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
+        monkeypatch.setattr("kiro_crew.cli_server._RESTART_TOKEN_WAIT", 0)
 
         _print_token_url(7777)
 
         out = capsys.readouterr().out
         assert "kirocrew token" in out
 
+    def test_token_wait_keeps_its_15s_budget_whatever_the_readiness_override(
+        self, capsys, monkeypatch
+    ):
+        """The readiness override is fork-path only; both paths' token wait stays at 15s."""
+        from kiro_crew import cli_server
+
+        monkeypatch.setenv("KIROCREW_RESTART_READY_TIMEOUT", "180")
+        secret_reads: list[int] = []
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret",
+            lambda port, **_kw: secret_reads.append(port) or "",
+        )
+        remaining = [0.0, 14.0, 16.0, 200.0]
+
+        def clock() -> float:
+            return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+        fake_time = types.SimpleNamespace(monotonic=clock, sleep=lambda _seconds: None)
+        with patch.object(cli_server, "time", fake_time):
+            cli_server._print_token_url(7777)
+
+        assert cli_server._RESTART_TOKEN_WAIT == 15
+        # One read at 14s; the 16s check is past the 15s deadline. A 180s
+        # budget would have read again at 16s.
+        assert secret_reads == [7777]
+        out = capsys.readouterr().out
+        assert "kirocrew token" in out
+        assert "Still starting" not in out
+
     def test_fallback_on_no_secret(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "")
-        monkeypatch.setattr("kiro_crew.cli_server._RESTART_READY_TIMEOUT", 0)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "")
+        monkeypatch.setattr("kiro_crew.cli_server._RESTART_TOKEN_WAIT", 0)
 
         _print_token_url(7777)
 
@@ -7210,13 +7497,15 @@ class TestInstallPidfdChildWatcher:
         # the PidfdChildWatcher ctor explode so reaching them fails the test.
         called = []
         monkeypatch.setattr(asyncio, "set_child_watcher", lambda w: called.append(w))
-        monkeypatch.setattr(asyncio, "SafeChildWatcher", lambda: "fake-safe-watcher")
+        # raising=False: these watcher classes are Unix-only and do not exist
+        # on Windows, where the test still simulates the macOS install path.
+        monkeypatch.setattr(asyncio, "SafeChildWatcher", lambda: "fake-safe-watcher", raising=False)
 
         def _boom(*_a) -> object:
             raise AssertionError("Linux pidfd path must not be reached on macOS")
 
         monkeypatch.setattr("kiro_crew.cli.os.pidfd_open", _boom, raising=False)
-        monkeypatch.setattr(asyncio, "PidfdChildWatcher", _boom)
+        monkeypatch.setattr(asyncio, "PidfdChildWatcher", _boom, raising=False)
         _install_child_watcher()
         assert called == ["fake-safe-watcher"], "macOS must install SafeChildWatcher"
 
@@ -7251,7 +7540,9 @@ class TestInstallPidfdChildWatcher:
         monkeypatch.setattr("kiro_crew.cli.os.close", lambda fd: closed.append(fd))
         called_with = []
         monkeypatch.setattr(asyncio, "set_child_watcher", lambda w: called_with.append(w))
-        monkeypatch.setattr(asyncio, "PidfdChildWatcher", lambda: "fake-pidfd-watcher")
+        monkeypatch.setattr(
+            asyncio, "PidfdChildWatcher", lambda: "fake-pidfd-watcher", raising=False
+        )
         _install_child_watcher()
         assert opened, "pidfd_open must be probed before installing"
         assert closed == [4242], "the probe fd must be closed"
@@ -7277,12 +7568,12 @@ class TestInstallPidfdChildWatcher:
         monkeypatch.setattr("kiro_crew.cli.os.pidfd_open", _no_pidfd, raising=False)
         installed = []
         monkeypatch.setattr(asyncio, "set_child_watcher", lambda w: installed.append(w))
-        monkeypatch.setattr(asyncio, "SafeChildWatcher", lambda: "fake-safe-watcher")
+        monkeypatch.setattr(asyncio, "SafeChildWatcher", lambda: "fake-safe-watcher", raising=False)
 
         def _ctor_must_not_run() -> object:
             raise AssertionError("PidfdChildWatcher must not be constructed when pidfd_open fails")
 
-        monkeypatch.setattr(asyncio, "PidfdChildWatcher", _ctor_must_not_run)
+        monkeypatch.setattr(asyncio, "PidfdChildWatcher", _ctor_must_not_run, raising=False)
         _install_child_watcher()  # must not raise
         assert installed == ["fake-safe-watcher"], (
             "a < 5.3 kernel must fall back to SafeChildWatcher, not the "
@@ -7306,14 +7597,14 @@ class TestInstallPidfdChildWatcher:
         monkeypatch.delattr("kiro_crew.cli.os.pidfd_open", raising=False)
         installed = []
         monkeypatch.setattr(asyncio, "set_child_watcher", lambda w: installed.append(w))
-        monkeypatch.setattr(asyncio, "SafeChildWatcher", lambda: "fake-safe-watcher")
+        monkeypatch.setattr(asyncio, "SafeChildWatcher", lambda: "fake-safe-watcher", raising=False)
 
         def _ctor_must_not_run() -> object:
             raise AssertionError(
                 "PidfdChildWatcher must not be constructed when os.pidfd_open is missing"
             )
 
-        monkeypatch.setattr(asyncio, "PidfdChildWatcher", _ctor_must_not_run)
+        monkeypatch.setattr(asyncio, "PidfdChildWatcher", _ctor_must_not_run, raising=False)
         _install_child_watcher()  # must not raise
         assert installed == ["fake-safe-watcher"], (
             "a Python build without os.pidfd_open must fall back to "
@@ -7471,7 +7762,9 @@ class TestTokenCommand:
     def test_prints_loopback_only(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _token
 
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="")),
@@ -7501,7 +7794,9 @@ class TestTokenCommand:
     def test_separates_custom_origin_with_blank_line(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _token
 
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="https://kirocrew.dev:7777")),
@@ -7539,7 +7834,7 @@ class TestTokenCommand:
 
     def _stub_token_env(self, tmp_path, monkeypatch, *, secret: bool = True) -> None:
         value = "test-secret" if secret else ""
-        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: value)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port, **_kw: value)
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="")),

@@ -53,7 +53,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
@@ -65,9 +65,11 @@ logger = logging.getLogger(__name__)
 #: travels together and a home copy carries a warm index.
 SKILL_SEARCH_INDEX_FILENAME = "skill_search_index.sqlite3"
 
-#: Bumped when the table shape changes; a mismatch drops and rebuilds rather than
-#: migrating, because every row is derived data one read can regenerate.
-_SCHEMA_VERSION = 5
+#: Bumped when the table shape or the derived metadata changes (6: HTML marker;
+#: 7: SKILL.md bytes decode as utf-8-sig, so a byte-order-marked file's stored
+#: frontmatter-less row must not be served against its unchanged fingerprint);
+#: a mismatch drops and rebuilds, because every row is derived data one read regenerates.
+_SCHEMA_VERSION = 7
 
 #: Another process may be indexing the same skill. Wait briefly, then give up and
 #: let the caller read files this once rather than block a chat turn on a lock.
@@ -228,6 +230,21 @@ def body_fingerprint(path: str | Path) -> str | None:
     return f"{stat.st_dev}:{stat.st_ino}:{stat.st_ctime_ns}:" f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
+class SyncOutcome(NamedTuple):
+    """What one :meth:`SkillSearchIndex.sync` call left for its caller.
+
+    ``deferred`` is every key this index declined to answer for, which the caller
+    reads directly. ``pending`` is the subset left unread only because the call's
+    work budget ran out, so an answer built from it may be missing matches.
+
+    Returned rather than stored on the index: one index serves every concurrent
+    search in the gateway, so a field set by one call would be read by another.
+    """
+
+    deferred: frozenset[str]
+    pending: frozenset[str]
+
+
 class SkillSearchIndex:
     """Term vocabulary per skill key, persisted in one SQLite file.
 
@@ -248,7 +265,6 @@ class SkillSearchIndex:
         # it again. SQLite serializes writers anyway; this serializes the shared
         # connection object, which is what check_same_thread=False stops policing.
         self._lock = threading.RLock()
-        self.pending_keys: frozenset[str] = frozenset()
 
     # ── connection ──
 
@@ -578,14 +594,15 @@ class SkillSearchIndex:
         live_keys: Iterable[str] | None = None,
         budget_seconds: float | None = None,
         canonical_roots: dict[str, str] | None = None,
-    ) -> frozenset[str] | None:
+    ) -> SyncOutcome | None:
         """Bring the index up to date for *rows* of ``(key, path, fingerprint)``.
 
         Only a key whose stored fingerprint differs is re-read, so a warm index
         costs one small query. Returns ``None`` when the database is unusable --
-        the signal the caller needs to read every body itself -- and otherwise the
-        set of keys this index declines to answer for, which the caller reads
-        directly. That set is normally empty.
+        the signal the caller needs to read every body itself -- and otherwise a
+        :class:`SyncOutcome` naming the keys this index declines to answer for,
+        which the caller reads directly, and which of those the budget left
+        unread. Both sets are normally empty.
 
         Declining PER KEY rather than for the whole call is deliberate: one
         pathological body would otherwise send an entire catalog back to reading
@@ -605,7 +622,7 @@ class SkillSearchIndex:
         live_keys: Iterable[str] | None,
         budget_seconds: float | None = None,
         canonical_roots: dict[str, str] | None = None,
-    ) -> frozenset[str] | None:
+    ) -> SyncOutcome | None:
         """``sync`` with the connection lock already held."""
         db = self._db()
         if db is None:
@@ -654,8 +671,7 @@ class SkillSearchIndex:
                     db.executemany("DELETE FROM skill_term WHERE key = ?", [(k,) for k in gone])
                     db.executemany("DELETE FROM skill_body WHERE key = ?", [(k,) for k in gone])
             db.commit()
-            self.pending_keys = frozenset(pending)
-            return frozenset(deferred)
+            return SyncOutcome(frozenset(deferred), frozenset(pending))
         except (sqlite3.Error, OSError) as exc:
             logger.warning(
                 "skill-search-index: sync failed; search falls back to reading bodies",

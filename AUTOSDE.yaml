@@ -130,6 +130,7 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/slack/gateway.py"
+      - "src/kiro_crew/slack/gateway_runtime/**/*.py"
       - "src/kiro_crew/dashboard/server.py"
       - "src/kiro_crew/dashboard/handlers/**/*.py"
       - "src/kiro_crew/cli.py"
@@ -348,6 +349,8 @@ custom-rules:
       - "src/kiro_crew/session.py"
       - "src/kiro_crew/subagent.py"
       - "src/kiro_crew/sandbox.py"
+      - "src/kiro_crew/sandbox_launcher.py"
+      - "src/kiro_crew/sandbox_seatbelt.py"
     rule: |
       Kiro Crew drives ONE first-class agent harness — kiro-cli
       (ACP_BACKEND_KIRO, spelled "") — and ADAPTS the others (the dormant
@@ -409,6 +412,7 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/context.py"
+      - "src/kiro_crew/context_assembly/**/*.py"
       - "src/kiro_crew/memory.py"
       - "src/kiro_crew/vector_memory.py"
       - "src/kiro_crew/vector_memory_runtime/**/*.py"
@@ -815,6 +819,9 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/sandbox.py"
+      - "src/kiro_crew/sandbox_launcher.py"
+      - "src/kiro_crew/sandbox_seatbelt.py"
+      - "src/kiro_crew/sandbox_mount_sweep.py"
       - "src/kiro_crew/security.py"
       - "src/kiro_crew/hooks.py"
     rule: |

@@ -1097,7 +1097,7 @@ Each step checks if the tool is already installed and skips if present.
 
 One flag is a MODE rather than a check and short-circuits before the list above runs, because it does not answer "is this install healthy": `--bundle` collects the redacted diagnostics zip and prints no health report. It ends with a prefilled `Open a GitHub issue` link whose `version`, `channel` dropdown answer and create-time `channel:` label all come from ONE resolver, `release_channel.provenance()` (shared with the dashboard's Report-a-problem link, which prints the same fields plus the free-form ones): the version is the PUBLIC release version — a repackager's four-part `BUILD_VERSION` stamp such as `0.7.0.5` is folded onto `0.7.0` (`changelog.release_of_build`), while the release pipeline's own spellings (`0.7.0-insider.4`, `0.7.0rc7`, a nightly stamp) are the public identity and stay — and the channel is the lane the build can PROVE from three sources that must agree: the `$KIROCREW_HOME/channel` record when it names a lane, a prerelease marker in the installed distribution's metadata version when it describes the same release (a repackaged insider build keeps its `rc` marker there after the stamp has removed it from `__version__`; PLAIN metadata proves nothing, because the desktop lanes pip-install the checkout and stamp only `__version__`, leaving `pyproject.toml`'s bare version in the dist-info of every lane), and `__version__` itself unless it is a build stamp, which says nothing about its lane. No claim, or claims that disagree (a stable record over a promoted `rc` build, a lane switch not yet updated onto), prefills the form's own `Not sure` and attaches NO `channel:` label, because a create-time label outlives whatever the reporter later picks and a guessed Stable is exactly how packaged insider reports arrived mislabelled (#13168). The raw stamp, the distribution version and the record are recorded in the bundle's private `versions.txt` and `manifest.json` instead. Doctor is otherwise read-only, which is why the ledger cleanup sweep is its own command (`kirocrew ledger-sweep`, see the command table and [session-work-ledger](session-work-ledger.md#cleanup)) rather than a second mode here.
 
-**Where each row lives.** `cli_doctor._doctor` is the orchestrator: it prints the sections above in one fixed order, threads one `issues` list through every section, and turns that list into the closing `❌ Fix these issues:` line with exit status 1, or `✅ Kiro Crew is ready!`. Sections print as they run rather than being collected first, so on an interactive terminal a probe that hangs still leaves every earlier row on screen. Most rows live in `kiro_crew.doctor_checks`, one module per family: `render` (the escaping, indent and wrapping helpers the sections share), `agents`, `mcp`, `confinement` (the sandbox verdict and the shapes that refuse a spawn), `access` (session signing, hook auto-approve, credentials), `install`, `services`, `resources`, `workload`, `channels` and `features` (vector memory, speech-to-text). `cli_doctor.py` keeps the rows the orchestrator composes itself (Platform, and the Dependencies, Agent, Runtime and Connectivity rows built from the values it threads onward) and the rows a repository gate pins to that file: the process-spawning probes `test/test_spawn_audit.py` keys by `cli_doctor.py::<function>` (including the node, venv-interpreter and `kiro-cli --version` rows `_doctor` spawns itself), the agent-spec reads `test/test_agent_spec_hardened_reads.py` inventories for that file (Model, model pins, MCP Governance), the MCP Tools repair and probe, the KAS relay rows whose ACP imports the agent-sdk boundary baseline counts, and the embedding-model URL probe the redactor registry names. `kiro_crew.cli_doctor` stays the one import path and patch target: a family reads every function, class and value the facade binds through the facade at call time (a module is one shared object, so its attributes are what a test patches, and a section that imported a name inside its own body keeps doing so), every name the module held before the move still resolves on the facade (a moved one as the family's own object, with a write there forwarded to the family, so `mock.patch(..., create=True)` must not target one), and a section this move extracted from `_doctor` is patched on its own family module. The families load only when a health report runs, never on `import kiro_crew.cli` or for `--bundle`.
+**Where each row lives.** `cli_doctor._doctor` is the orchestrator: it prints the sections above in one fixed order, threads one `issues` list through every section, and turns that list into the closing `❌ Fix these issues:` line with exit status 1, or `✅ Kiro Crew is ready!`. Sections print as they run rather than being collected first, so on an interactive terminal a probe that hangs still leaves every earlier row on screen. Most rows live in `kiro_crew.doctor_checks`, one module per family: `render` (the escaping, indent and wrapping helpers the sections share), `agents`, `mcp`, `confinement` (the sandbox verdict and the shapes that refuse a spawn), `access` (session signing, hook auto-approve, credentials), `install`, `services`, `resources`, `workload`, `channels` and `features` (vector memory, speech-to-text). `cli_doctor.py` keeps the rows the orchestrator composes itself (Platform, and the Dependencies, Agent, Runtime and Connectivity rows built from the values it threads onward) and the rows a repository gate pins to that file: the process-spawning probes `test/test_spawn_audit.py` keys by `cli_doctor.py::<function>` (including the node, venv-interpreter and `kiro-cli --version` rows `_doctor` spawns itself), the agent-spec reads `test/test_agent_spec_hardened_reads.py` inventories for that file (Model, model pins, MCP Governance), the MCP Tools repair and probe, the KAS relay rows whose ACP imports the agent-sdk boundary baseline counts, and the embedding-model URL probe the redactor registry names. `kiro_crew.cli_doctor` stays the one import path and patch target: a family reads every function, class, value and project module the facade binds through the facade at call time (a family binds no project module by name but `cli_doctor` and its sibling families either: it loads on its first read through the facade, which can fall inside a test's rebind of that module, and `test/test_cli_doctor_refactor_family_reads.py` pins it; a section that imported a name inside its own body keeps doing so), every name the module held before the move still resolves on the facade (a moved one as the family's own object, with a write there forwarded to the family, so `mock.patch(..., create=True)` must not target one), and a section this move extracted from `_doctor` is patched on its own family module. The families load only when a health report runs, never on `import kiro_crew.cli` or for `--bundle`.
 
 ## Update Command
 
@@ -1271,6 +1271,15 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
 
 `kirocrew stop [--port PORT]` stops a running gateway:
 
+`kirocrew stop --port PORT --expect-pid PID` is a narrower stop for a caller
+that already identified the gateway (the desktop app's stuck-gateway restart).
+It skips the steps below: it opens a pidfd on `PID`, checks that `PID` is the
+sole listener on `PORT`, looks like a Kiro Crew gateway and is the live holder
+of this home's `gateway.lock`, re-checks the listener, then sends SIGTERM
+through the pidfd. Any failed check, and any host without both
+`os.pidfd_open` and `signal.pidfd_send_signal` (macOS, Windows), refuses with
+no signal and exit 1. Without `--expect-pid` the command is unchanged:
+
 1. If a systemd/launchd service is active **and** the caller did not pass
    `--port` explicitly (see Service Management), stop it via the service
    manager and return — without this branch, SIGTERM-by-port would be
@@ -1314,7 +1323,18 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
    matched against `port_resolution._gateway_module_roots()`: always `kiro_crew`, plus
    the top-level module of every installed `kirocrew.plugins` entry point, so a composed
    edition whose launcher execs its own module with `-m` classifies without the core
-   knowing any edition's name. When a listener exists but none of the pids classify,
+   knowing any edition's name. The desktop launcher's own port-owner matcher
+   (`isKirocrewCommand` in `website/electron/gateway-stop.js`) has no view of the
+   Python environment's entry points, so it matches the companion naming convention
+   instead — `-m kiro_crew` or an exact top-level `-m kirocrew_<edition>`, each followed
+   by one of the same server subcommands — which is
+   what lets the app reuse a composed edition's gateway rather than refuse it as a
+   foreign holder. The legacy dotted spawn (`-m kiro_crew.gateway`) is recognised by
+   `stop` only; the desktop launcher does not match it and never has, so a service
+   unit spelled that way reads as a foreign holder on the desktop.
+   `test/test_cli.py::TestDesktopGatewayIdentityParity` pins the desktop copy of the
+   subcommand set and module pattern to the Python side, so widening one without the
+   other fails a test instead of a user. When a listener exists but none of the pids classify,
    `stop` names the pid(s) — with the cmdline basename when cheap — and exits 1 with SEL
    `reason=unrecognized_listener`, rather than reporting "no gateway running" for a port
    that is occupied.
@@ -1443,8 +1463,28 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
      tails for foreground gateways). Detach is per-platform: POSIX uses
      `start_new_session=True`; Windows uses `creationflags=DETACHED_PROCESS
      | CREATE_NEW_PROCESS_GROUP` (there is no setsid) — both via
-     `platform_compat`. The shell returns immediately and the user can
-     follow logs via `kirocrew logs -f`.
+     `platform_compat`. The spawn returns immediately, the command then
+     waits for readiness (next bullet), and the user can follow logs via
+     `kirocrew logs -f`.
+   - Report success only once the replacement answers `/api/ready` and its
+     run marker records a pid that differs from the previous gateway's pid
+     when one is known (`_wait_gateway_ready`). Only this fork path verifies
+     readiness before printing success. A replacement that exits prints
+     `Replacement gateway (pid N) died immediately (exit status S)` and exits
+     1 at once. One still running at the deadline prints `Replacement gateway
+     (pid N) did not become ready within Ns. It is still running but not
+     serving port P.` and exits 1. The readiness deadline is read from the
+     environment each time the fork path runs: it defaults to 60 s because a
+     loaded install can take 25-35 s to boot; `KIROCREW_RESTART_READY_TIMEOUT`
+     overrides it, fractional values round up to whole seconds, the result is
+     clamped to 15..180 s, and an unset, non-numeric, non-finite, zero or
+     negative value falls back to the default. A set value that falls back
+     or gets clamped prints one `KIROCREW_RESTART_READY_TIMEOUT='V' ...;
+     using Ns.` line to stderr. When the deadline exceeds
+     15 s, the wait prints one `Still starting (Ns elapsed), continuing to
+     wait...` line on the first check after 15 s. The service path (step 1)
+     does not use this deadline and is unchanged. On both paths, the
+     token-URL wait after a successful restart keeps its fixed 15 s budget.
 3. SEL audit event logged with `via=service` or `via=fork pid=<n>` so
    the audit trail distinguishes the two paths.
 
@@ -1518,8 +1558,17 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
     lacks a credential; a fall-back login store, or a stopped unit beside a
     foreground `kirocrew gateway`, both leave the host healthy while the check
     fires.
-  - Boot survival via `WantedBy=multi-user.target` (no linger needed —
-    that's a user-service concept; this is system-level).
+  - Boot survival of the GATEWAY via `WantedBy=multi-user.target` needs no
+    linger — the gateway is a system-level unit, and linger is a user-service
+    concept. The AGENT RUNTIMES are a separate matter: the unit bakes
+    `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` for the service account, so each
+    runtime scope is created under that account's `user@<uid>.service`, which
+    logind stops when the account's last login session ends unless linger is on
+    — killing in-flight scoped runtimes and dropping later spawns to the
+    unscoped path (no cgroup ceilings). `install_service()` therefore prints a
+    non-fatal warning naming `loginctl enable-linger <user>` when it detects
+    linger off for the service account, beside the headless-auth warning above;
+    it is advisory and never changes the install outcome.
   - Crash-loop safety: `StartLimitBurst=3 StartLimitIntervalSec=300`.
   - **A home another gateway already serves is not retried.** `kirocrew
     gateway` takes `<home>/gateway.lock` before it binds anything. One
@@ -1814,6 +1863,29 @@ source checkout within 12 hours of one, where the version-only verdict only did
 so at a release. Requiring both keeps that path firing no more often than
 before. Commit distance without a version bump lights the dashboard badge, and
 `POST /api/update` is the non-destructive way to apply it.
+
+**What `auto_update` does on this install is derived once.**
+`update_capability.auto_update_effect()` answers `install` (with the switch on,
+an available update is installed and the gateway restarts), `notify` (the switch
+cannot install here, so it only notifies), or `mandatory` (a policy floor this
+build is below installs it whatever the switch says). It is read from install
+shape and policy alone, before any check runs: a policy provider owns the update
+and installs only with an `apply_command` it can run; a git checkout installs only
+past the unattended git apply's static gates (a trusted `git`, a primary branch,
+no repository-named exec driver, tracking `origin/<branch>`, the pinned source);
+a managed venv only past the installer's (POSIX, the managed venv itself, a safe
+HTTPS CDN, the pinned source); anything else is updated by its own updater. The
+gateway's update loop branches on that answer, and `notify` never reaches
+`_prepare_auto_update_apply`, so admission is not paused for an update the install
+will not apply (a provider with no `apply_command`, a feature-branch checkout).
+Dynamic conditions stay with the update itself: the git route still requires
+`version_newer`, the installer route a newer build. The status frame carries the
+same answer as `update_auto_effect` (`unknown` until the loop's first
+derivation), re-derived off the loop at most once every five minutes; the
+update loop's first cycle arms that refresh. A policy provider the CHECK
+resolves after the derivation (a live policy refresh) downgrades the cycle to
+notify: a provider owns the update, so no built-in route applies it. `test_every_unattended_apply_consults_the_effect_first`
+pins that every apply branch reads it before pausing admission.
 
 **`POST /api/update` refuses before it moves the tree, and fast-forwards to a
 pinned commit rather than pulling.** In order: a dirty tracked tree is 409

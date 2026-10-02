@@ -256,9 +256,16 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 # plan's stages is still working even though no task is assigned.
                 ("session_control.py", "created_session_status"),
                 ("session_control.py", "read_messages"),
+                # The summary verb reports liveness beside the digest for the
+                # same reason `read_messages` does.
+                ("session_control.py", "read_summary"),
                 ("session_control.py", "send_to_target"),
                 # Pre-pick idle check via _switch_target_busy (idle-only tool contract).
                 ("session_control.py", "set_model_target"),
+                ("openai_compat.py", "api_completions"),
+                # Idle-only teardown: the same pre-lock and in-lock probe via
+                # _switch_target_busy, so a reserved slot between stages is busy.
+                ("session_control.py", "reload_target"),
                 ("state.py", "_ChatSlot.enqueue_or_run_prompt"),
                 ("ws.py", "_handle_slot_focused"),
             }
@@ -267,7 +274,6 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
             site: execution
             for site in {
                 ("channel_slots.py", "_window_refresh_is_safe"),
-                ("chat_orchestrator.py", "api_chat_plan_action"),
                 ("chat_slack.py", "drain_slack_backfill"),
                 ("slot_projection.py", "SlotProjection.to_dict"),
                 ("slot_registry.py", "SlotRegistry.running_session_keys"),
@@ -282,15 +288,12 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 ("chat_regenerate.py", "api_chat_slot_edit_resend"),
                 ("chat_regenerate.py", "api_chat_slot_regenerate"),
                 ("chat_regenerate.py", "api_chat_slot_switch_variant"),
-                ("openai_compat.py", "api_completions"),
             }
         },
     }
     assert actual == expected
     assert publishers == {
         ("chat_handlers.py", "api_chat"),
-        ("chat_orchestrator.py", "_stage_loop"),
-        ("chat_orchestrator.py", "api_chat_plan_action"),
         ("chat_regenerate.py", "api_chat_slot_edit_resend"),
         ("chat_regenerate.py", "api_chat_slot_regenerate"),
         ("chat_rewind.py", "api_chat_slot_rewind"),

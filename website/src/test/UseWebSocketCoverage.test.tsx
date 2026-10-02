@@ -27,7 +27,7 @@ import {
 } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
-import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sseAutomation, resolveByApprovalId } from '../store/chatSlice'
+import chatReducer, { PANE_HYDRATE_LIMIT, setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sseAutomation, resolveByApprovalId } from '../store/chatSlice'
 import { sseSlots, addSlotOptimistic, armConfirmedCloseHold, removeSlotOptimistic } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
@@ -1696,7 +1696,8 @@ describe('useWebSocket frame router', () => {
     const { ws } = mount()
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockClear()
     act(() => { ws.simulateMessage({ type: 'chat_variant_switch', data: { slot: ACTIVE } }) })
-    expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE)
+    // An empty view asks for the floor-sized page, never the whole transcript.
+    expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE, PANE_HYDRATE_LIMIT)
   })
 
   it('chimes once when a turn completes', () => {
@@ -2716,7 +2717,7 @@ describe('useWebSocket connection lifecycle', () => {
 
       const second = WS_INSTANCES[1]
       act(() => { second.simulateOpen() })
-      expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE)
+      expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE, PANE_HYDRATE_LIMIT)
       expect(second.send).toHaveBeenCalledWith(JSON.stringify({ type: 'subscribe_subagents' }))
       unmount()
     } finally {

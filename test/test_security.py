@@ -5459,7 +5459,12 @@ class TestIsSensitivePath:
         (home / ".aws").mkdir(parents=True)
         cred = home / ".aws" / "credentials"
         cred.write_text("[default]\n")
+        # is_sensitive_path anchors on Path.home(), which reads USERPROFILE on
+        # Windows and never HOME, so pinning only HOME builds a fixture in a home
+        # directory the matcher never consults there.
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         ws = tmp_path / "workspace"
         ws.mkdir()
         link = ws / "cfg.ini"
@@ -5472,7 +5477,10 @@ class TestIsSensitivePath:
         (home / ".aws").mkdir(parents=True)
         cred = home / ".aws" / "credentials"
         cred.write_text("[default]\n")
+        # Both spellings: Path.home() reads USERPROFILE on Windows (see above).
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         ws = tmp_path / "workspace" / "sub"
         ws.mkdir(parents=True)
         link = ws / "alt.txt"
@@ -5487,7 +5495,10 @@ class TestIsSensitivePath:
         (home / ".aws").mkdir(parents=True)
         cred = home / ".aws" / "credentials"
         cred.write_text("[default]\n")
+        # Both spellings: Path.home() reads USERPROFILE on Windows (see above).
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         ws = tmp_path / "workspace"
         ws.mkdir()
         (ws / "cfg.ini").symlink_to(cred)
@@ -9180,7 +9191,7 @@ class TestCronStoreProtection:
     """
 
     def test_leaf_membership(self) -> None:
-        # Drift guard: a rename of the store or sidecar dir in cron.py /
+        # Drift guard: a rename of the store or sidecar dir in cron_service/store.py /
         # cron_history.py without a matching entry here would silently
         # un-fence them.
         from kiro_crew.security import _CREW_SECRET_LEAVES

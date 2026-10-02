@@ -63,6 +63,7 @@ import asyncio
 import re
 from typing import Callable
 
+from kiro_crew.constants import md_link_destination
 from kiro_crew.messaging.display_safety import redact_for_display, strip_ansi
 from kiro_crew.messaging.markup import (
     MERMAID_INFO,
@@ -101,7 +102,13 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _BOLD_US_RE = re.compile(r"__(.+?)__")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
-_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+#: A balanced pair may sit inside the url (``.../Python_(programming_language)``);
+#: see :func:`kiro_crew.constants.md_link_destination`. The label class is the
+#: display-safety screen's: no ``[``, ``]`` or line break.
+_LINK_DESTINATION_CHAR_CLASS = r"[^()\s]"
+_LINK_RE = re.compile(
+    rf"\[([^\[\]\n]+)\]\((https?://{md_link_destination(_LINK_DESTINATION_CHAR_CLASS)}+)\)"
+)
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+")
 #: A single-backtick inline-code span, matching the Telegram renderer's shape.
 #: The dialect has ONE code marker, so a longer run carries no distinct meaning
@@ -309,6 +316,17 @@ def render_chunks(
     if not text:
         return []
     if stable:
+        # PREFIX-STABLE, and stated HERE rather than as a mode on the shared
+        # splitter's default: the streaming turn renderer re-splits its growing
+        # body every frame and treats all but the last chunk as delivered, so it
+        # needs chunk *i* decided by the text before it and NOTHING later. A sealed
+        # chunk is a promise to the client that nothing may rewrite, so this cut
+        # redacts the whole body (``stable=True``) then splits at the budget with
+        # no whole-body search that could move a boundary under a message already
+        # sent. The cross-message seam -- a chunk ending in a credential PREFIX the
+        # next completes -- is graded by the turn renderer, which knows which
+        # chunks are still unsealed and gives up only the completing span on a
+        # boundary it has not yet promised.
         return split_markdown_safe(text, limit, redactor=_redact_all, stable=True)
     # A credential-aware cut can DECLINE to cut, answering with the text whole,
     # which is fail-closed but one chunk over ``limit``. This channel's own sender

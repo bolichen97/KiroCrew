@@ -1129,8 +1129,9 @@ one.
 `github` (headers, GraphQL `errors[]`, `gh` stderr wording), `http` (status
 codes, `Retry-After` delay-seconds or HTTP-date, `X-RateLimit-Reset` epoch,
 duck-typed over `urllib`/`aiohttp`/`httpx` error shapes) and `acp_provider`
-(reuses `acp.client`'s own throttle / usage-limit / auth / 5xx patterns and
-`_is_transient_raw_error`, so a third copy cannot drift) — and returns the
+(reuses the ACP layer's own throttle / usage-limit / auth / 5xx patterns and
+`_is_transient_raw_error`, defined in `acp.transport_errors` and read through
+`acp.client`, so a third copy cannot drift) — and returns the
 first match, or `None` when the error is not a dependency error at all. An
 exception carrying a pre-attached `dependency_signal` wins outright.
 `register_adapter(name, fn, first=False)` adds one; an adapter that raises is
@@ -1245,7 +1246,7 @@ gateway makes before the store finished opening adopts nothing and the
 store-ready pass adopts exactly once -- two concurrent sweeps over one set of
 rows would let each settle a row the other is resuming.
 
-Gateway wiring is TWO passes over ONE admission (`slack/gateway.py`).
+Gateway wiring is TWO passes over ONE admission (`slack/gateway_runtime/admission.py`).
 `_wire_runner_admission` runs while the dashboard socket is being bound, so both
 consumers hold the admission -- and therefore the typed
 `task_store_unavailable` refusal -- from the moment they can serve; it also

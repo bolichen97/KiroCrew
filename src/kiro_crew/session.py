@@ -634,7 +634,7 @@ def _load_bg_runtime_types() -> tuple[Any, type[BaseException]]:
 # Heartbeat session key — used by HeartbeatService.  Spawned with the full
 # ``kirocrew`` agent so polled tasks can call read-only MCP tools (CR/ticket
 # status, etc.).  Tool approval at runtime is gated by the
-# ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway.py``.
+# ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway_runtime/tool_policy.py``.
 HEARTBEAT_KEY = "_hb"
 
 
@@ -869,6 +869,42 @@ def _provider_has_active_turn(provider: LLMProvider) -> bool:
     return res is True
 
 
+def _provider_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """``provider``'s newest background launch as ``(seconds since, description)``.
+
+    ``None`` unless the provider answers with exactly that shape. Same defensive
+    shape as :func:`_provider_has_active_turn`: the probe is optional, a raising
+    one reads as "nothing launched", and an ``AsyncMock``-style double's
+    coroutine is closed. A ``MagicMock`` attribute answers a ``MagicMock``,
+    which is not a tuple, so a double can never hold the watchdog off.
+    """
+    fn = getattr(provider, "background_launch", None)
+    if not callable(fn):
+        return None
+    try:
+        res = fn()
+    except Exception:
+        return None
+    if inspect.isawaitable(res):
+        close = getattr(res, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return None
+    if not (isinstance(res, tuple) and len(res) == 2):
+        return None
+    age, description = res
+    if (
+        isinstance(age, bool)
+        or not isinstance(age, (int, float))
+        or not isinstance(description, str)
+    ):
+        return None
+    return float(age), description
+
+
 def _context_pct_is_unknown(provider: LLMProvider) -> bool:
     """True only if ``provider`` reports its 0% context reading as unknown.
 
@@ -933,7 +969,7 @@ def _provider_has_unfinished_turn(provider: LLMProvider) -> bool:
     return res is True
 
 
-StopOutcome = Literal["soft", "hard", "idle"]
+StopOutcome = Literal["soft", "hard", "idle", "compacting"]
 
 
 class FirstTurnState(Enum):
@@ -1022,6 +1058,11 @@ class _Session:
     # remembers WHO held it, so that task's later key-only ``release`` is
     # absorbed instead of unlocking whatever successor now occupies the key.
     turn_owner: Any = None
+    # Set by the allocation layer when a claim or registration adopted entries a
+    # forced stop parked (``session_lifecycle.adopt_parked_queue``); ``release``
+    # reads and clears it to wake those entries' channel drains once the lease
+    # is free.
+    adopted_parked: bool = False
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
     capability_member: str = ""
@@ -1311,6 +1352,10 @@ class SessionManager:
             self.__dict__["_cleanup_state"] = state
         return state
 
+    def runtime_reconciler(self) -> Any:
+        """The retained runtime reconciler, or ``None`` before the first cleanup tick."""
+        return self._cleanup_state_boundary().runtime_reconciler
+
     def _cleanup_deps(self) -> CleanupDeps:
         # Resolved HERE, on the thread that builds the deps, and carried into the
         # sandbox sweep. That sweep runs on the maintenance pool, and a path a pool
@@ -1357,6 +1402,7 @@ class SessionManager:
             provider_has_active_turn=lambda provider: _provider_has_active_turn(provider),
             emit_counter=lambda event, dimensions: emit_counter(event, dimensions),
             get_persistent_keys=lambda: _PERSISTENT_KEYS,
+            provider_background_launch=lambda provider: _provider_background_launch(provider),
             get_channel_prefix=lambda: _CHANNEL_PREFIX,
             get_stuck_turn_report_secs=lambda: _STUCK_TURN_REPORT_SECS,
             get_pycache_gc_interval_secs=lambda: PYCACHE_GC_INTERVAL_SECS,
@@ -1546,6 +1592,16 @@ class SessionManager:
         the registry lock.
         """
         return self._closing
+
+    @property
+    def final_drain_started(self) -> bool:
+        """Whether ``close_all()`` began, so no turn here outlives this process.
+
+        An update pause also closes admission, but it can resume. ``close_all``
+        revokes that pause, so closing without an owned pause is the final drain
+        of a shutdown or an in-app re-exec restart.
+        """
+        return self._closing and not self._update_pause_owned
 
     @property
     def _update_pause_owned(self) -> bool:
@@ -1940,6 +1996,8 @@ class SessionManager:
                 acp_backend_kiro=ACP_BACKEND_KIRO,
                 bg_recycle_pct=_BG_RECYCLE_PCT,
                 bg_blind_recycle_prompts=_BG_BLIND_RECYCLE_PROMPTS,
+                rss_max_mb=lambda: self._rss_max_mb,
+                tree_rss_mb=lambda pid: get_session_rss_mb(pid),
                 runtime_backends=lambda: _bg_runtime_backends(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 runtime_types=lambda: _load_bg_runtime_types(),
@@ -2607,6 +2665,14 @@ class SessionManager:
         """Register the compaction completion callback."""
         self._compaction.set_compact_callback(cb)
 
+    def set_compacting_callback(self, cb: Callable[[str, bool], None] | None) -> None:
+        """Register the observer told when a session enters or leaves compaction."""
+        self._compaction.set_compacting_callback(cb)
+
+    def is_compacting(self, key: str) -> bool:
+        """Whether an automatic compaction is in flight on *key* right now."""
+        return self._compaction.is_compacting(key)
+
     def mark_needs_reinjection(self, key: str) -> None:
         """Mark a live session for one-shot context reinjection."""
         self._compaction.mark_needs_reinjection(key)
@@ -2888,9 +2954,11 @@ class SessionManager:
             key, pct_before, pct_after, expect=expect
         )
 
-    async def _fire_compact_callback(self, key: str, pct: float, *, success: bool) -> None:
+    async def _fire_compact_callback(
+        self, key: str, pct: float, *, success: bool, outcome: str | None = None
+    ) -> None:
         """Delegate compaction callback dispatch."""
-        await self._compaction._fire_compact_callback(key, pct, success=success)
+        await self._compaction._fire_compact_callback(key, pct, success=success, outcome=outcome)
 
     async def _fire_recycle_callback(self, key: str, *, reason: str) -> None:
         """Dispatch a lifecycle recycle callback through the lifecycle boundary."""
@@ -3161,8 +3229,25 @@ class SessionManager:
         """Consume a queued-message cancellation marker."""
         return self._allocation_boundary().is_cancelled(key, msg_ts)
 
-    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None:
+    def detach_queue(self, key: str) -> tuple[Any, ...]:
+        """Take the queued entries out of the live queue, keeping their files."""
+        return self._allocation_boundary().detach_queue(key)
+
+    def restore_queue(self, key: str, entries: tuple[Any, ...]) -> None:
+        """Put ``detach_queue``'s entries back at the head of the queue."""
+        self._allocation_boundary().restore_queue(key, entries)
+
+    def clear_queue(
+        self,
+        key: str,
+        owned_by: Callable[[dict], bool] | None = None,
+        *,
+        only: tuple[Any, ...] | None = None,
+    ) -> None:
         """Clear queued messages and their temporary paths.
+
+        *only* narrows the clear to the handles ``detach_queue`` returned, so a
+        Stop drops what was queued when it was pressed and nothing admitted since.
 
         *owned_by* narrows the clear to the entries it selects, for a caller acting for
         ONE principal rather than for the whole session: under
@@ -3176,7 +3261,7 @@ class SessionManager:
         Omitted, the whole queue goes, which is what a whole-session request means:
         teardown, a generation bump, a fresh conversation.
         """
-        self._allocation_boundary().clear_queue(key, owned_by)
+        self._allocation_boundary().clear_queue(key, owned_by, only=only)
 
     async def is_provider_alive(self, key: str) -> bool | None:
         """Probe a folded session provider outside the registry lock."""
@@ -3269,6 +3354,11 @@ class SessionManager:
     def mirror_accepts_inbound(self, key: str) -> bool:
         """True iff this session's mirror is a session-resume (two-way) binding."""
         return self._session_map.mirror_accepts_inbound(key)
+
+    def has_mirror_row(self, key: str) -> bool:
+        """Whether an explicit ``mirror`` row is stored under exactly *key* (no Slack
+        synthesis, no legacy-row fallback); see ``SessionMap.has_mirror_row``."""
+        return self._session_map.has_mirror_row(key)
 
     def mirror_link_nonce(self, key: str) -> str:
         """The per-binding nonce of the mirror ``get_mirror_link`` returns (``""`` for none)."""

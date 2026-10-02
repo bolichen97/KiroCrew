@@ -354,7 +354,7 @@ export function pagingCursorAfterKeptHead(
 
 /** Upper bound on the count-matched `refreshSlot` limit, matching the ceiling
  *  the slot-detail handler clamps `limit` to. A request above it comes back
- *  SHORT of what was asked for, which for an in-place replacement means the
- *  view SHRINKS — so a transcript paged back past this keeps the unbounded
- *  shape rather than truncate. */
-export const REFRESH_LIMIT_CEILING = 500
+ *  SHORT of what was asked for, which for an in-place replacement would mean the
+ *  view SHRINKS -- so a view paged back past this asks for exactly this many
+ *  and lets `walkWindowBackTo` reach the rest one page at a time. */
+export const REFRESH_LIMIT_CEILING = SLOT_DETAIL_MAX_LIMIT

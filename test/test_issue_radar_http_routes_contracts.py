@@ -28,6 +28,7 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew import llm_helpers
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
@@ -50,6 +51,10 @@ def _get(path: str, query: dict | None = None, app: web.Application | None = Non
 
 def _post(path: str, body: object, app: web.Application | None = None) -> web.Request:
     req = make_mocked_request("POST", f"{BASE}/{path}", app=app or web.Application())
+    if "state" not in req.app:
+        req.app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
     req.json = AsyncMock(return_value=body)  # type: ignore[method-assign]
     return req
 
@@ -1010,7 +1015,11 @@ class TestConfigRoutesKeepTheirProvider(unittest.IsolatedAsyncioTestCase):
             await routes._handle_add_settings_label(
                 _post("settings/role", {**GITLAB_Q, "role": "triage", "label": "bug"})
             )
-            resp = await routes._handle_disconnect(_get("repos", GITLAB_Q))
+            disconnect = _get("repos", GITLAB_Q)
+            disconnect.app["state"] = NoConfiguredOwner()
+            disconnect["user"] = "local-app"
+            disconnect["app"] = ""
+            resp = await routes._handle_disconnect(disconnect)
         self.assertEqual(_body(resp), {"ok": True, "owner": "g", "repo": "p"})
         self.assertEqual(read.call_args, mock.call("g", "p", **identity))
         self.assertEqual(write.call_args.kwargs, {"expected_revision": 0, **identity})

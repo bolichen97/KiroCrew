@@ -65,9 +65,10 @@ import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, cast
 
 from kiro_crew.config.paths import data_home
+from kiro_crew.context_blocks import PHASE_SESSION_START
 from kiro_crew.crew_log.entry_types import (
     PANEL_CREW_KEY_LIMIT,
     PANEL_ENTRY_TYPE,
@@ -94,6 +95,7 @@ from kiro_crew.crew_log.entry_types import (
 )
 from kiro_crew.crew_log.errors import CODE_BAD_DATA, CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION, Entry
+from kiro_crew.crew_log.session_tree import OpenedRecord, log_rank_of
 from kiro_crew.crew_log.store import (
     CrewLog,
     log_exception_text,
@@ -101,6 +103,7 @@ from kiro_crew.crew_log.store import (
     session_units_by_slot,
     session_units_for_slot,
     unit_header_created_at,
+    unit_opened_previous,
 )
 from kiro_crew.projection import ProjectionRegistry, Savepoint, attribute_seq
 
@@ -144,6 +147,7 @@ PROJECTION_NAMES: Final[tuple[str, ...]] = (
     "timeline",
     "tools",
     "approvals",
+    "subagents",
 )
 
 #: Folds this module registers but does NOT advertise: no panel draws them and the
@@ -189,19 +193,26 @@ FOLD_NAMES: Final[tuple[str, ...]] = (
 #: projection kernel reads it off each definition
 #: (:class:`~kiro_crew.projection.ProjectionDefinition`) and refuses a payload
 #: written under another number, so a stored state cannot resume onto logic that
-#: keeps different bookkeeping. ``crew_log.checkpoint`` re-exports it as
-#: ``CHECKPOINT_VERSION``, the name its files and its own docs use.
+#: keeps different bookkeeping.
 #:
-#: THE RULE: any change to what a fold's ``start`` or ``step`` STORES moves it,
-#: including one that keeps the same keys. Shape is all this number and
-#: ``_state_matches_fold`` can check, so a counting fix that leaves the keys alone
-#: would resume the old build's state onto the new logic -- and the long sessions a
-#: savepoint speeds up are the ones that then serve pre-fix numbers for the life of
-#: the unit. Moving it retires every savepoint to a cold fold, which costs one refold
-#: each and is the only in-product way to retire them, since the tree is fenced from
-#: the agent. ``test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move``
-#: pins each fold's stored state, so forgetting the move fails CI rather than shipping.
-FOLD_STATE_VERSION: Final[int] = 4
+#: THE RULE: any change to what a fold's ``start`` or ``step`` STORES moves that
+#: FOLD's version, including one that keeps the same keys. Shape is all this number
+#: and ``_state_matches_fold`` can check, so a counting fix that leaves the keys
+#: alone would resume the old build's state onto the new logic -- and the long
+#: sessions a savepoint speeds up are the ones that then serve pre-fix numbers for the
+#: life of the unit. Moving it retires that fold's savepoints to a cold fold, which
+#: costs one refold each and is the only in-product way to retire them, since the tree
+#: is fenced from the agent.
+#: ``test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move`` pins each
+#: fold's stored state against its own version, so forgetting the move fails CI rather
+#: than shipping.
+#:
+#: THE NUMBER IS PER FOLD (:attr:`_Fold.state_version`), and this is the value a fold
+#: that has never moved still stands at. A savepoint file records the version of the
+#: fold it holds, so a bump retires THAT fold's files and leaves every other fold's
+#: standing -- where one shared number retired all six for a change to one of them,
+#: and the sessions paying for it were the long ones the savepoints exist for.
+_FOLD_STATE_VERSION_BASE: Final[int] = 4
 
 #: The types these folds can interpret, handed to ``iter_from(known=...)`` so an
 #: entry from a newer writer stops the fold instead of skewing it. The set is the
@@ -217,6 +228,42 @@ KNOWN_TYPES: Final[frozenset[str]] = frozenset(SESSION_ENTRY_TYPES)
 #: reader is told the list is a window rather than the whole history.
 TIMELINE_LIMIT: Final[int] = 200
 
+#: Newest per-turn context rows a ``usage`` projection keeps, the same posture and
+#: the same value as :data:`TIMELINE_LIMIT`: this is the second window this module
+#: holds, and a projection is pushed over a socket on every growth, so its size is
+#: bounded by construction rather than by how long the session ran. No count of what
+#: fell off the front rides beside it: every retained row carries its own ``ordinal``,
+#: assigned before any truncation, so a reader reads the first row's true position and
+#: knows exactly how much precedes it. A whole-session drop total could not answer
+#: that for a reader bounded to a narrower window, which is what made it a defect.
+#:
+#: Measured at the WORST CASE rather than reasoned about, since this is the fold's
+#: largest new state: 200 rows each holding :data:`CONTEXT_SOURCES_PER_TURN_LIMIT`
+#: sources whose labels sit at :data:`TEXT_LIMIT` is 808,912 bytes of Python objects.
+#: ``test_a_full_window_stays_under_the_slot_fold_cell_budget`` re-measures
+#: that same worst case, so the figure fails rather than rots -- and it measures the
+#: CAP, not a realistic row, because a realistic 40-source row is 511,192 and would
+#: leave the real ceiling untested.
+#:
+#: It matters because this fold is read per SLOT, so its state lands in the slot-fold
+#: cache, whose own ceiling is stated against its largest member -- ``radar`` at
+#: 995,342 bytes. A full window plus a full ordinal memo (``context_turn_keys``, 120,042
+#: bytes at its widest) fits under that with 66,388 bytes to spare.
+#: The row shape is what buys that: the entry's own list of three-key dicts measures
+#: 3,319,357 at the same worst case and would breach the ceiling by 2.3 MB. See
+#: ``row_sources`` in ``_usage_step``.
+CONTEXT_TURNS_LIMIT: Final[int] = 200
+
+#: Sources one retained context row details. The label vocabulary
+#: (``context_blocks.split_blocks``) is fixed and far under this, so the cap is what
+#: keeps a row bounded against a NEWER writer's longer vocabulary rather than a limit
+#: today's writer reaches. Past it the row's own ``chars`` total stays as recorded, so
+#: a truncated source list is never mistaken for a smaller prompt, and the session-wide
+#: ``by_source`` breakdown counts every source regardless -- it is keyed by label and so
+#: is not subject to this per-row cap. Each source a row leaves out is counted in the
+#: rendered ``context.sources_omitted``.
+CONTEXT_SOURCES_PER_TURN_LIMIT: Final[int] = 64
+
 #: Distinct tool names a ``tools`` projection details. Past it the totals stay
 #: exact and ``names_omitted`` counts the names left out.
 TOOL_NAME_LIMIT: Final[int] = 100
@@ -226,6 +273,18 @@ TOOL_NAME_LIMIT: Final[int] = 100
 #: the same posture as ``TOOL_NAME_LIMIT``. A turn carries a model string, so an
 #: unbounded ``by_model`` would grow the checkpoint over a long session.
 MODEL_LIMIT: Final[int] = 100
+
+#: ``(unit, turn)`` keys ``_count_turn_ordinal`` remembers, so a rewound or edit-resent
+#: turn reuses its ordinal rather than taking a new one. Sized to the REWINDABLE range:
+#: ``chat_rewind`` can re-run any user message still in the slot's live list, and that
+#: list holds up to ``dashboard.state._MAX_SLOT_MESSAGES`` (10,000) rows, so up to that
+#: many distinct turns can recur. A smaller bound evicts a turn a user can still rewind
+#: to, and the rerun then takes a NEW ordinal that nothing refolds. Pinned equal to that
+#: cap by ``test_usage_the_ordinal_memo_covers_the_rewindable_range``. Bounded at all
+#: because it is checkpointed fold state; the keys are held as ONE string (see
+#: ``context_turn_keys``) so the bound costs ~100 KB rather than a dict of 10,000 entries.
+#: Oldest-inserted keys evict first.
+CONTEXT_ORDINAL_MEMO_LIMIT: Final[int] = 10_000
 
 #: Open tool calls and pending approvals listed individually.
 OPEN_LIST_LIMIT: Final[int] = 50
@@ -405,6 +464,20 @@ class _Fold:
     whole state. A shallower copy is what makes the per-entry cost bounded, and
     ``test_a_fold_never_reaches_into_the_state_it_was_handed`` is what keeps it
     honest: a nested container left shared shows up there as the prior state moving.
+
+    ``state_version`` is the version of what THIS fold stores, and it is the number
+    its savepoint files carry. It is per fold so that retiring one fold's stored
+    meaning costs a cold fold to that fold alone -- see
+    :data:`_FOLD_STATE_VERSION_BASE` for the rule that moves it.
+
+    ``mode`` decides WHEN the fold runs. ``"lazy"`` is the original posture: the value
+    is folded when a reader asks for it. ``"eager"`` folds it off the append path
+    instead, so a reader is served a value that was already current
+    (:mod:`kiro_crew.crew_log.eager`). An eager fold must declare ``affects``: the worker
+    wakes on the entry types its folds name, and a fold every entry moves would wake it
+    for every message body in the log -- the exact cost the mode exists to remove from
+    the read. That is checked here, at import, because a registry the process cannot
+    honour is not a thing to discover under load.
     """
 
     name: str
@@ -414,10 +487,30 @@ class _Fold:
     bind_slot: Callable[[dict[str, Any], str], None] | None = None
     affects: frozenset[str] | None = None
     copy_state: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    state_version: int = _FOLD_STATE_VERSION_BASE
+    mode: Literal["eager", "lazy"] = "lazy"
+
+    def __post_init__(self) -> None:
+        if self.mode == "eager" and self.affects is None:
+            raise ValueError(
+                f"the {self.name} fold is eager with no affects set: an eager fold is "
+                "woken by entry type, so one that every entry moves would fold on every "
+                "entry in the log off the append path"
+            )
 
     def touched_by(self, entry: Entry) -> bool:
         """Whether *entry* can move this fold, so a copy is worth making."""
         return self.affects is None or entry.type in self.affects
+
+    def touched_by_type(self, entry_type: str) -> bool:
+        """:meth:`touched_by` for a caller holding only the TYPE, not the entry.
+
+        The eager path decides which folds a committed entry wakes before it has read
+        the entry back, so it has the type and nothing else. Same answer as
+        :meth:`touched_by`, from the same set, rather than a second membership test that
+        could drift from it.
+        """
+        return self.affects is None or entry_type in self.affects
 
     def copied(self, state: dict[str, Any]) -> dict[str, Any]:
         """*state* copied deeply enough that :attr:`step` cannot reach the original."""
@@ -435,6 +528,16 @@ def require_name(name: str) -> str:
             field="name",
         )
     return name
+
+
+def fold_state_version(name: str) -> int:
+    """The version of what the *name* fold STORES, which its savepoint is keyed to.
+
+    Public because the savepoint module writes this number into each file and demands
+    it back on resume, and the fold registry is this module's. One accessor rather than
+    a second copy of the table, so a bump lands in one place.
+    """
+    return _FOLDS[require_name(name)].state_version
 
 
 def initial(name: str) -> Checkpoint:
@@ -975,7 +1078,7 @@ class _SessionFold:
     def __init__(self, fold: _Fold) -> None:
         self._fold = fold
         self.key = fold.name
-        self.state_version = FOLD_STATE_VERSION
+        self.state_version = fold.state_version
 
     def init(self) -> dict[str, Any]:
         return self._fold.start()
@@ -1316,11 +1419,121 @@ def _usage_start() -> dict[str, Any]:
         "context_blocks": 0,
         "context_estimated": 0,
         "context_by_source": {},
+        # Sources a retained row could not detail (see ``CONTEXT_SOURCES_PER_TURN_LIMIT``).
+        "context_sources_omitted": 0,
+        # The per-turn window the Context panel reads, newest LAST, bounded by
+        # ``CONTEXT_TURNS_LIMIT``. The cumulative ``context_by_source`` above answers
+        # "what does this session inject in total"; a panel drawing one bar per turn
+        # needs the turns themselves, and cannot recover them from a sum.
+        "context_turns": [],
+        # Which UNIT each row came from, counted off ``session/opened``. This works WITH
+        # the ``_closed`` seal, and neither covers the other's case: the seal tells two
+        # CLOSED runs of one ordinal apart (an attempt that already finished, in this
+        # unit or an earlier one), while the unit tells apart a run that was never closed
+        # at all -- a unit cut off mid-turn leaves its rows unsealed, and the next unit's
+        # same-ordinal turn walks straight onto them. Measured both ways: seal alone
+        # stamps the earlier unit's open row, unit alone stamps an earlier attempt whose
+        # own closer reported no reading. Internal to the fold; stripped at render.
+        "context_unit": 0,
+        # Which crew-log UNIT the ordinal key belongs to, counted off the ``session/opened``
+        # that STARTS a unit (``resumed`` not true) and nothing else. Distinct from
+        # ``context_unit`` above, which also moves on every re-attachment: a re-attach is
+        # the same conversation picked up again, and its turn numbers continue the same
+        # unit's, so a regenerate after a gateway restart must find the key its first run
+        # left. Only a new unit -- a new session or a compaction, each its own crew log --
+        # starts a new key space, because that is where turn numbers restart.
+        "context_key_unit": 0,
+        # A monotonic 1-based counter over the slot's TURN HISTORY, never reset by
+        # truncation. Each composition row is stamped with its value as ``ordinal`` so a
+        # retained row carries its TRUE position in the whole session history -- exact
+        # regardless of how many older rows the window dropped or the day view excluded,
+        # and a reader shows it directly instead of deriving a turn number from an array
+        # index, which only counts the rows still present.
+        #
+        # It advances for turns WITHOUT a composition too, not just per composition row:
+        # a turn can complete having composed nothing (a refusal, or a turn that reused
+        # the prompt already in context), and if the counter only moved on compositions
+        # a later row would carry an ordinal that under-counts the turns that actually
+        # ran before it -- the panel would then show the wrong turn number and the wrong
+        # "earlier turns not shown" count. So a composition advances it (below) AND a
+        # ``turn/completed`` that closed a composition-less turn advances it once, so the
+        # ordinal tracks the durable turn sequence, not the subset that composed. It is a
+        # bare int that grows without bound over a session's life, the one running
+        # counter a long session needs, and costs 8 bytes.
+        "context_turns_seq": 0,
+        # Every ``(unit, turn)`` the ordinal counter has already ACCOUNTED FOR, in the
+        # order the counter gave them out. A turn is counted once -- the first event that
+        # reaches it (a composition, the closer of a turn that composed nothing, or a
+        # refusal) advances the counter and appends its key here; every later event naming
+        # the same pair reads its ordinal back rather than advancing again, so a turn that
+        # composes more than once, is retried, or is both composed and closed shares one
+        # ordinal across its rows.
+        #
+        # Every seen pair rather than the single most-recent one because a turn number is
+        # not monotonic within a unit: the panel recomputes it from the live row count
+        # (``chat_runner``), and an edit-resend (``chat_regenerate``) or a rewind
+        # (``chat_rewind``) truncates that list in place in the same crew-log session, so
+        # a turn already counted can RECUR at a lower number later. A last-only check would
+        # see the recurring turn as new and advance the counter again -- mislabelling the
+        # rewound turn and inflating the dropped-turn count, with the wrong value persisted
+        # in savepoint state and no refold that corrects it.
+        #
+        # ONE string, ``",{unit}:{turn},{unit}:{turn},"``, rather than a key -> ordinal
+        # map: each new key takes the next ordinal, so a key's ordinal is its POSITION
+        # (``context_turns_seq`` minus the keys after it) and needs no stored value. That
+        # is what lets the memo cover the whole rewindable range
+        # (``CONTEXT_ORDINAL_MEMO_LIMIT``) inside the slot-fold cell budget, and a str is
+        # immutable, so a snapshot can share it without a copy. ``unit`` is the fold's own
+        # integer counter and ``turn`` an int, so neither can contain a separator.
+        "context_turn_keys": ",",
+        # The newest NON-ZERO window ``request/configured`` stated. That entry is
+        # written only when the configuration CHANGED, so the newest one still
+        # describes every turn since, and a zero means the provider reported no
+        # window rather than a window of nothing. This is what stamps a context ROW,
+        # whose question is "what window was this prompt composed against".
+        "context_window": 0,
+        # No session-wide occupancy maximum is kept here. Occupancy is stamped onto the
+        # ROWS instead (see the ``turn/completed`` branch in ``_usage_step``), because a
+        # reader bounded to a time window has to be able to exclude a reading from
+        # outside it -- and a scalar maximum cannot be narrowed to a window after the
+        # fact. The reading and the window it was taken against stay together on the
+        # row, so any window's peak is derivable from the rows inside it.
+        # The model the newest ``request/configured`` named, stamped onto each context
+        # row as it is appended. Truncated like every other retained label.
+        "context_model": "",
         "compactions": 0,
         "freed_pct": 0.0,
         "steps": 0,
         "step_ms": 0,
     }
+
+
+def _credit_charge(value: Any) -> float | None:
+    """*value* as a credit charge this module can arithmetic on, else ``None``.
+
+    THE module's one screen for a charge coming off the wire, shared by every fold that
+    reads a ``credits`` field -- ``usage`` through :func:`_bill_credits`, and ``subagents``
+    per row. Spelled once because it is one question, and two spellings of it drift: the
+    second would be the one that forgets a case.
+
+    Two shapes get through a naive check. ``bool`` is an ``int`` in Python, so ``True``
+    would bill as one credit. And a JSON integer is UNBOUNDED while a ``float`` is not, so
+    ``float(10 ** 400)`` raises ``OverflowError`` rather than returning a wrong number --
+    and nothing between here and :func:`fold_session` catches it, so an escaping raise
+    would cost the whole projection over one line that stays on disk for good. A line this
+    module cannot interpret costs that line and nothing else.
+
+    Deliberately does NOT screen the VALUE for sign, NaN or infinity. That is the caller's
+    business and belongs on the RESULT: a charge has many unusable shapes and an
+    accumulated total has one invariant (stay finite, never go down), so checking the total
+    needs one clause where checking the charge needs a clause per shape.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _bill_credits(state: dict[str, Any], entry: Entry) -> float | None:
@@ -1339,17 +1552,8 @@ def _bill_credits(state: dict[str, Any], entry: Entry) -> float | None:
     source = _CREDIT_SOURCE_OF.get(entry.type)
     if source is None:
         return None
-    credits = entry.data.get("credits")
-    if not isinstance(credits, (int, float)) or isinstance(credits, bool):
-        return None
-    try:
-        billed = float(credits)
-    except (OverflowError, ValueError):
-        # A JSON integer is unbounded, so a charge can be unrepresentable rather
-        # than merely wrong -- ``float(10 ** 400)`` raises. Nothing between here and
-        # ``fold_session`` catches it, so letting it escape would cost the whole
-        # projection over one line. A line this fold cannot interpret costs that
-        # line and nothing else.
+    billed = _credit_charge(entry.data.get("credits"))
+    if billed is None:
         return None
     bucket = state["credits_by_source"][source]
     total = state["credits"] + billed
@@ -1382,10 +1586,81 @@ def _bill_credits(state: dict[str, Any], entry: Entry) -> float | None:
     return billed
 
 
+def _count_turn_ordinal(state: dict[str, Any], unit_no: int, turn_no: int) -> int:
+    """Advance the session-global ordinal counter ONCE per distinct ``(unit, turn)``.
+
+    *unit_no* is ``context_key_unit``, the crew-log unit, so the key is stable across a
+    retry, a rewind, a regenerate and a re-attachment within one unit; every caller
+    passes that and nothing else.
+
+    The ordinal is a context row's position in the session's turn history -- what the
+    panel renders as the turn's number and what it counts the dropped-off turns from.
+    Every durable turn boundary passes through here: a composition, the closer of a
+    turn that composed nothing, and the refusal of a turn a dispatch gate never let run.
+    Each is ONE turn, so each consumes AT MOST one ordinal.
+
+    ``context_turn_keys`` lists every ``(unit, turn)`` already accounted for, in the
+    order the counter numbered them. If this call names a listed pair, its ordinal is
+    read back from its position and the counter is left where it is -- so a turn that
+    composes more than once, is retried, or is both composed and closed takes a single
+    ordinal shared across its rows. A pair not yet seen advances the counter and is
+    appended, which is what makes position and ordinal agree.
+
+    Every pair rather than the single most-recent one because a turn number is NOT monotonic
+    within a unit: an edit-resend or a rewind truncates the live row list the panel
+    numbers from, so a turn already counted can recur at a lower number later. Reusing
+    its original ordinal keeps the rewound turn's label stable; a last-only check would
+    read the recurrence as new and advance the counter again, mislabelling it and
+    inflating the dropped-turn count with no refold that corrects it.
+
+    The list is BOUNDED at ``CONTEXT_ORDINAL_MEMO_LIMIT`` keys, the rewindable range, and
+    evicts its oldest key. The counter is a bare int that keeps advancing, so evicting a
+    key never disturbs a later turn's ordinal, and position still reads true because the
+    keys after a match are counted from the END.
+    """
+    keys = state["context_turn_keys"]
+    needle = f",{unit_no}:{turn_no},"
+    found = keys.find(needle)
+    if found >= 0:
+        # Each key after this one ends in exactly one comma, and the newest key holds
+        # the counter's current value.
+        return int(state["context_turns_seq"] - keys.count(",", found + len(needle)))
+    state["context_turns_seq"] += 1
+    keys = keys + needle[1:]
+    if state["context_turns_seq"] > CONTEXT_ORDINAL_MEMO_LIMIT:
+        # One key in, one key out: every advance appends exactly one key, so past the
+        # bound the list is full and drops its oldest.
+        keys = "," + keys[keys.index(",", 1) + 1 :]
+    state["context_turn_keys"] = keys
+    return int(state["context_turns_seq"])
+
+
 def _usage_step(state: dict[str, Any], entry: Entry) -> None:
     data = entry.data
     billed = _bill_credits(state, entry)
-    if entry.type == "turn/completed":
+    if entry.type == "session/opened":
+        # A new unit begins, and the rows appended from here belong to it. The
+        # occupancy stamp is scoped to this counter because ordinals restart per unit.
+        #
+        # An opener is also written per RE-ATTACHMENT, so this can advance inside one
+        # unit. Deliberately not special-cased: it splits a unit into two scopes, and
+        # the effect is conservative -- a completion after a re-attachment leaves rows
+        # composed before it unstamped, so occupancy reads absent. Under-reporting a
+        # reading is the safe direction; carrying an earlier run's reading is not.
+        state["context_unit"] += 1
+        if data.get("resumed") is not True:
+            state["context_key_unit"] = int(state.get("context_key_unit", 0)) + 1
+        # The model/window stamps are scoped to the unit that was told them, so a new
+        # unit must start without them. The successor restamps from its own
+        # request/configured; until it does, a row reads absent rather than inheriting
+        # the predecessor's values. request/configured only accepts a NON-ZERO window
+        # and a NON-EMPTY model (an auto/backend-default session reports model="" and a
+        # provider that has not reported a window writes 0), so without this reset such
+        # a successor would silently keep the previous unit's stamp -- carrying one
+        # unit's reading onto another's rows, with no self-correcting re-fold.
+        state["context_window"] = 0
+        state["context_model"] = ""
+    elif entry.type == "turn/completed":
         state["turns_completed"] += 1
         model = _as_str(data.get("model"))
         by_model = state["by_model"]
@@ -1427,15 +1702,109 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
                 state["tokens"][dimension] += measured
                 if per_model is not None:
                     per_model["tokens"] += measured
+        # The fullest this window got, as the PROVIDER measured it, taken as one pair
+        # so the reading and its window always come from the same turn.
+        #
+        # Deliberately NOT derived from ``tokens.input`` above: that total is summed
+        # over every model call the turn made, so on a tool-using turn it exceeds the
+        # window it would be divided by, and the ratio a reader computes from it is
+        # wrong in the direction that looks alarming. Billing and occupancy are two
+        # quantities, and only the second answers "how full did this get".
+        #
+        # A closer SEALS the rows it closes, whether or not it carried a reading. The
+        # window merges every UNIT of a slot and turn ordinals restart per unit, and a
+        # regenerate or rewind reruns an ordinal as a fresh ATTEMPT -- so a matching
+        # turn number is NOT on its own proof a row belongs to the turn now closing.
+        # Two things could otherwise be conflated: a later unit's turn 1 walking back
+        # into a previous unit's turn 1, and this turn's attempt 2 walking back into
+        # its own attempt 1 (whose rows are the SAME ordinal). The seal is what tells
+        # them apart: each attempt's closer marks its own tail run closed, and the next
+        # closer stops at the first already-closed row. Sealing happens even for a
+        # closer with no reading, because otherwise an attempt that reported no
+        # occupancy would leave its rows unsealed and the next attempt's reading would
+        # stamp them. ``_closed`` is private bookkeeping the panel reader never sees;
+        # the reading itself is ``used`` / ``used_window``, present only when measured.
+        occupancy = data.get("context")
+        used: int | None = None
+        window = 0
+        if isinstance(occupancy, dict):
+            used = _as_int(occupancy.get("used"))
+            window = _as_int(occupancy.get("window"))
+        turn_no = _as_int(data.get("turn"))
+        unit_no = state["context_unit"]
+        rows = state["context_turns"]
+        for index in range(len(rows) - 1, -1, -1):
+            # The UNIT, beside the ordinal: ordinals restart in each unit of a slot, so
+            # an earlier unit's turn N carries this turn's number without being this
+            # turn. The seal below cannot catch that when the earlier turn was never
+            # CLOSED -- a unit cut off mid-turn by a gateway restart leaves its rows
+            # unsealed, and nothing else here tells them from an unstamped attempt.
+            if rows[index]["turn"] != turn_no or rows[index]["unit"] != unit_no:
+                break
+            # The boundary between this closer's rows and an earlier attempt's (or an
+            # earlier unit's same-ordinal turn's): that run was sealed by its own
+            # closer, so its reading -- or its deliberate absence of one -- must stand.
+            if rows[index].get("_closed"):
+                break
+            # REPLACED, never edited in place. ``_usage_copy`` shares these row dicts
+            # between a snapshot and the state that keeps growing -- that sharing is
+            # what makes the copy O(window) instead of O(window x sources) -- so writing
+            # into a row would reach a projection already handed to a reader. Assigning
+            # an element touches only this state's own freshly-copied list.
+            sealed = {**rows[index], "_closed": True}
+            if used is not None:
+                sealed["used"] = used
+                # Travels WITH the reading, including as 0: a turn that reported a used
+                # count but no window is a reading whose window is unknown, and
+                # borrowing another turn's size would pair the number with something it
+                # was never measured against.
+                sealed["used_window"] = window
+            rows[index] = sealed
         duration = data.get("duration_ms")
         if isinstance(duration, int) and not isinstance(duration, bool):
             state["duration_ms"] += duration
             state["duration_turns"] += 1
+        # A turn that closed having composed nothing still ran, so it occupies a
+        # position in the turn history the ordinal tracks: advance the counter once for
+        # it so the NEXT composition's ordinal counts it among the turns before it,
+        # rather than the counter only ever moving on the turns that happened to compose
+        # (which would make the panel show the wrong turn number). This turn is not yet
+        # counted when the mark names some OTHER turn -- an earlier one, or none at all.
+        #
+        # ONCE, however many attempts it takes: the mark is stamped here as well as at a
+        # composition, so a retried composition-less turn -- closed once per attempt,
+        # which is why the seal above is per-attempt -- consumes one ordinal rather than
+        # one per attempt. Without the stamp the second attempt reads the same unstamped
+        # state as the first and advances again, and every later row carries a turn
+        # number too high.
+        _count_turn_ordinal(state, state["context_key_unit"], turn_no)
+    elif entry.type == "turn/refused":
+        # A refused turn never reached the model, so it carries no cost and composes
+        # nothing -- but it still OCCUPIED a position in the turn history (a dispatch
+        # gate declining a turn is ordinary operation), so it consumes an ordinal just
+        # as a composition-less close does, and through the same helper so the rule is
+        # one rule. ``turn/refused`` is a turn's only durable entry when it fires: no
+        # ``turn/completed`` follows, so without this the counter never accounts for the
+        # turn and every later composition in the unit reads an ordinal one low.
+        _count_turn_ordinal(state, state["context_key_unit"], _as_int(data.get("turn")))
     elif entry.type == "context/composed":
         state["context_tokens"] += _as_int(data.get("tokens"))
         state["context_chars"] += _as_int(data.get("chars"))
         if data.get("tokens_estimated") is True:
             state["context_estimated"] += 1
+        # Label to CHARACTERS for this one turn, which is the shape its reader asks
+        # for. Deliberately NOT the entry's own ``[{kind, chars, tokens}]`` list:
+        # per-turn per-source tokens have no reader, and they are not an independent
+        # measurement -- the writer derives every one of them from that source's
+        # ``chars`` at one fixed ratio, and the cumulative ``context_by_source``
+        # below keeps the summed version for a reader who wants them.
+        #
+        # Measured at the worst case rather than argued, and it is what decides the
+        # shape: a full window is 808,912 bytes this way against 3,319,357 as the
+        # entry's list of three-key dicts. This fold is read per SLOT, so the cell
+        # lands in the slot-fold cache whose largest budgeted member is 995,342 --
+        # so the list shape does not merely cost more, it does not fit.
+        row_sources: dict[str, int] = {}
         sources = data.get("sources")
         if isinstance(sources, list):
             for source in sources:
@@ -1451,6 +1820,104 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
                 per_source["tokens"] += _as_int(source.get("tokens"))
                 per_source["chars"] += _as_int(source.get("chars"))
                 state["context_blocks"] += 1
+                # The retained ROW is bounded where the cumulative tally above is
+                # not: that one keys by label and so holds one entry per distinct
+                # label whatever the turn count, while a row is kept per turn and
+                # would multiply any per-row growth by the window. A label at
+                # ``TEXT_LIMIT`` is not keyed, the same reason ``_keyable`` gives
+                # everywhere else: it cannot be told apart from one that was cut, so
+                # two sources would pool into one number.
+                # A source left out is COUNTED (``sources_omitted`` on the rendered
+                # ``context``), so a reader can tell a truncated breakdown from a
+                # complete one. A label the row already holds still adds to it at the
+                # cap: only a NEW label is refused, so a kept label is never cut short.
+                keyed = _as_str(label)
+                if _keyable(keyed) and (
+                    keyed in row_sources or len(row_sources) < CONTEXT_SOURCES_PER_TURN_LIMIT
+                ):
+                    row_sources[keyed] = row_sources.get(keyed, 0) + _as_int(source.get("chars"))
+                else:
+                    state["context_sources_omitted"] += 1
+        row: dict[str, Any] = {
+            "turn": _as_int(data.get("turn")),
+            # The entry's own writer-assigned stamp (epoch ms). The entry data
+            # carries no time of its own, and this is the one the log recorded.
+            "ts": entry.time,
+            "chars": _as_int(data.get("chars")),
+            # NO per-row ``tokens`` / ``tokens_estimated``: the only reader of these rows
+            # shapes them to the ``ContextTrace`` interface, which asks for neither, and a
+            # row's token count is not an independent measurement -- the writer derives it
+            # from the same ``chars`` at a fixed ratio. The session-wide counts those two
+            # feed (``tokens``, ``estimated_turns``) are accumulated above and unaffected.
+            "sources": row_sources,
+            # Which unit of the slot this composition came from. Internal to the fold
+            # and stripped at render: it keeps one unit's reading off another unit's
+            # same-ordinal rows, and no reader asks for it.
+            "unit": state["context_unit"],
+            # Which population this row belongs to, as the COMPOSER stated it, or ""
+            # when it did not. Never derived here: a reader separating the one-off
+            # session-start injection from the per-turn ones needs the composer's own
+            # answer, and the guess available to a fold -- the first row of a unit --
+            # is wrong for the rebuild a mid-session replay triggers.
+            "phase": _as_str(data.get("phase")),
+            # Stamped from the newest configuration rather than looked up later, so a
+            # row records the model and window its prompt was actually measured
+            # against even after either moves.
+            "model": state["context_model"],
+            "window": state["context_window"],
+        }
+        # The row's TRUE position in the whole session history, assigned before any
+        # truncation and never reused. Dropped rows take their ordinal with them, so the
+        # first retained row's ordinal is exactly how many rows came before it -- what a
+        # reader needs to show a turn's real number without counting an array that holds
+        # only the survivors.
+        #
+        # ONCE per distinct (unit, turn), through the shared helper: a single turn can
+        # compose more than once (a rebuild re-emits the session-start injection, a
+        # prompt recomposed within one turn), and every such row is the SAME turn, so it
+        # carries that turn's one ordinal. The helper reuses the current counter value
+        # when this turn is already the one it last accounted for, so a second
+        # composition does not advance past the real turn sequence.
+        row["ordinal"] = _count_turn_ordinal(state, state["context_key_unit"], row["turn"])
+        turns_window = state["context_turns"]
+        turns_window.append(row)
+        if len(turns_window) > CONTEXT_TURNS_LIMIT:
+            over = len(turns_window) - CONTEXT_TURNS_LIMIT
+            # Drop the OLDEST per-turn rows first, and keep the session-start rows they
+            # sit among. A session-start composition is the one-off injection a unit
+            # opens with -- many times the size of a per-turn one and the anchor the
+            # Context panel draws its history against. Trimming it like an ordinary row
+            # once a session passes CONTEXT_TURNS_LIMIT turns would silently corrupt the
+            # panel's totals (the reader sums the RETAINED rows) and lose the largest
+            # bar. So the trim skips session-start rows: only per-turn rows count toward
+            # ``over`` and are removed, oldest first.
+            #
+            # Session-start rows are one per unit start/rebuild, so the count preserved
+            # is bounded by the units folded into a slot, not by how long the session
+            # ran. The final clamp below is the backstop for the pathological case where
+            # session-start rows alone would exceed the cap: it drops oldest-overall so
+            # the byte budget this limit exists to hold is never breached.
+            removed = 0
+            index = 0
+            while removed < over and index < len(turns_window):
+                if turns_window[index].get("phase") == PHASE_SESSION_START:
+                    index += 1
+                    continue
+                del turns_window[index]
+                removed += 1
+            if len(turns_window) > CONTEXT_TURNS_LIMIT:
+                del turns_window[: len(turns_window) - CONTEXT_TURNS_LIMIT]
+    elif entry.type == "request/configured":
+        # Newest NON-ZERO wins. This entry is written only when the configuration
+        # changed, and a provider that reports no window writes 0 -- taking that as
+        # the current window would erase a size the session was told earlier and is
+        # still running under.
+        window = _as_int(data.get("context_window"))
+        if window > 0:
+            state["context_window"] = window
+        configured_model = _as_str(data.get("model"))
+        if configured_model:
+            state["context_model"] = configured_model
     elif entry.type == "compaction/applied":
         state["compactions"] += 1
         freed = data.get("freed_pct")
@@ -1507,6 +1974,37 @@ def _usage_render(state: dict[str, Any]) -> dict[str, Any]:
             "by_source": {
                 name: dict(row) for name, row in sorted(state["context_by_source"].items())
             },
+            # How many sources the retained ``turns`` rows leave out, across the session.
+            # 0 means every row's ``sources`` is its whole breakdown.
+            "sources_omitted": state["context_sources_omitted"],
+            # The per-turn window, OLDEST FIRST. No count of what fell off the front
+            # rides beside it: each row carries its own ``ordinal``, assigned before
+            # any truncation, so the first row's number is what tells a reader this is
+            # a window rather than the whole history -- and it says how much precedes
+            # it, which a whole-session total could not for a narrower window.
+            # ``_closed`` is the fold's private seal (which closer already stamped this
+            # row) and ``unit`` (which run of the slot appended it) are both dropped
+            # here: together they keep one run's reading off another's same-ordinal
+            # rows, and no reader asks for either.
+            "turns": [
+                {
+                    **{k: v for k, v in row.items() if k not in ("_closed", "unit")},
+                    "sources": dict(row["sources"]),
+                }
+                for row in state["context_turns"]
+            ],
+            # NO session-wide occupancy pair here. The reading and its window ride on
+            # each ROW (``used`` / ``used_window``), because the reader is bounded to a
+            # TIME WINDOW and a maximum computed here could not be narrowed to it: the
+            # fullest turn of a long session is frequently older than every row the
+            # caller asked for. The reader takes the peak over the rows it keeps and
+            # gets its window from the same row.
+            #
+            # ``window`` remains: it is the newest size ``request/configured`` stated,
+            # which is what a reader with NO occupancy reading in its window can still
+            # be told the session runs under. A reader with a reading uses that row's
+            # own ``used_window`` instead.
+            "window": state["context_window"],
         },
         "compactions": {
             "count": state["compactions"],
@@ -1522,12 +2020,32 @@ def _usage_render(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _timeline_start() -> dict[str, Any]:
-    return {"moments": [], "dropped": 0}
+    # ``last_seq`` is the seq of the newest moment folded so far, or 0 before the
+    # first. A crew log's seq is strictly increasing within one succession unit and
+    # restarts at 1 in the next, so a moment at or below it is the mark that a SECOND
+    # unit has begun -- which this fold refuses below rather than render as one
+    # scrambled timeline.
+    return {"moments": [], "dropped": 0, "last_seq": 0}
 
 
 def _timeline_step(state: dict[str, Any], entry: Entry) -> None:
     if entry.type not in TIMELINE_TYPES:
         return
+    if entry.seq <= state["last_seq"]:
+        # A slot-wide read folds the units a slot ran under back to back, and each
+        # unit's seq restarts at 1. One session holds exactly one unit, so the only
+        # reader today never gets here; the day a slot-keyed reader folds this over a
+        # slot, two units interleaved by wall clock carry a clock-rollback inversion.
+        # Fail loudly at that boundary so the timeline is ordered by succession before
+        # anyone orders it by bare timestamp.
+        raise CrewLogError(
+            f"timeline moment at seq {entry.seq} is at or below the fold's seq "
+            f"{state['last_seq']}; the timeline fold spans one succession unit, not a "
+            f"slot of them -- order the units by succession before folding",
+            code=CODE_BAD_DATA,
+            field="seq",
+        )
+    state["last_seq"] = entry.seq
     moment: dict[str, Any] = {"seq": entry.seq, "time": entry.time, "type": entry.type}
     data = entry.data
     for key in (
@@ -1836,6 +2354,256 @@ def _approvals_render(state: dict[str, Any]) -> dict[str, Any]:
         "unmatched_decisions": state["unmatched_decisions"],
         "by_decision": dict(sorted(state["by_decision"].items())),
         "last": dict(state["last"]) if state["last"] else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# subagents
+# --------------------------------------------------------------------------- #
+#
+# WHAT THIS FOLD IS FOR. "Which children did this session dispatch, and for each one
+# what happened, how long it ran and what it cost" -- answered from one savepoint read
+# rather than from a 200-entry ``timeline`` window that happens to have swallowed the
+# four ``subagent/*`` types along with everything else.
+#
+# The same number lives in five places besides this one -- the runtime accumulator, the
+# terminal tombstone, the persistence record, the WS frame and its replay, and the
+# browser store -- and keeping those five agreeing is where a reader's numbers go wrong.
+# This fold is the one that is DERIVED from the log, so it cannot disagree with the
+# record without the record itself being wrong.
+
+
+#: Outcomes this fold counts under their own name. ``subagent/failed`` carries an OPEN
+#: enum, deliberately: the value is the subagent runtime's own, and enforcing the set
+#: would turn "the upstream vocabulary grew" into a lost record. So a closer whose
+#: outcome is not one of these lands in ``unknown``, which is what the declaration
+#: already means by it -- the row keeps the literal string, so the fact is not lost at
+#: the level that can hold it.
+_SUBAGENT_OUTCOMES: Final[frozenset[str]] = frozenset({"completed", "failed", "stopped", "unknown"})
+
+#: Entry types ``subagents`` reads: one opener and two closers. ``subagent/steered`` is
+#: DECLARED in the session vocabulary and deliberately not read here -- a steer is an event
+#: about a child rather than a state of one, and nothing this fold answers for is a count of
+#: them. Leaving it out of ``affects`` is safe in the direction that matters: the set may be
+#: wider than the truth but never narrower, and a type the step ignores would cost a copy
+#: per entry for a value that never changes.
+SUBAGENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "subagent/spawned",
+        "subagent/completed",
+        "subagent/failed",
+    }
+)
+
+
+def _subagents_start() -> dict[str, Any]:
+    return {
+        "by_id": {},
+        # Deliberately NO ``open`` list. ``_subagents_render`` answers which children are
+        # still going from the rows themselves (an ``outcome`` of ``None``) and from the
+        # totals, so a second list here would be state nothing reads, kept in step by hand
+        # on every closer.
+        # Dispatches this fold counted but did NOT retain, for any of THREE reasons: an
+        # id that identifies nothing (empty or over-long), an id a retained row already
+        # holds, or a full ``by_id``. The three reasons differ; what they share is the
+        # only thing this counter is for, which is keeping
+        # ``spawned == len(by_id) + omitted`` true.
+        "omitted": 0,
+        "totals": {
+            # EVERY dispatch, including the ones ``omitted`` counts. See
+            # ``_subagents_render`` for why the two are allowed to disagree.
+            "spawned": 0,
+            "completed": 0,
+            "failed": 0,
+            "stopped": 0,
+            "unknown": 0,
+            # Closers that found no row. Without this, a session whose totals exceed
+            # what its rows account for reads as an arithmetic bug.
+            "closed_unmatched": 0,
+            # DELIBERATELY no cost or duration aggregate here. ``usage`` folds the credits
+            # one from these same closers -- ``CREDIT_SOURCES`` carries ``"subagent"``, and
+            # ``credits_by_source["subagent"]`` is ``{"credits", "reported"}`` over exactly
+            # this population -- so a second spelling would be two things to keep in step.
+            # A summed duration had no such owner and no reader either, and the rule this
+            # module holds is the one stated for a row: a field kept against a reader that
+            # does not exist is state paid for on every copy and every savepoint write.
+            # Both figures still ride per child on the row that closed, which answers the
+            # question a surface actually asks -- whose, not how much altogether. What that
+            # gives up is the duration of a child whose dispatch left no row: its outcome
+            # and ``closed_unmatched`` still record that it ran and how it ended, but how
+            # long it took is not kept anywhere.
+        },
+    }
+
+
+def _subagent_credits(value: Any) -> float | None:
+    """*value* as a credit charge on ONE row, or ``None`` when none was reported.
+
+    Absent is NOT zero: a child that was never billed and a child that cost nothing
+    are different facts, and only one of them is a measurement.
+
+    The SHAPE screen is :func:`_credit_charge`, the module's single one. What this adds is
+    the part that screen deliberately leaves to its caller -- sign and finiteness -- stated
+    per VALUE rather than against a running total, because this fold keeps none: ``usage``
+    owns the aggregate over these same closers, so the only credit figure published here is
+    the one on a row, and a row has nothing to accumulate into.
+
+    Both clauses are about what the row would PUBLISH. A non-finite value survives
+    ``round``, the savepoint persists it, and a cold refold reads the same entry again, so
+    one unusable charge would sit in the served projection for the life of the unit. A
+    negative one is not a charge: the module's spend invariant is that a total never goes
+    down, and a row is a term in someone else's.
+    """
+    charge = _credit_charge(value)
+    if charge is None or not math.isfinite(charge) or charge < 0:
+        return None
+    return charge
+
+
+def _subagents_step(state: dict[str, Any], entry: Entry) -> None:
+    data = entry.data
+    agent_id = _as_id(data.get("agent_id"))
+    rows: dict[str, Any] = state["by_id"]
+    totals: dict[str, Any] = state["totals"]
+
+    if entry.type == "subagent/spawned":
+        # Counted BEFORE the cap is consulted: this is how many children the session
+        # dispatched, which is a fact about the session rather than about how many rows
+        # this fold chose to keep.
+        totals["spawned"] += 1
+        # An empty or over-long id identifies nothing, so keying a row by it would make
+        # every such child the same child and let one closer close another's row. It is
+        # counted above and left unretained, the same path a dispatch past the cap takes.
+        if not agent_id or agent_id in rows:
+            # Both of these dispatches were counted in ``spawned`` and neither gets a row of
+            # its own, so both belong in ``omitted``: that is what keeps
+            # ``spawned == len(by_id) + omitted`` true, which the spec advertises as
+            # checkable. A dispatch that vanished from both sides of the identity would read
+            # to an auditing reader as arithmetic this fold got wrong.
+            state["omitted"] += 1
+            return
+        if len(rows) >= OPEN_RETAIN_LIMIT:
+            # The bound this module holds everywhere: a session that dispatched more
+            # children than the cap keeps its totals exact and stops growing the state.
+            state["omitted"] += 1
+            return
+        rows[agent_id] = {
+            "agent_id": agent_id,
+            # Retained because ``render`` orders the rows by it. Deliberately the SEQ and
+            # not the time: two children dispatched in one millisecond tie on a clock, and
+            # a seq is what the log guarantees is ordered.
+            "seq_spawned": entry.seq,
+            "agent": _as_str(data.get("agent")),
+            "model": _as_str(data.get("model")),
+            "outcome": None,
+            # ``None``, not 0, for the same reason ``credits`` is: a closer writes ``ms``
+            # only when it measured a duration above zero, and crash-repair's closer writes
+            # none at all, so a 0 would present an absent measurement as a measured instant.
+            "ms": None,
+            "credits": None,
+            "reason": "",
+        }
+        return
+
+    # A closer, and the type is matched EXPLICITLY rather than reached by falling through
+    # the two branches above. ``affects`` spares this fold the entries it does not read,
+    # but only on the kernel's path (:class:`_SessionFold`): :func:`advance` and
+    # :func:`fold` call ``step`` for every entry in the file, so a fall-through ``else``
+    # here would bill every ``turn/completed`` in the log as a child that closed.
+    if entry.type not in ("subagent/completed", "subagent/failed"):
+        return
+    if entry.type == "subagent/completed":
+        outcome = "completed"
+    else:
+        outcome = _as_str(data.get("outcome")) or "unknown"
+    counted = outcome if outcome in _SUBAGENT_OUTCOMES else "unknown"
+    raw_ms = data.get("ms")
+    ms = raw_ms if isinstance(raw_ms, int) and not isinstance(raw_ms, bool) else None
+    # Screened as the value the ROW would publish. There is no total here to hang the
+    # invariant on: ``usage`` owns the aggregate over these closers.
+    credits = _subagent_credits(data.get("credits"))
+
+    # The totals move for EVERY closer, row or no row. crash-repair closes a child
+    # across the whole file, so a closer routinely names a dispatch this fold omitted --
+    # and dropping it would under-report what the session actually ran and spent, which
+    # is the one number a reader comes here for.
+    totals[counted] += 1
+
+    row = rows.get(agent_id) if agent_id else None
+    if row is None:
+        totals["closed_unmatched"] += 1
+        return
+    row["outcome"] = outcome
+    row["ms"] = ms
+    row["credits"] = credits
+    row["reason"] = _as_str(data.get("reason"))
+
+
+def _subagents_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The children this session dispatched, in dispatch order.
+
+    ``totals["spawned"]`` and ``by_id`` are allowed to DISAGREE, and ``omitted`` is
+    what reconciles them: ``spawned == len(by_id) + omitted``. A reader that wants to
+    know what the session did reads the total; one that wants per-child detail reads the
+    rows and is told, by a non-zero ``omitted``, that it is holding a window rather than
+    the whole list. Reporting only the retained count would silently shrink a long
+    session's history to the cap and look exact.
+
+    ``credits`` on a row is ``None`` when that child reported no charge, never ``0``.
+    A surface drawing this has three states to draw, not two: a number, "no charge was
+    reported", and a child that has not closed yet.
+
+    ``running`` is the count still open, and it is derived from TWO floors because neither
+    alone is right.
+
+    The totals give ``spawned - closed``, which retention never touches -- so it stays exact
+    once the cap has dropped a dispatch, where counting the retained rows without a closer
+    would report a session with 600 children in flight as having 512 or fewer.
+
+    But that difference can fall BELOW what this fold can still point at. A closer whose
+    ``subagent/spawned`` never reached the readable file -- an append dropped once its
+    attempt budget was spent, or a damaged record ``_iter_segments`` skips -- bills into
+    ``closed`` having never bumped ``spawned``. With one other child still in flight that
+    arithmetic answers 0 while a retained row is drawn wearing a running pill, and a floor
+    at 0 hides it rather than fixing it. So the retained open rows are the other floor: the
+    result is at least the number of children this fold is still showing as open. In the
+    retain-cap case the omitted dispatch WAS counted in ``spawned``, so the totals figure is
+    the larger of the two and stays exact.
+    """
+    rows = sorted(state["by_id"].values(), key=lambda row: row["seq_spawned"])
+    totals = dict(state["totals"])
+    closed = sum(totals[outcome] for outcome in sorted(_SUBAGENT_OUTCOMES))
+    # Counted, not emitted. An id list and the cap were both in this value with no reader:
+    # the panel derives the open rows by filtering `by_id` for an absent outcome, which is
+    # the same filter, so the list was a second spelling of something already there.
+    still_open = sum(1 for row in rows if row["outcome"] is None)
+    return {
+        "by_id": {
+            row["agent_id"]: {
+                "agent_id": row["agent_id"],
+                "seq_spawned": row["seq_spawned"],
+                "agent": row["agent"],
+                "model": row["model"],
+                "outcome": row["outcome"],
+                "ms": row["ms"],
+                "credits": row["credits"],
+                "reason": row["reason"],
+            }
+            for row in rows
+        },
+        "running": max(still_open, totals["spawned"] - closed),
+        # Whether that number is the answer or a FLOOR under it. It is a floor exactly when
+        # both truncations are in play at once: a dispatch this fold omitted, and a closer
+        # that matched no row. Each unmatched closer is subtracted from the count, but the
+        # fold cannot tell whether it closed one of the omitted dispatches or a child whose
+        # ``subagent/spawned`` never reached the file -- and only the first of those two
+        # should reduce the running count. So a session at 513 dispatches with one orphan
+        # closer reports 512 while 513 are in flight. A surface stating the count says "at
+        # least" when this is false, because a number that can be short by an unknown amount
+        # and is drawn as exact is the same class of lie as a truncated list drawn as whole.
+        "running_exact": not (state["omitted"] > 0 and totals["closed_unmatched"] > 0),
+        "omitted": state["omitted"],
+        "totals": totals,
     }
 
 
@@ -2831,6 +3599,99 @@ def _supplemental_units(slot: str, name: str) -> "tuple[str, ...]":
     return session_units_for_slot(slot)
 
 
+def _usage_units_in_succession(slot: str) -> "tuple[str, ...]":
+    """The slot's units for the ``usage`` fold, ordered by DURABLE succession.
+
+    The header fallthrough orders units by ``createdAt``, a wall-clock stamp: a clock
+    that steps backward between two units of one slot -- an NTP correction, a VM
+    resume -- sorts the genuinely-newer unit BEFORE its predecessor. The usage fold
+    appends each ``context/composed`` as a per-turn row and trims the OLDEST off the
+    front at ``CONTEXT_TURNS_LIMIT``, so an inverted order lands the newest unit's rows
+    at the front and the trim evicts them, keeping a retired session's rows as the
+    "newest" the panel draws.
+
+    So the units are ordered by the ``previous_sid`` succession chain the store itself
+    wrote -- each ``session/opened`` names the unit it replaced -- via the same
+    :func:`log_rank_of` the session tree ranks its logs with: depth in the chain leads.
+    The predecessor link is read O(1) from each unit's opening entry, and there are as
+    many reads as the slot has units, which is small. A unit whose predecessor cannot be
+    read is a chain start (depth 0), the safe direction -- it starts its own chain rather
+    than borrowing another's history.
+
+    Depth alone is NOT the whole order, because a slot can hold two UNRELATED chains at
+    once -- a session recreated after its predecessor's log was pruned, two logs whose
+    link was never written -- and those chains do not relate. Ordering by ``(depth, ...)``
+    globally would interleave them: chain A's depth-1 unit and chain B's depth-1 unit
+    would sort adjacent, splitting each chain's ``previous_sid`` edges apart and landing
+    a retired chain's rows between a live chain's. So the order is chain-CONTIGUOUS: each
+    unit is grouped under its chain root (the deepest predecessor still in the
+    population), the roots -- the only units the chain cannot relate -- are ordered by
+    their ``createdAt`` header, and within a chain the ``previous_sid`` depth leads. That
+    preserves every predecessor edge as a contiguous run and confines the wall clock to
+    the one question the chain leaves open.
+    """
+    units = session_units_for_slot(slot)
+    if len(units) < 2:
+        # One unit (or none) has nothing to reorder, and the chain read is pure cost.
+        return units
+    records = []
+    for unit_id in units:
+        created = unit_header_created_at(KIND_SESSION, unit_id)
+        previous = unit_opened_previous(KIND_SESSION, unit_id)
+        records.append(
+            OpenedRecord(
+                sid=unit_id,
+                slot=slot,
+                created_at=created if isinstance(created, int) else 0,
+                parent_slot=None,
+                previous_sid=previous,
+            )
+        )
+    by_sid = {record.sid: record for record in records}
+    rank = log_rank_of(records)
+    # The store's own listing order, which is the creation order it established and the
+    # clock-independent chronology the OLD stable sort preserved for two same-ranked units.
+    # It is the tiebreak for units the succession chain cannot separate -- two unrelated
+    # roots, or (defensively) two units a damaged chain gives one depth -- so a root with
+    # no readable ``createdAt`` keeps its store position instead of falling to an arbitrary
+    # id order that would reorder a retired chain ahead of a live one.
+    listed = {unit_id: index for index, unit_id in enumerate(units)}
+
+    def _chain_root(unit_id: str) -> str:
+        # Walk ``previous_sid`` to the deepest predecessor still in the population -- the
+        # unit that shares no chain with any other root. A predecessor pruned from the
+        # slot, absent, or belonging to another slot stops the walk (the same three stops
+        # ``_chain_step`` makes), so the walk stays within THIS slot's history. A cycle
+        # reached through damaged records is bounded by ``seen``: once a unit repeats, its
+        # chain has no clean root and the first-seen unit anchors the group deterministically.
+        cursor = unit_id
+        seen = {cursor}
+        while True:
+            previous = by_sid[cursor].previous_sid
+            if not previous:
+                return cursor
+            step = by_sid.get(previous)
+            if step is None or step.slot != by_sid[cursor].slot or previous in seen:
+                return cursor
+            seen.add(previous)
+            cursor = previous
+
+    def _order_key(unit_id: str) -> "tuple[int, int, int, int]":
+        root = _chain_root(unit_id)
+        # Chains are grouped by their root so every ``previous_sid`` edge stays a
+        # contiguous run. Roots -- the only units the chain cannot relate -- are ordered
+        # by the header ``createdAt`` (the wall clock, consulted ONLY here), then by store
+        # listing position so an unset or tied clock keeps creation order rather than an
+        # arbitrary id one. Within a chain the succession depth leads (predecessor first);
+        # the unit's own listing position is the final, defensive tiebreak. Ascending =
+        # oldest first, the order the fold applies (a later unit's update wins).
+        root_created = rank.get(root, (0, by_sid[root].created_at, root))[1]
+        depth = rank.get(unit_id, (0, 0, unit_id))[0]
+        return (root_created, listed.get(root, len(units)), depth, listed.get(unit_id, len(units)))
+
+    return tuple(sorted(units, key=_order_key))
+
+
 def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
     """The units *name* is folded over for *slot*, as that fold's owner defines them."""
     if name == LEDGER_FOLD_NAME:
@@ -2844,6 +3705,12 @@ def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
         # retired publish would become the current panel permanently, with the history
         # rows built against the wrong predecessor.
         return session_ledger.panel_crew_log_units(slot)
+    if name == "usage":
+        # NOT the header fallthrough either. The usage fold keeps a per-turn row window
+        # and trims the oldest off the front, so a backward clock step that inverted two
+        # units would evict the newest unit's rows and keep a retired session's. Order by
+        # the durable succession chain instead of the header clock.
+        return _usage_units_in_succession(slot)
     return session_units_for_slot(slot)
 
 
@@ -2855,6 +3722,14 @@ def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
 #: by COUNT: each cell is a bounded record, so what needs a ceiling is how many are
 #: retained, and the insertion order makes the oldest the one evicted. An evicted slot
 #: folds cold on its next read, which costs time and never correctness.
+#:
+#: What that bound is in BYTES, measured at each fold's declared caps rather than
+#: reasoned about: the largest cell is ``radar`` at :data:`RADAR_ITEM_LIMIT` items,
+#: 995,342 bytes, so a table of 64 of those is 60.8 MiB; ``work`` at
+#: :data:`WORK_ITEM_LIMIT` plus :data:`WORK_EVENT_LIMIT` is 138,067 bytes, 8.4 MiB for 64.
+#: A separate byte ceiling was tried and removed: at any value above this it never fires,
+#: and below it the eviction order stops meaning "least recently used" and starts meaning
+#: "whoever has the biggest board loses", which is not a policy anything asked for.
 SLOT_FOLD_CACHE_SLOTS: Final[int] = 64
 
 
@@ -3011,7 +3886,7 @@ class _SlotFold:
         self._fold = fold
         self._slot = slot
         self.key = fold.name
-        self.state_version = FOLD_STATE_VERSION
+        self.state_version = fold.state_version
 
     def init(self) -> dict[str, Any]:
         state = self._fold.start()
@@ -3121,6 +3996,75 @@ _slot_memos: "dict[tuple[str, str, str], _SlotMemo]" = {}
 _slot_memo_guard = threading.Lock()
 
 
+@dataclass
+class _FoldLock:
+    """One key's fold lock, beside the number of passes holding or waiting for it.
+
+    The count is what makes the table droppable: an entry at zero is one no pass can be
+    inside, so replacing it with a fresh lock serializes exactly what it needs to.
+    """
+
+    lock: threading.Lock
+    holders: int = 0
+
+
+#: One lock per (data home, slot, fold), held across a whole pass of
+#: :func:`fold_slot_warm`. Created under :data:`_slot_memo_guard`.
+#:
+#: WHY A PASS AND NOT A DICT ACCESS. Two warm passes on one key SHARE the cell: the
+#: continuation drives ``memo.registry``, and :func:`_slot_checkpoint` then reads that
+#: live cell and pairs it with the caller's OWN ``reached``. So a pass that read a
+#: shorter tail could return the other pass's newer state labelled with its own older
+#: seq -- and ``seq`` is what a reader truncates against, so the value is newer than the
+#: number that describes it. The kernel's watermark repairs the CELL on a later read; it
+#: cannot repair a value already returned.
+#:
+#: The pairing matters here because two readers on one slot is the NORMAL mode: the
+#: append-driven wake folds the same board a dashboard poll is reading, which is what eager
+#: folding is for. A lock is therefore the mechanism rather than a documented caveat.
+#:
+#: PER KEY, not one lock, because two slots have nothing to share. And held across the
+#: pass rather than around the drive alone: the state and the seq are read at different
+#: moments and it is their PAIRING that must be atomic. A caller that waits here waits
+#: for a fold it would otherwise have duplicated, and finds the cell warm when it
+#: arrives, so the lock costs no wall time it was not already paying.
+#:
+#: WHAT BOUNDS THIS TABLE. One entry per key with a pass holding or waiting for it, so
+#: its size is the folds running right now rather than the slots this process has ever
+#: folded. :func:`_release_fold_lock` drops an entry when its last holder leaves, which is
+#: the only moment at which dropping one is safe: a lock handed out twice as two different
+#: objects serializes nothing, so an entry with a waiter has to stay.
+_slot_fold_locks: "dict[tuple[str, str, str], _FoldLock]" = {}
+
+
+def _acquire_fold_lock(key: "tuple[str, str, str]") -> "_FoldLock":
+    """Claim one (data home, slot, fold)'s lock entry, creating it on first use.
+
+    Claiming is counting a holder, not taking the lock: the caller takes ``entry.lock``
+    itself, outside :data:`_slot_memo_guard`, because a pass holds it while folding and
+    the guard is taken inside that pass. Every claim owes a :func:`_release_fold_lock`.
+    """
+    with _slot_memo_guard:
+        entry = _slot_fold_locks.get(key)
+        if entry is None:
+            entry = _FoldLock(lock=threading.Lock())
+            _slot_fold_locks[key] = entry
+        entry.holders += 1
+        return entry
+
+
+def _release_fold_lock(key: "tuple[str, str, str]", entry: "_FoldLock") -> None:
+    """Give up a claim, and drop the entry once nobody holds or waits for it.
+
+    The identity check keeps a release from deleting an entry some other pass created for
+    the same key after this one was dropped.
+    """
+    with _slot_memo_guard:
+        entry.holders -= 1
+        if entry.holders <= 0 and _slot_fold_locks.get(key) is entry:
+            del _slot_fold_locks[key]
+
+
 def forget_slot_folds(slot: str = "", name: str = "") -> None:
     """Drop warm slot folds, so the next read folds cold.
 
@@ -3131,6 +4075,9 @@ def forget_slot_folds(slot: str = "", name: str = "") -> None:
     another's needs.
     """
     home = str(data_home())
+    # The locks (``_slot_fold_locks``) are not touched here: an entry exists only while a
+    # pass holds or waits for it, and dropping one out from under that pass would hand the
+    # next caller a different lock object and reopen the race it exists to close.
     with _slot_memo_guard:
         if not slot and not name:
             _slot_memos.clear()
@@ -3144,8 +4091,20 @@ def forget_slot_folds(slot: str = "", name: str = "") -> None:
 
 
 def _remember_slot_fold(key: "tuple[str, str, str]", memo: _SlotMemo) -> None:
-    """Keep *memo* under *key*, capped by count; the oldest slot is evicted first."""
+    """Keep *memo* under *key*, capped by COUNT; least recently STORED goes first.
+
+    Eviction order is least recently stored or advanced, which is not the same as least
+    recently read: a read that finds the cell already at the file's position returns it
+    without storing anything, so it does not move the cell towards the back. A cell can
+    therefore be read often while sitting at the front, be evicted, and fold cold on its
+    next read. That is the cost of not taking the guard on a read that had nothing to
+    record, and it is the cheaper side of the trade.
+
+    Insertion order tracks stores because a cell is never edited in place -- a read or an
+    eager fold that carries one forward stores a NEW memo, which moves it to the end.
+    """
     with _slot_memo_guard:
+        _slot_memos.pop(key, None)
         _slot_memos[key] = memo
         while len(_slot_memos) > SLOT_FOLD_CACHE_SLOTS:
             _slot_memos.pop(next(iter(_slot_memos)))
@@ -3219,6 +4178,25 @@ def fold_slot_warm(name: str, unit_ids: Sequence[str], *, slot: str) -> Checkpoi
     """
     require_name(name)
     key = (str(data_home()), slot, name)
+    # The whole pass, under this key's own lock. Everything below reads or advances one
+    # shared cell and then pairs that cell's state with this pass's own seq, and it is
+    # the PAIRING that a second pass would break -- see ``_slot_fold_locks``.
+    entry = _acquire_fold_lock(key)
+    try:
+        with entry.lock:
+            return _fold_slot_warm_locked(name, key, unit_ids, slot=slot)
+    finally:
+        _release_fold_lock(key, entry)
+
+
+def _fold_slot_warm_locked(
+    name: str, key: "tuple[str, str, str]", unit_ids: Sequence[str], *, slot: str
+) -> Checkpoint:
+    """:func:`fold_slot_warm`'s body, with this key's lock already held.
+
+    Split out so the lock's extent is one ``with`` statement rather than an indentation
+    a later edit could fall out of: every return below is inside it by construction.
+    """
     with _slot_memo_guard:
         memo = _slot_memos.get(key)
     marks = _unit_marks(unit_ids)
@@ -4229,21 +5207,44 @@ def _as_id(value: Any) -> str:
 #: session that spent most of its budget on a wave of subagents as cheap.
 USAGE_TYPES: Final[frozenset[str]] = frozenset(
     {
+        # Not a cost entry either, and it is here for the per-turn OCCUPANCY stamp:
+        # it is the only entry that marks where a unit begins, and turn ordinals
+        # restart in each unit of a slot. Without it the stamp's reach-back cannot
+        # tell an earlier unit's same-ordinal turn from an earlier attempt of the
+        # turn now closing.
+        "session/opened",
         "turn/completed",
+        # A refused turn never ran, so it carries no cost and no occupancy -- it is
+        # here only so the ordinal counter sees it. A dispatch gate refusing a turn
+        # (an oversized or blocked ``@prompt``, a superseded replay) is ordinary
+        # operation, and the refusal is the turn's ONLY durable entry: it emits no
+        # ``turn/completed`` and composes nothing. Without it the counter never
+        # accounts for that turn, so every later composition in the unit reads an
+        # ordinal one low per refusal -- the panel's turn number and its "earlier
+        # turns not shown" count both drift down and never self-correct.
+        "turn/refused",
         "context/composed",
         "compaction/applied",
         "step/completed",
         "subagent/completed",
         "subagent/failed",
         "background/completed",
+        # Not a cost entry, and it is here for the OCCUPANCY pair: the window size
+        # a prompt was measured against lives on this entry and on no other, and a
+        # per-turn context row without it reports a numerator with no denominator.
+        # It is also the only entry written BEFORE the prompt that names the model
+        # the prompt was composed for -- ``turn/completed`` names it afterwards, so
+        # stamping a context row from that one would date each row by the next
+        # turn's configuration.
+        "request/configured",
     }
 )
 
 #: Where a credit charge came from, which is the split ``usage`` keeps beside its
 #: total. Fixed rather than discovered: these are the three writers that carry a
 #: ``credits`` field, so the buckets are a closed set and a reader is never shown a
-#: partial split. A fourth spender would add a bucket here and move
-#: :data:`FOLD_STATE_VERSION`.
+#: partial split. A fourth spender would add a bucket here and move ``usage``'s own
+#: :attr:`_Fold.state_version`, which is the version its savepoints carry.
 CREDIT_SOURCES: Final[tuple[str, ...]] = ("turn", "subagent", "background")
 
 #: Which bucket each billing entry type lands in.
@@ -4288,7 +5289,16 @@ def _usage_copy(state: dict[str, Any]) -> dict[str, Any]:
     grown["context_by_source"] = {
         source: dict(row) for source, row in state["context_by_source"].items()
     }
+    # Appended to, trimmed from the front, and a row is REPLACED when its turn's
+    # occupancy arrives -- so only the LIST is rebuilt. The row dicts are shared with
+    # the snapshot rather than copied, which is what keeps this O(window) instead of
+    # O(window x sources), and that sharing is exactly why the occupancy stamp in
+    # ``_usage_step`` assigns ``rows[index] = {**row, ...}`` instead of writing into a
+    # row: an in-place write would reach a projection already handed to a reader.
+    grown["context_turns"] = list(state["context_turns"])
     grown["omitted_models"] = list(state["omitted_models"])
+    # ``context_turn_keys`` needs no copy: it is a str, which ``_count_turn_ordinal``
+    # REPLACES rather than mutates, so the snapshot keeps the value it was handed.
     return grown
 
 
@@ -4321,6 +5331,20 @@ def _approvals_copy(state: dict[str, Any]) -> dict[str, Any]:
     return grown
 
 
+def _subagents_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """A per-child row is filled in by its closer, and ``totals`` by every branch.
+
+    Those are the only two containers the step reaches: the row dict for the child a
+    closer names, and the ``totals`` dict every branch increments. Every value inside a
+    row is a scalar, so the row's shallow copy covers it. Bounded by
+    ``OPEN_RETAIN_LIMIT`` rows of fixed width.
+    """
+    grown = dict(state)
+    grown["by_id"] = {agent_id: dict(row) for agent_id, row in state["by_id"].items()}
+    grown["totals"] = dict(state["totals"])
+    return grown
+
+
 _FOLDS: Final[dict[str, _Fold]] = {
     # ``affects=None``: every entry moves these two. ``status`` counts entries and
     # keeps the newest time, and ``class`` records the seq it saw so a gap in the
@@ -4333,7 +5357,36 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _usage_render,
         affects=USAGE_TYPES,
         copy_state=_usage_copy,
+        # Moved off the base for the per-turn context window and the occupancy pair,
+        # and moved again for the monotonic ordinal counter this fold now keeps. That
+        # counter advances over the TURN HISTORY -- a turn that composed nothing still
+        # consumes an ordinal (``context_turns_seq`` plus the memo
+        # that records which turns were counted), and a REFUSED turn does too now
+        # that the fold sees ``turn/refused`` -- so a savepoint from a build whose
+        # counter only moved on compositions, or on completions but not refusals, would
+        # resume with a differently-numbered sequence; the bump retires THIS fold's
+        # files to a cold fold and leaves the others' standing. Moved again because a new
+        # unit now CLEARS the model/window stamps on ``session/opened``: a savepoint from
+        # a build that carried a prior unit's stamp into the next unit would resume still
+        # carrying it. Moved once more because the counter now REMEMBERS every counted
+        # ``(unit, turn)`` in a map rather than only the most recent, so a rewound or
+        # edit-resent turn reuses its ordinal instead of taking a new one; a savepoint
+        # written with the old scalar companion carries no such map and must refold cold.
+        # Moved again because the key's unit is now ``context_key_unit``, which a
+        # re-attachment does not advance; a savepoint keyed by the per-attachment counter
+        # would hand a regenerated turn a second ordinal.
+        # Moved again for ``context_sources_omitted``: a savepoint without the counter
+        # would resume short of it, and the count it renders would be wrong for good.
+        # Moved once more because the memo is now ``context_turn_keys``, one string
+        # covering the whole rewindable range; a savepoint holding the old bounded map
+        # carries neither the new field nor the turns that map had already evicted.
+        state_version=_FOLD_STATE_VERSION_BASE + 9,
     ),
+    # LAZY on purpose, and the one fold where that deserves saying. It is the fold a
+    # reader would guess wants pushing, because it is the one that looks like a live
+    # feed -- but its value is a 200-entry window (``TIMELINE_LIMIT``) that the
+    # dashboard does not read, and it is session-keyed, so folding it eagerly would
+    # advance state nothing asks for.
     "timeline": _Fold(
         "timeline",
         _timeline_start,
@@ -4341,6 +5394,10 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _timeline_render,
         affects=TIMELINE_TYPES,
         copy_state=_timeline_copy,
+        # The state carries ``last_seq`` now, so a savepoint from a build that stored
+        # only ``moments`` describes an older shape and resumes onto this logic blind
+        # to the unit boundary -- retire it.
+        state_version=_FOLD_STATE_VERSION_BASE + 1,
     ),
     "tools": _Fold(
         "tools",
@@ -4357,6 +5414,26 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _approvals_render,
         affects=APPROVAL_TYPES,
         copy_state=_approvals_copy,
+    ),
+    # LAZY, and the reason is not this fold's own: eager folding continues the warm SLOT
+    # memo, and this fold is keyed by one SESSION. See the import-time rule below
+    # (``EAGER_FOLD_NAMES <= SLOT_PROJECTION_NAMES``). A reader asks for this one when it
+    # draws the panel, which is a read per turn rather than a read on a timer.
+    "subagents": _Fold(
+        "subagents",
+        _subagents_start,
+        _subagents_step,
+        _subagents_render,
+        affects=SUBAGENT_TYPES,
+        copy_state=_subagents_copy,
+        # Two past the base, one step per change to what this fold STORES: it dropped its
+        # own credits aggregate once ``usage`` was found to fold the same number from the
+        # same closers, then its duration aggregate once no reader could be named for it.
+        # Each step retires the savepoints written under the shape before it, which is
+        # exactly what the number is for. Every sibling stays at the base, because a bump
+        # here costs a cold fold to this fold alone -- see
+        # :data:`_FOLD_STATE_VERSION_BASE`.
+        state_version=_FOLD_STATE_VERSION_BASE + 2,
     ),
     "class": _Fold("class", _class_start, _class_step, _class_render, copy_state=_flat_copy),
     # The SLOT-keyed folds each answer to exactly ONE entry type -- their ``step``
@@ -4379,6 +5456,10 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _radar_render,
         affects=frozenset({RADAR_ENTRY_TYPE}),
     ),
+    # EAGER. These two are the folds a dashboard reads on a timer, and each answers to
+    # exactly one entry type -- so the eager worker wakes for one type in a log that is
+    # otherwise message bodies, and the read it serves is a memo lookup rather than a
+    # walk of every unit the slot ran under.
     "work": _Fold(
         "work",
         _work_start,
@@ -4394,6 +5475,7 @@ _FOLDS: Final[dict[str, _Fold]] = {
         cast("Callable[[dict[str, Any]], dict[str, Any]]", _work_render),
         bind_slot=_work_bind_slot,
         affects=frozenset({WORK_ENTRY_TYPE}),
+        mode="eager",
     ),
     PANEL_FOLD_NAME: _Fold(
         PANEL_FOLD_NAME,
@@ -4401,12 +5483,27 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _panel_step,
         _panel_render,
         affects=frozenset({PANEL_ENTRY_TYPE}),
+        mode="eager",
     ),
 }
 
 if tuple(_FOLDS) != FOLD_NAMES:  # pragma: no cover - import-time consistency
     raise RuntimeError(
         "the fold registry and FOLD_NAMES disagree: " f"{tuple(_FOLDS)} against {FOLD_NAMES}"
+    )
+
+#: The eager folds, resolved once at import. Every one is SLOT-keyed: eager folding
+#: continues the warm slot memo (:func:`fold_slot_warm`), which is the one warm path
+#: this module has, and a session-keyed fold's warm state is a bundle its own caller
+#: holds rather than anything this module could advance on its behalf.
+EAGER_FOLD_NAMES: Final[tuple[str, ...]] = tuple(
+    name for name, fold in _FOLDS.items() if fold.mode == "eager"
+)
+
+if not set(EAGER_FOLD_NAMES) <= set(SLOT_PROJECTION_NAMES):  # pragma: no cover - import-time
+    raise RuntimeError(
+        "an eager fold must be slot-keyed, because eager folding advances the slot "
+        f"memo: {sorted(set(EAGER_FOLD_NAMES) - set(SLOT_PROJECTION_NAMES))}"
     )
 
 

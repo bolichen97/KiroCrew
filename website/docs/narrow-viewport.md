@@ -28,11 +28,11 @@ must be the only one.** `SidePanelLayout` drops the desktop header block below `
 the block whose `pb-3` put 12px between a tab's title and its content — and replaces it
 with a pill strip that ends in a drawn `border-b`. The pane kept no inset of its own, so
 a tab whose first element is a `Card` or a `StatCard` rendered that element's own border
-ON the divider: two lines touching, measured at a 0px gap on four of Agent Capabilities'
+ON the divider: two lines touching, measured at a 0px gap on four of Customize's
 seven tabs and on seven of Developer's eight renderable ones at 390px. The pane carries
 `pt-3` on the narrow branch only — desktop must stay at 0 or the two insets stack.
 
-That inset is shared by all three pages built on the shell (Agent Capabilities,
+That inset is shared by all three pages built on the shell (Customize,
 Developer, Settings), which makes the second half of the rule as load-bearing as the
 first: **a tab must not add a top margin to its own first element.** Doing so stacks on
 the pane and lands that tab 28px down while its siblings sit at 12px — the inconsistency
@@ -46,7 +46,7 @@ the difference is whether the heading can ever have a sibling above it:
   gap depend on it. (A conditionally rendered `Modal` does NOT have this effect: it
   `createPortal`s to `document.body` and never occupies a sibling slot.)
 - **A heading that repeats within one tab** (`SettingsSection`, used many times per
-  Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-4`, because the gap
+  Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-6`, because the gap
   between two sections is real, and pairs it with `first:mt-0`. The fragment adds no DOM
   node, so every section header is a sibling in one parent and only the leading one
   matches — and when a tab renders something of its own above the first section, the
@@ -283,8 +283,8 @@ the shell's, and the chat page fills it:
 | cell | who renders it | what is in it |
 |---|---|---|
 | leading (`auto`) | `App.tsx` | the crew switcher (when a remote crew exists) and downstream widgets (while they exist); usually empty. Not the update pill: beside a remote crew's chip + dropdown it was a third action, so on this page a pending update is the first item of the overflow menu (`UpdatePill variant="menu-item"`, same lifecycle label) |
-| centre (`minmax(0,1fr)`) | `ChatPage.tsx`, by `createPortal` into `#mobile-topbar-slot` | sessions toggle, then ONE control that is the session title with the menu chevron flush after it (`ChatHeaderMenu` `triggerLabel`); Rename and Auto-title are items of that menu (`SessionActionsMenu` `onRename` / `onAutoTitle`), and Rename swaps in the shared title editor. That menu leaves out its pop-out / focus-popped-out rows here (`omitPopout`): the trailing ⋯ menu is the phone's window menu and carries them, and the same row in two adjacent menus read as two different actions. Nothing else: the inline row's Autopilot InfoTip and `InboundLinkChip` would each be a third control, so the mode is read from the session menu's Autopilot row and a two-way link's actions from its Linked surfaces section |
-| trailing (`auto`, `.tb-trail`) | `App.tsx`, plus a portal into `#mobile-topbar-trail-slot` | exactly two: the bell, then the page's overflow menu (update when pending, pop out or focus the popped-out window, activity panel, split view). The update row reads `<status> — Open update settings`: a menu row is read as an action, and the row only navigates to Settings › About, so it names that outcome instead of implying a download or restart. The update row is a lazy chunk inside its own `ErrorBoundary`, so a chunk that fails to load costs the row, not the page (a rejection would otherwise reach the route boundary); the fallback is an inline `ErrorNotice` plus its `ErrorNoticeMenuItem` hand-off (`errors-use-error-notice`), never `null`, because this menu is the update's only phone home and a silent gap would hide the failure |
+| centre (`minmax(0,1fr)`) | `ChatPage.tsx` through `pages/chat/page/MobileTopBar.tsx`, by `createPortal` into `#mobile-topbar-slot` | sessions toggle, then ONE control that is the session title with the menu chevron flush after it (`ChatHeaderMenu` `triggerLabel`); Rename and Auto-title are items of that menu (`SessionActionsMenu` `onRename` / `onAutoTitle`), and it leads with "New chat in {folder}" (`ChatHeaderMenu` `newSessionHere`), which opens a sibling session in the on-screen session's folder with that folder's agent and project, and Rename swaps in the shared title editor. That menu leaves out its pop-out / focus-popped-out rows here (`omitPopout`): the trailing ⋯ menu is the phone's window menu and carries them, and the same row in two adjacent menus read as two different actions. Nothing else: the inline row's Autopilot InfoTip and `InboundLinkChip` would each be a third control, so the mode is read from the session menu's Autopilot row and a two-way link's actions from its Linked surfaces section |
+| trailing (`auto`, `.tb-trail`) | `App.tsx`, plus the same `MobileTopBar`'s portal into `#mobile-topbar-trail-slot` | exactly two: the bell, then the page's overflow menu (update when pending, pop out or focus the popped-out window, activity panel, split view). The update row reads `<status> — Open update settings`: a menu row is read as an action, and the row only navigates to Settings › About, so it names that outcome instead of implying a download or restart. The update row is a lazy chunk inside its own `ErrorBoundary`, so a chunk that fails to load costs the row, not the page (a rejection would otherwise reach the route boundary); the fallback is an inline `ErrorNotice` plus its `ErrorNoticeMenuItem` hand-off (`errors-use-error-notice`), never `null`, because this menu is the update's only phone home and a silent gap would hide the failure |
 
 That is the `topbar-single` header variant (`index.css`), applied only while
 `isMobile && isChat`. **Its side cells are plain flex divs, not `.tb-left` /
@@ -341,7 +341,8 @@ centre track and collapse.
 now holds a 72px icon rail on the left -- the shell's, rendered by `App.tsx` and
 handed down through `MobileNavRailContext` -- beside the sessions pane. The rail is
 built from the same registry as the desktop rail (`advertisedNavItems`,
-`sortedAppGroup`, the Bottom group) through the same `NavItem`, with `touch` for a
+`sortedAppGroup`, both from `shell/nav/appRail.tsx`, and the Bottom group) through
+the same `NavItem`, with `touch` for a
 64x56 `rounded-xl` tile carrying a 10px caption under the glyph (a finger cannot summon
 the desktop rail's hover tip), a full-opacity muted glyph (the desktop rail's 70% dimming
 measured 3.4:1 on these flat tiles) and the desktop rail's selected paint, on a
@@ -481,8 +482,9 @@ hamburger-opened drawer cannot be dragged shut.
 
 **A MODAL LAYER owns every touch inside it, read from its `role`.** A dialog is not
 necessarily portaled out of the shell: the changelog and update-error overlays are plain
-`fixed inset-0` JSX inside it (the shell element spans `App.tsx` 2635-3878, and both sit
-between), so a horizontal drag across one pulled the nav drawer out BEHIND the dialog.
+`fixed inset-0` JSX inside it (the shell element is the `shellRef` root `App.tsx`
+renders, and both the update-error overlay and `ChangelogModal` from
+`shell/updates/updateFlow.tsx` mount inside it), so a horizontal drag across one pulled the nav drawer out BEHIND the dialog.
 The hook therefore stands down for any `role="dialog"` / `role="alertdialog"` in the
 chain. Read as a rule rather than a list of overlays, because `src/` declares dozens of
 dialogs and a list means the next one silently fights the drawer — the same reasoning as

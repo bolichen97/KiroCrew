@@ -35,7 +35,7 @@ import pytest
 from kiro_crew import crewmate_prune_migration as mig
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import AgentInfo
-from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, config_path
 from kiro_crew.memory_stores import provision_member_memory
 
 
@@ -221,6 +221,35 @@ class TestThePass:
         assert marker["kept"] == ["radar"]
         assert marker["doubted"] == {}
 
+    def test_records_bound_to_a_removed_row_stay_executable(
+        self, old_style_config, bindings_dir, log
+    ):
+        """Removing a row must never strand the records that picked it.
+
+        Chats, forks, subagent runs and cron jobs that picked a synced crewmate
+        persist a ``member`` record naming it. After the pass removes the row,
+        each such record must decode as the installed template on the shared
+        store -- otherwise every reader refuses it as an unavailable member.
+        """
+        from kiro_crew.execution_context import (
+            EXECUTION_CONTEXT_KEY,
+            ExecutionContext,
+            MemoryStoreRef,
+            execution_from_record,
+        )
+
+        report = _run(old_style_config, log)
+        assert report.removed
+        for name in report.removed:
+            record = ExecutionContext(
+                None, MemoryStoreRef("default"), "member", name, selection_name=name
+            )
+            decoded = execution_from_record({EXECUTION_CONTEXT_KEY: record.to_record()})
+            assert decoded.selection_kind == "template", name
+            assert decoded.template_id == name
+            assert decoded.store.store_id == "default"
+            assert _spec_path(name).exists()
+
     def test_a_session_that_ran_the_agent_elsewhere_does_not_count(
         self, old_style_config, bindings_dir, log
     ):
@@ -333,6 +362,82 @@ class TestThePass:
         assert report.removed == []
         assert {"empty", "described"} <= KiroCrewConfig.load().agents.keys()
 
+    def test_rows_bound_to_skill_view_aliases_are_removed(self, bindings_dir, log):
+        # Discovery never lists a ``kirocrew-skill-view-*`` alias, so no spec is
+        # reported for these rows; the older sync still wrote one per alias file.
+        a = "kirocrew-skill-view-000d98d7ce0f52f0500da355"
+        b = "kirocrew-skill-view-0245aff77b1473735250d2a0"
+        cfg = KiroCrewConfig.load()
+        cfg.save()
+        raw = json.loads(config_path().read_text())
+        raw["agents"][a] = {
+            "member_id": "",
+            "kiro_agent": a,
+            "workspace": "default",
+            "memory_store": "default",
+            "model": "",
+            "display_name": "",
+            "description": "One-click setup agent -- managed by AIM.",
+            "triggers": "",
+            "source": "builtin",
+            "starred": False,
+        }
+        raw["agents"][b] = {
+            "member_id": "",
+            "kiro_agent": b,
+            "workspace": "default",
+            "memory_store": "default",
+            "description": "Communication agent -- managed by AIM.",
+            "triggers": "",
+            "source": "builtin",
+            "starred": False,
+        }
+        config_path().write_text(json.dumps(raw))
+        report = _run({}, log)
+        assert set(report.removed) == {a, b}
+        assert not {a, b} & KiroCrewConfig.load().agents.keys()
+
+    def test_a_skill_view_row_the_owner_chatted_with_or_claimed_is_kept(self, bindings_dir, log):
+        chatted = "kirocrew-skill-view-" + "1" * 24
+        created = "kirocrew-skill-view-" + "2" * 24
+        tuned = "kirocrew-skill-view-" + "3" * 24
+        runtime = "kirocrew-skill-view-" + "4" * 24
+        plain = "kirocrew-skill-view-" + "5" * 24
+        cfg = KiroCrewConfig.load()
+        for name in (chatted, created, tuned, plain):
+            cfg.agents[name] = _synced(name)
+        cfg.agents[created].member_id = "member-created"
+        cfg.agents[tuned].model = "m"
+        cfg.agents[runtime] = _synced(runtime, source="kirocrew")
+        cfg.save()
+        log.dm(chatted)
+        report = _run({}, log)
+        assert report.removed == [plain] and report.refused == []
+        assert {chatted, created, tuned, runtime} <= KiroCrewConfig.load().agents.keys()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "kirocrew-skill-view-mine",
+            "kirocrew-skill-view-" + "a" * 23,
+            "kirocrew-skill-view-" + "a" * 25,
+            "kirocrew-skill-view-" + "A" * 24,
+            "kirocrew-skill-view-" + "g" * 24,
+        ],
+    )
+    def test_a_prefixed_row_that_is_not_an_exact_alias_name_needs_a_spec(
+        self, bindings_dir, log, name
+    ):
+        # Only the name the projection writes (prefix + 24 lowercase hex) is
+        # judged on the row alone; any other tail is an ordinary row, and with
+        # no installed spec it is kept.
+        cfg = KiroCrewConfig.load()
+        cfg.agents[name] = _synced(name)
+        cfg.save()
+        report = _run({}, log)
+        assert report.removed == []
+        assert name in KiroCrewConfig.load().agents
+
     def test_a_created_crewmate_is_never_removed(self, bindings_dir, log):
         cfg = KiroCrewConfig.load()
         cfg.agents["created"] = _synced("created")
@@ -358,12 +463,16 @@ class TestThePass:
     ):
         from kiro_crew.config.paths import config_dir
 
-        first = config_dir() / "crewmate_prune_migrated.json"
-        first.write_text(json.dumps({"removed": [], "kept": [], "doubted": {}}))
+        earlier = [
+            config_dir() / "crewmate_prune_migrated.json",
+            config_dir() / "crewmate_prune_v2_migrated.json",
+        ]
+        for marker in earlier:
+            marker.write_text(json.dumps({"removed": [], "kept": [], "doubted": {}}))
         report = _run(old_style_config, log)
         assert report.skipped_marker is False
         assert set(report.removed) == {"radar", "scout"}
-        assert first.exists()
+        assert all(marker.exists() for marker in earlier)
 
     def test_a_no_op_pass_still_writes_the_marker(self, bindings_dir, log):
         report = _run({}, log)

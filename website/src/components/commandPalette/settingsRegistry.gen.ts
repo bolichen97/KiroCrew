@@ -950,18 +950,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
-    "id": "chat.default-to-autopilot-mode",
-    "label": "Default to Autopilot Mode",
-    "labelKey": "pages.settings.chatPanel.default_to_autopilot_mode",
-    "description": "New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions.",
-    "tab": "chat",
-    "type": "toggle",
-    "occurrence": 1,
-    "params": {
-      "sub": "sessions"
-    }
-  },
-  {
     "id": "chat.describe-your-role",
     "label": "Describe your role",
     "labelKey": "pages.settings.chatPanel.describe_your_role",
@@ -1608,10 +1596,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
-    "id": "developer.crew-members",
-    "label": "Crew Members",
+    "id": "developer.composable-layout",
+    "label": "Composable layout",
+    "labelKey": "pages.developer.featurePreviewsTab.layout_harness",
+    "description": "Turns on an in-development, developer-only harness for a new layout mechanism. Nothing you can see changes yet: the mechanism has no page of its own, so this exists only so it can be built and tested behind a switch.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.crewmates",
+    "label": "Crewmates",
     "labelKey": "pages.developer.featurePreviewsTab.crew_members",
-    "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
+    "description": "The Crewmates page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1713,6 +1710,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "display",
     "type": "toggle",
     "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    },
     "configKey": "dashboard.terminal.completion.enabled"
   },
   {
@@ -1722,10 +1722,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "The font the whole dashboard uses, including chat, the composer, and sidebar session and folder names. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders its glyphs and a programming font shows its ligatures.",
     "tab": "display",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "zoom"
+    }
   },
   {
     "id": "display.default-for-new-sessions",
+    "params": {
+      "sub": "sidebar"
+    },
     "labelKey": "pages.settings.displayPanel.default_for_new_sessions",
     "tab": "display",
     "type": "buttonGroup",
@@ -1741,6 +1747,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "display",
     "type": "input",
     "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    },
     "configKey": "dashboard.terminal.shell"
   },
   {
@@ -1750,7 +1759,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How the session color is applied to the row.",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sidebar"
+    }
   },
   {
     "id": "display.enable-ligatures",
@@ -1759,7 +1771,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Render programming ligatures (=>, !=, ->) when the custom font has them. Code and diffs in messages are unaffected.",
     "tab": "display",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "zoom"
+    }
   },
   {
     "id": "display.font",
@@ -1768,7 +1783,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Font for the built-in terminal. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders Powerline and prompt-theme glyphs.",
     "tab": "display",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    }
   },
   {
     "id": "display.font-family",
@@ -1777,7 +1795,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "zoom"
+    }
   },
   {
     "id": "display.font-size",
@@ -1786,7 +1807,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Text size in the built-in terminal, measured in pixels.",
     "tab": "display",
     "type": "stepper",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    }
   },
   {
     "id": "display.highlight-recent-sessions",
@@ -1795,7 +1819,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Highlight the N most-recently-active sessions with a graded accent stripe (0 = off). Saved to your Kiro Crew config.",
     "tab": "display",
     "type": "stepper",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sidebar"
+    }
   },
   {
     "id": "display.intensity",
@@ -1804,7 +1831,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How visible the color tint is on sidebar rows.",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sidebar"
+    }
   },
   {
     "id": "display.interface",
@@ -1813,7 +1843,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Chat bubbles or CLI-style line-by-line output",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    }
   },
   {
     "id": "display.language",
@@ -1822,7 +1855,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Language for the dashboard interface.",
     "tab": "display",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    }
   },
   {
     "id": "display.mode",
@@ -1831,7 +1867,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Light or dark appearance for the dashboard",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "theme"
+    }
   },
   {
     "id": "display.palette",
@@ -1840,16 +1879,23 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Choose a color palette for your sidebar sessions.",
     "tab": "display",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sidebar"
+    }
   },
   {
-    "id": "display.reduce-glass-transparency",
-    "label": "Reduce glass transparency",
-    "labelKey": "pages.settings.displayPanel.reduce_transparency",
-    "description": "Show the frosted glass panes (the message box, the suggestion chips, the Settings search) as solid cards. Same look the app uses when your system asks for less transparency.",
+    "id": "display.reuse-the-current-terminal",
+    "label": "Reuse the current terminal",
+    "labelKey": "pages.settings.displayPanel.terminal_reuse_current",
+    "description": "Copies the command instead of running it: Run in terminal focuses the terminal tab you have selected and copies the command, so you can paste it into that shell while keeping its working directory, environment, and any active login session. With no terminal open, it still copies the command for you to paste — it is never run for you.",
     "tab": "display",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    },
+    "configKey": "dashboard.terminal.reuse_current"
   },
   {
     "id": "display.theme",
@@ -1858,7 +1904,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Select a theme for the dashboard",
     "tab": "display",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "theme"
+    }
+  },
+  {
+    "id": "display.translucent-panels",
+    "label": "Translucent panels",
+    "labelKey": "pages.settings.displayPanel.translucent_panels",
+    "description": "Show the top bar, the tab bar, the message box, the suggestion chips and the search fields as frosted glass over the content that scrolls under them. Off, they are solid cards.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    }
   },
   {
     "id": "display.zoom-level",
@@ -1866,7 +1927,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.displayPanel.zoom_level",
     "tab": "display",
     "type": "stepper",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "zoom"
+    }
   },
   {
     "id": "instances.auto-connect-crews",
@@ -1888,6 +1952,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-approval",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_approval",
     "tab": "notifications",
     "type": "select",
@@ -1897,6 +1964,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-turn",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_turn",
     "tab": "notifications",
     "type": "select",
@@ -1906,6 +1976,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-cron",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_cron",
     "tab": "notifications",
     "type": "select",
@@ -1915,6 +1988,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-all",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_all",
     "tab": "notifications",
     "type": "select",
@@ -1924,6 +2000,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-heartbeat",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_heartbeat",
     "tab": "notifications",
     "type": "select",
@@ -1938,7 +2017,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "A background session is marked unread when its agent finishes or waits on your answer, instead of on every new message.",
     "tab": "notifications",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "alerts"
+    }
   },
   {
     "id": "notifications.notify-when-a-background-chat-finishes",
@@ -1947,7 +2029,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
     "tab": "notifications",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "alerts"
+    }
   },
   {
     "id": "notifications.play-sound-on-new-notifications",
@@ -1955,10 +2040,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.notificationsPanel.play_sound_on_new_notifications",
     "tab": "notifications",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sound"
+    }
   },
   {
     "id": "notifications.sound-category-agent",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_agent",
     "tab": "notifications",
     "type": "select",
@@ -1973,10 +2064,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "A card slides in under the top bar when a notification arrives, then tucks into the bell.",
     "tab": "notifications",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "alerts"
+    }
   },
   {
     "id": "notifications.sound-category-skills",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_skills",
     "tab": "notifications",
     "type": "select",
@@ -1986,6 +2083,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sources",
+    "params": {
+      "sub": "sources"
+    },
     "labelKey": "pages.settings.notificationsPanel.sources",
     "tab": "notifications",
     "type": "toggle",
@@ -1995,6 +2095,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-subagent",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_subagent",
     "tab": "notifications",
     "type": "select",
@@ -2004,6 +2107,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-taskrunner",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_taskrunner",
     "tab": "notifications",
     "type": "select",
@@ -2013,6 +2119,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.volume",
+    "params": {
+      "sub": "sound"
+    },
     "labelKey": "pages.settings.notificationsPanel.volume",
     "tab": "notifications",
     "type": "stepper",
@@ -2021,6 +2130,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   },
   {
     "id": "notifications.sound-category-hook",
+    "params": {
+      "sub": "percategory"
+    },
     "labelKey": "pages.settings.notificationsPanel.category_hook",
     "tab": "notifications",
     "type": "select",
@@ -2186,7 +2298,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "skills.auto-generate-skills-from-sessions",
     "label": "Auto-generate skills from sessions",
     "labelKey": "pages.settings.skillsPanel.auto_generate_skills_from_sessions",
-    "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Agent Capabilities → Skills for review — nothing goes live without your approval (see below).",
+    "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Customize → Skills for review — nothing goes live without your approval (see below).",
     "tab": "skills",
     "type": "toggle",
     "occurrence": 1,

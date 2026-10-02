@@ -497,7 +497,7 @@ managed-server invocation resolves.
 qualifying PR, installs it silently, and runs
 `.github/scripts/test-windows-installer.ps1` with NO `-SkipGatewayValidation`.
 The script starts the just-installed bundled interpreter against an isolated data
-home and requires `/api/ready` within 30 seconds, so an artifact that installs
+home and requires `/api/ready` within 50 seconds, so an artifact that installs
 but cannot boot fails at review time.
 
 Its backend payload is a real python-build-standalone runtime carrying the wheel
@@ -512,7 +512,7 @@ pywhispercpp and numpy download for a code path a gateway boot never reaches.
 `KIROCREW_KIRO_BIN` points at a `.cmd` shim running
 `kiro_crew.testing.fake_acp_backend` out of the INSTALLED payload through the
 INSTALLED interpreter, so readiness needs no model, no network and no sign-in.
-`KIROCREW_SKIP_MODEL_DOWNLOAD=1` keeps the embedding model out of a 30-second
+`KIROCREW_SKIP_MODEL_DOWNLOAD=1` keeps the embedding model out of a 50-second
 ceiling.
 
 Two ceilings became load-bearing with that change and were not before. The
@@ -1054,8 +1054,9 @@ and the plane's `a/**` artifacts and `h/**/*.log` pod logs from under that
 basetemp; on a default run the scenario globs simply match nothing.
 
 Three facts about WHEN the label takes effect, all consequences of `ci.yml`
-listening only for `push` and `pull_request` (`opened`, `synchronize`,
-`reopened`) and deliberately not for `labeled` -- the same choice `ci-full-run`
+listening only for `push`, `pull_request` (`opened`, `synchronize`,
+`reopened`) and `merge_group` -- on which a run has no PR labels, so the suite
+stays off -- and deliberately not for `labeled` -- the same choice `ci-full-run`
 makes, because a `labeled` trigger re-runs the whole workflow on every bot label:
 
 - The label must be on the PR BEFORE the `opened` or `synchronize` event that

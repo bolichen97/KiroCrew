@@ -26,8 +26,11 @@ export default function SessionStatusFrame({ slot, title, active }: { slot: stri
   const { t } = useTranslation()
   const { theme, colorTheme, themeVersion } = useTheme()
   const owner = useAppSelector(s => s.dashboard.slots.find(item => item.key === slot))
-  // Mirrors the producer: team workers (a creator link) get no automatic card.
-  const eligible = !isPrivateMemoryMode(owner?.memory_mode) && owner?.executor !== 'remote' && !owner?.created_by
+  // Mirrors the producer: only a ROOT session gets an automatic card. `created_by` is
+  // the birth-time parent edge; `parent` is the session-tree edge every slot row
+  // carries, the only way this side can see an ADOPTED worker.
+  const eligible = !isPrivateMemoryMode(owner?.memory_mode) && owner?.executor !== 'remote'
+    && !owner?.created_by && !owner?.parent
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const vars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
   const query = useQuery({ queryKey: ['dashboard-card', slot, owner?.linked_session_key ?? '', owner?.memory_mode ?? 'persistent'], queryFn: () => api.dashboardCard(slot),

@@ -232,6 +232,18 @@ def _request(
     return request
 
 
+def _owner_request(*args: Any, **kwargs: Any) -> Any:
+    """``_request`` carrying the dashboard owner's claims, for the owner-gated secret
+    routes: the gate reads ``request.get("user")``, ``"app" in request`` and
+    ``request["app"]``."""
+    request = _request(*args, **kwargs)
+    claims = {"user": "local-app", "app": ""}
+    request.get = lambda key, default=None: claims.get(key, default)
+    request.__contains__.side_effect = lambda key: key in claims
+    request.__getitem__.side_effect = lambda key: claims[key]
+    return request
+
+
 def _payload(response: web.StreamResponse) -> Any:
     """The JSON body of a handler's response (every handler here answers ``json_response``)."""
     assert isinstance(response, web.Response), response
@@ -669,10 +681,12 @@ class TestEverySeamControlsItsCallSites(_Home):
             ),
             "claim": lambda: routes._handle_claim(_request({"signal": {"id": "x"}})),
             "put_provider_config": lambda: routes._handle_put_provider_config(
-                _request({"site": "datadoghq.eu"}, match={"provider_id": "datadog"})
+                _owner_request({"site": "datadoghq.eu"}, match={"provider_id": "datadog"})
             ),
             "put_secret": lambda: routes._handle_put_secret(
-                _request({"field": "api_token", "value": "v"}, match={"provider_id": "pagerduty"})
+                _owner_request(
+                    {"field": "api_token", "value": "v"}, match={"provider_id": "pagerduty"}
+                )
             ),
         }
         for label, call in cases.items():
@@ -711,7 +725,7 @@ class TestEverySeamControlsItsCallSites(_Home):
         cases: dict[str, Callable[[], Any]] = {
             "webhook": lambda: routes._handle_webhook(oversized),
             "secret_on_config_route": lambda: routes._handle_put_provider_config(
-                _request({"api_token": "x"}, match={"provider_id": "pagerduty"})
+                _owner_request({"api_token": "x"}, match={"provider_id": "pagerduty"})
             ),
             "hygiene_not_primary": lambda: routes._handle_ledger_hygiene(_request()),
             "settings_write_refused": lambda: routes._settings_write_or_refuse(
@@ -751,7 +765,7 @@ class TestEverySeamControlsItsCallSites(_Home):
                 "merge_provider_config",
                 refuse,
                 lambda: routes._handle_put_provider_config(
-                    _request({"site": "datadoghq.eu"}, match={"provider_id": "datadog"})
+                    _owner_request({"site": "datadoghq.eu"}, match={"provider_id": "datadog"})
                 ),
             ),
             "verification_unscheduled": (
@@ -788,7 +802,7 @@ class TestEverySeamControlsItsCallSites(_Home):
             "stored_proposal": lambda: routes._execute_stored_proposal(
                 incident, {"action": models.ACTION_COMMENT, "note": "n"}, permit
             ),
-            "settings": lambda: routes._handle_put_settings(_request({"mode": "observe"})),
+            "settings": lambda: routes._handle_put_settings(_owner_request({"mode": "observe"})),
         }
         for label, call in cases.items():
             with self.subTest(site=label):
@@ -841,21 +855,25 @@ class TestEverySeamControlsItsCallSites(_Home):
         await self._reaches(
             "put_secret",
             lambda: routes._handle_put_secret(
-                _request({"field": "api_token", "value": "v"}, match={"provider_id": "pagerduty"})
+                _owner_request(
+                    {"field": "api_token", "value": "v"}, match={"provider_id": "pagerduty"}
+                )
             ),
         )
 
     async def test_delete_secret_is_read_by_the_revocation_route(self) -> None:
         await self._reaches(
             "delete_secret",
-            lambda: routes._handle_delete_secret(_request(match={"provider_id": "pagerduty"})),
+            lambda: routes._handle_delete_secret(
+                _owner_request(match={"provider_id": "pagerduty"})
+            ),
         )
 
     async def test_merge_provider_config_is_read_by_the_config_route(self) -> None:
         await self._reaches(
             "merge_provider_config",
             lambda: routes._handle_put_provider_config(
-                _request({"site": "datadoghq.eu"}, match={"provider_id": "datadog"})
+                _owner_request({"site": "datadoghq.eu"}, match={"provider_id": "datadog"})
             ),
         )
 
@@ -917,7 +935,7 @@ class TestSeamsReachTheHelpersBehindAHandler(_Home):
         audited = self.enterContext(mock.patch.object(routes, "_audit"))
         refuse = PermissionError(13, "Permission denied")
         with mock.patch.object(policy_store, "set_ceiling", side_effect=refuse):
-            response = await routes._handle_put_settings(_request({"mode": "observe"}))
+            response = await routes._handle_put_settings(_owner_request({"mode": "observe"}))
         self.assertEqual(response.status, 503)
         self.assertEqual(
             audited.call_args_list, [mock.call("settings_put", "refused after []", "failure")]
@@ -1111,24 +1129,6 @@ class TestTheProjectionsStayBehindTheFacade(unittest.TestCase):
                 text = Path(str(module.__file__)).read_text(encoding="utf-8")
                 self.assertIsNone(_REDACTOR_CALL_RE.search(text))
 
-    def test_nothing_on_a_claim_path_pushes_a_notification(self) -> None:
-        """``test_notify_out``'s claim-path rule, over the whole surface.
-
-        That test scans ``routes.py`` and ``dispatch.py`` only, and the transition handler that
-        does notify lives in ``http_routes``; so the rule is asserted here over every module,
-        with a floor so the scan cannot pass by finding nothing.
-        """
-        notifying = [
-            line
-            for module in [routes, *_projection_modules()]
-            for line in inspect.getsource(module).splitlines()
-            if "notify_out.notify_" in line
-        ]
-        self.assertTrue(notifying, "the scan must see the transition's needs-human push")
-        for line in notifying:
-            with self.subTest(line=line.strip()):
-                self.assertNotIn("claim", line.lower())
-
 
 class TestTheBoardReads(_Home):
     """The read projections, through the handlers the router serves."""
@@ -1215,7 +1215,7 @@ class TestTheLifecycleAndConfigurationEdges(_Home):
             "_handle_post_ledger",
         ):
             with self.subTest(handler=name):
-                request = _request()
+                request = _owner_request()
                 request.json = mock.AsyncMock(side_effect=ValueError("not json"))
                 response = await getattr(routes, name)(request)
                 self.assertEqual(response.status, 400)
@@ -1238,7 +1238,7 @@ class TestTheLifecycleAndConfigurationEdges(_Home):
         for label, (body, provider, status, _code) in cases.items():
             with self.subTest(case=label):
                 response = await routes._handle_put_secret(
-                    _request(body, match={"provider_id": provider})
+                    _owner_request(body, match={"provider_id": provider})
                 )
                 self.assertEqual(response.status, status)
                 expected = codes.get(label, "missing_required_field")
@@ -1246,14 +1246,18 @@ class TestTheLifecycleAndConfigurationEdges(_Home):
 
     async def test_a_secret_round_trips_through_save_and_revoke(self) -> None:
         saved = await routes._handle_put_secret(
-            _request({"field": "api_token", "value": "u+token"}, match={"provider_id": "pagerduty"})
+            _owner_request(
+                {"field": "api_token", "value": "u+token"}, match={"provider_id": "pagerduty"}
+            )
         )
         self.assertEqual(
             _payload(saved), {"ok": True, "provider": "pagerduty", "field": "api_token"}
         )
-        revoked = await routes._handle_delete_secret(_request(match={"provider_id": "pagerduty"}))
+        revoked = await routes._handle_delete_secret(
+            _owner_request(match={"provider_id": "pagerduty"})
+        )
         self.assertEqual(_payload(revoked), {"ok": True, "removed": True})
-        missing = await routes._handle_delete_secret(_request(match={}))
+        missing = await routes._handle_delete_secret(_owner_request(match={}))
         self.assertEqual(missing.status, 400)
 
     async def test_the_ledger_reads_and_a_missing_entry_is_a_coded_404(self) -> None:
@@ -1292,7 +1296,7 @@ class TestTheLifecycleAndConfigurationEdges(_Home):
             "stale_after_secs": 600,
             "needs_human_stale_after_secs": 900,
         }
-        response = await routes._handle_put_settings(_request(body))
+        response = await routes._handle_put_settings(_owner_request(body))
         self.assertEqual(response.status, 200)
         self.assertEqual(sorted(_payload(response)["applied"]), sorted(body))
 

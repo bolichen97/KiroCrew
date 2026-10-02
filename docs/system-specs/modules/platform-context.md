@@ -7,7 +7,7 @@ enterprise-specific code.
 
 > Authoring note: Kiro Crew is the public edition of this seam. The daily
 > de-branding content sync from the upstream authoring home strips the
-> enterprise-tinted Defaults (e.g. the internal git host, `.midway` sandbox dirs)
+> enterprise-tinted Defaults (e.g. the internal git host, SSO sandbox dirs)
 > down to the public baseline; the enterprise companion re-adds them via overrides.
 > The contract (interfaces + consumption-site wiring) is generic core
 > infrastructure and survives the sync.
@@ -23,6 +23,15 @@ adapters for the same interfaces.
 The dependency runs one way: **the companion depends on the core; the core never
 depends on the companion.** Because the core ships a default for every
 interface, the public edition is complete standalone.
+
+The execution catalog reads `ProviderRegistry.agent_runtime_policy(engine_identity)`
+through `current_context()` and `safe_context_call` for owner-visible member rows.
+The lookup key is the member's `kiro_agent`, falling back to its roster alias
+when empty. Redacted requests neither query nor emit this metadata; template
+rows never carry it. The public adapter returns `None`; companion policy is
+advisory metadata, not an enforcement boundary or a public picker behavior.
+Composition failures propagate, while other lookup failures log at debug and
+omit the policy.
 
 ## PlatformContext
 
@@ -178,9 +187,9 @@ installs the context. `bootstrap_context`:
 `resolve_profile(cfg, *, entry_points)` precedence (first match wins):
 1. `KIROCREW_PROFILE` env (`standalone` | `enterprise`; unknown → standalone).
 2. Non-empty `kirocrew.plugins` entry-point group (companion installed).
-3. Identity signal: a present `~/.midway` directory (a cheap stat, no
+3. Identity signal: a present SSO-marker directory (a cheap stat, no
    subprocess) — **only when the opt-in `KIROCREW_MIDWAY_PROFILE_PROBE` env var
-   is truthy**. OFF by default so a stray `~/.midway` left by some other tool
+   is truthy**. OFF by default so a stray marker directory left by some other tool
    cannot force the public edition into the `enterprise` profile (which has no
    companion to compose and would fail-closed at boot, bricking every command).
    The companion's managed launcher sets `KIROCREW_MIDWAY_PROFILE_PROBE=1`.
@@ -189,7 +198,7 @@ installs the context. `bootstrap_context`:
 The profile is a **load trigger, not a security decision**: capability comes
 from the installed companion, so a spoofed signal at worst loads a stricter
 posture on a host that has nothing to enforce it. The core does NOT spawn a
-`whoami` subprocess — entry-point presence + the opt-in `~/.midway` stat cover
+`whoami` subprocess — entry-point presence + the opt-in marker stat cover
 the trigger cases; the companion's own identity provider refines the principal
 once loaded.
 
@@ -398,6 +407,18 @@ kirocrew-enterprise = "kirocrew_enterprise.cli:main"
 The `kirocrew-enterprise` binary sets `KIROCREW_PROFILE=enterprise` and delegates to the
 core `main` — the explicit composition-root path that a security review reads.
 
+**The companion's top-level module MUST be named `kirocrew_<edition>`** — lowercase
+letters, digits and underscores only, no dots or hyphens. Two matchers identify a
+running gateway from its command line and neither can read the companion's entry
+points: `port_resolution._gateway_module_roots()` derives the Python side's set
+from the installed `kirocrew.plugins` entry points, while the desktop launcher's
+`isKirocrewCommand` (`website/electron/gateway-stop.js`) runs in a process with no
+view of that Python environment and matches the name against `KIROCREW_MODULE_RE`
+instead. Both also require a server subcommand (`gateway`, `dashboard`, `start`)
+as the first positional after the module. A companion named outside the
+convention classifies as ours on the Python side but as a foreign port holder on
+the desktop side, and the app refuses to start on its own gateway's port.
+
 ### Distribution build version
 
 A distribution that repackages one core release as several builds of its own
@@ -588,11 +609,13 @@ Wired sites:
   `test_gateway_first_run_setup_routes_through_the_seam`). Best-effort: the
   gateway's surrounding `except` keeps a failure non-fatal to startup, and
   `PlatformCompositionError` still propagates fail-closed.
-- `sandbox.py` — `_build_launcher_script` / `_build_seatbelt_profile` source the
-  sensitive-dir lists from `current_context().sandbox` (the `.aws`-exclusion at
-  the cc branch is preserved). `namespace_argv` / `sandbox_exec_argv` resolve
-  argv[0] through `current_context().agent_executable` before applying the core
-  sandbox. The public Default is identity; a companion may return the direct
+- `sandbox_launcher.py` / `sandbox_seatbelt.py` — `_build_launcher_script` /
+  `_build_seatbelt_profile` source the sensitive-dir lists from
+  `current_context().sandbox` through `sandbox._sandbox_policy` (the
+  `.aws`-exclusion at the cc branch is preserved). `sandbox.py`'s
+  `namespace_argv` / `sandbox_exec_argv` resolve argv[0] through
+  `current_context().agent_executable` before applying the core sandbox. The
+  public Default is identity; a companion may return the direct
   executable behind an edition-managed launcher to avoid nested isolation, but
   cannot disable or weaken the outer sandbox. A transient adapter error falls
   back to the original executable (outer sandbox still applies); a
@@ -699,7 +722,8 @@ Wired sites:
   `CredentialPolicy` Protocol; no `CONTRACT_VERSION` bump; `DefaultCredentialPolicy`
   returns `frozenset()` so standalone redaction is byte-identical.
 - `agent.py` — `current_context().mcp_tooling.extra_mcp_servers()` merged
-  additively (`setdefault`) into the agent config build + dynamic refresh.
+  additively into the agent config build; the dynamic refresh also re-pins an
+  existing entry's `command`/`args` and keeps its other keys.
 - `slack/events.py` / `slack/handler.py` / `dashboard/handlers_system.py` —
   Slack enterprise gate + SSO status route through `slack_gate` / `identity`.
 - `mcp_gateway/manager.py` — `GatewayManager._spawn_once` resolves
@@ -933,8 +957,8 @@ the public fork dropped without the core importing it. All are v1 additions (a
 is byte-identical) with no `CONTRACT_VERSION` bump.
 
 - `SlackEnterpriseGate.heartbeat_safe_tools() -> frozenset[str]` — unioned into
-  `slack/gateway.py::_is_heartbeat_safe_tool` after the core `HEARTBEAT_SAFE_TOOLS`
-  exact-match. Default `frozenset()`. ADD-only; never sourced from config.
+  `slack/gateway_runtime/tool_policy.py::_is_heartbeat_safe_tool` after the core
+  `HEARTBEAT_SAFE_TOOLS` exact-match. Default `frozenset()`. ADD-only; never sourced from config.
 - `AppsLoader.registry_rows() -> List[Dict]` — ADD-only merged by
   `apps/registry_pipeline/sources.py::_load_registry_file` after bundled `app-registry.json`
   (same-`name` core row wins). Default `[]`.
@@ -1288,8 +1312,8 @@ representative rather than exhaustive.
 - `hooks.register_internal_read_path(read_id, rel_path)` — guarded seam adding a
   fixed-path entry to `_INTERNAL_READ_ALLOWLIST` (rejects `..`/absolute/
   non-sensitive/repoint).
-- `security._SENSITIVE_HOME_DIRS` gains `.midway` (live SSO bearer cookie;
-  inert on a host without `~/.midway`).
+- `security._SENSITIVE_HOME_DIRS` gains the SSO cookie directory (live SSO
+  bearer cookie; inert on a host without it).
 - `config.knowledge.doc_ingest_hosts` (list) — SSRF-safe allowlist for the
   server-side fetch path only; empty = deny-by-default. The agent-driven
   `auto_add_documents` path is NOT gated

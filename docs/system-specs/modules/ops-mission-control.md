@@ -278,6 +278,12 @@ hygiene embeds rows hygiene is about to prune; pushing before hygiene makes ever
 re-derive the same dedupe locally so the repo never converges. Pinned by
 `test_stage_order_is_pull_hygiene_index_push`.
 
+When `memory.persistence_enabled` is false, the pass preserves that stage order
+but the index stage is a no-op decided before `VectorMemoryStore` construction.
+Pull, ledger hygiene, incident pruning, and push still run: they mutate the
+app's own durable state, while only the projection into shared episodic memory
+is an automatic persistent-memory write.
+
 Before this, **both halves were wired to nothing.** `ledger_sync` had no caller anywhere,
 and `dispatch`'s semantic recall queried an index `import_pending` never populated — so on
 a real install recall returned zero hits forever while every unit test passed. Two modules
@@ -807,7 +813,7 @@ holds the credential, so the agent never needs one.
 **The brief bounds evidence separately from the adapter budget.**
 `EvidenceBudget.max_bytes` (64 KB) caps what an adapter may *return* — right for a
 spool, far too large for a prompt (6 calls × 64 KB ≈ 384 KB, against the documented
-50k total session context budget in `context.py`). A measured brief measured
+50k total session context budget in `context_assembly/budget.py`). A measured brief measured
 **37,423 chars** from two items. `MAX_BRIEF_EVIDENCE_CHARS` (8k total) and
 `MAX_BRIEF_EVIDENCE_ITEM_CHARS` (4k per item) bound the rendered text, and the brief
 **says** when it truncates — an agent silently handed half a log dump will reason

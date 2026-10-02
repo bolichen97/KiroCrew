@@ -18,11 +18,17 @@ import type { RootState } from '../store'
 
 // --- Stub child components ---
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
-vi.mock('../components/ChatInput', () => ({
-  default: ({ value }: { value: string }) => (
-    <textarea aria-label="test chat input" value={value} readOnly />
-  ),
-}))
+vi.mock('../components/ChatInput', async () => {
+  // The page hands the text over through the Composer root's draft store, not
+  // a `value` prop, so the stand-in reads it the way the real ChatInput does.
+  const { useComposerDraftText } = await import('../chat-core/composer/Composer')
+  return {
+    default: function ChatInputStub({ value }: { value?: string }) {
+      const draft = useComposerDraftText()
+      return <textarea aria-label="test chat input" value={draft ?? value ?? ''} readOnly />
+    },
+  }
+})
 vi.mock('../components/PendingQuestionCard', () => ({
   default: ({ onFallbackSend }: { onFallbackSend: (text: string) => void }) => (
     <button aria-label="send stale question fallback" onClick={() => onFallbackSend('Public only')}>
@@ -57,7 +63,7 @@ vi.mock('../api/client', () => ({
   api: Object.fromEntries(
     ['sessions', 'chatSlotDetail', 'createChatSlot', 'deleteChatSlot', 'resumeChatSlot',
      'deleteSession', 'agentDetail', 'approveChatSlot', 'chatSlotAgent', 'chatSlotModel',
-     'chatSlotWorkspace', 'models', 'planAction', 'planFromChat', 'renameSlot',
+     'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
      'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
      'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
      'notifications', 'status', 'sendChat'].map(k => [k, vi.fn().mockResolvedValue(k === 'chatSlotDetail' ? { messages: [], has_more: false } : {})])
@@ -126,7 +132,7 @@ beforeEach(() => {
   __resetPanelTabs()
 })
 
-const allSlots = [slot('chat-1'), slot('chat-2'), slot('orch-1', 'orchestrator'), slot('orch-2', 'orchestrator')]
+const allSlots = [slot('chat-1'), slot('chat-2')]
 
 describe('ChatPage unmount slot persistence (real component)', () => {
   it('persists activeSlot to localStorage on unmount', async () => {
@@ -141,7 +147,7 @@ describe('ChatPage unmount slot persistence (real component)', () => {
     localStorage.clear()
     await act(() => { unmount() })
     expect(localStorage.getItem('mc-active-slot-chat')).toBe('chat-2')
-    expect(localStorage.getItem('mc-active-slot-orchestrator')).toBeNull()
+    expect(localStorage.getItem('mc-active-slot-dashboard')).toBeNull()
   })
 
   it('each mode persists independently', async () => {
@@ -149,12 +155,12 @@ describe('ChatPage unmount slot persistence (real component)', () => {
     localStorage.clear()
     await act(() => { u1() })
     expect(localStorage.getItem('mc-active-slot-chat')).toBe('chat-2')
-    expect(localStorage.getItem('mc-active-slot-orchestrator')).toBeNull()
+    expect(localStorage.getItem('mc-active-slot-dashboard')).toBeNull()
 
-    const { unmount: u2 } = renderChatPage('orchestrator', 'orch-1', allSlots)
-    localStorage.removeItem('mc-active-slot-orchestrator')
+    const { unmount: u2 } = renderChatPage('dashboard', 'chat-1', allSlots)
+    localStorage.removeItem('mc-active-slot-dashboard')
     await act(() => { u2() })
-    expect(localStorage.getItem('mc-active-slot-orchestrator')).toBe('orch-1')
+    expect(localStorage.getItem('mc-active-slot-dashboard')).toBe('chat-1')
     expect(localStorage.getItem('mc-active-slot-chat')).toBe('chat-2')
   })
 

@@ -409,6 +409,8 @@ Security invariants:
 
 The **HMAC signing key** is loaded from (or created at) `<config_dir>/token_signing.key` (mode `0600`) by `token_secret.py` — it is **persistent**, not `os.urandom(32)` per process (that is only a can't-persist fallback). Signed access and refresh cookies therefore survive a gateway restart.
 
+Inside the Linux agent sandbox the key is masked by an unreadable (mode `0`) empty file, not a readable one (`sandbox._CREW_UNREADABLE_MASK_LEAVES`). A data-home copy made from a sandboxed shell (`rsync`, `cp -a`, `tar`) therefore fails on the key with `Permission denied` instead of writing a 0-byte `token_signing.key` at the destination, which `token_secret` would never replace. The sandboxed uid owns that mask inode, so nothing may be able to `chmod` it back: the launcher creates it at mode `0` in a small tmpfs mounted over a fresh stage directory in the sandbox's own mount namespace (outside it the stage is an empty host directory, so no name in the shared tmpfs can be chmodded, swapped or redirected through a symlink), stays non-dumpable while that stage is mounted (no `/proc/<pid>/root` or `/proc/<pid>/fd` path for another same-uid process), binds the file through its own descriptor, remounts the bind read-only (a `chmod` through the key path fails with `EROFS`), and then detaches the stage. If the private tmpfs cannot be mounted, the launcher falls back to the readable empty mask with a warning. macOS denies the same read through its Seatbelt profile.
+
 Mutable link-session state is encapsulated in `TokenStateManager`, a thread-safe singleton using `threading.Lock` (not `asyncio.Lock`, since token operations are called from both async middleware and sync CLI contexts):
 
 ```python
@@ -601,7 +603,10 @@ either auth flavor can grant (see `_verify_unix_peer`):
    key — the token's MAC is keyed by the agent-unreadable SEL trust root and
    names ONE session, which peer credentials cannot distinguish on a shared
    runtime. No token, or a token naming another session → **403**
-   `peer_session_unattested`. A truncated roster does not weaken this: a
+   `peer_session_unattested`, and so does a token this resolver cannot even
+   name: the header arrives decoded with `surrogateescape`, so the resolver
+   compares the MAC as BYTES and answers an ordinary refusal for a token whose
+   text a `str` comparison cannot hold. A truncated roster does not weaken this: a
    recorded count above one is the evidence the token is required, so a
    declared key absent from a SHORT membership is still challenged rather than
    admitted as "membership unknown". Both outcomes are SEL-recorded, including

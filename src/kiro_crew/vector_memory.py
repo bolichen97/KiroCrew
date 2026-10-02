@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from sqlite3 import Error as StdlibSQLiteError
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 from uuid import uuid4
 
 from kiro_crew import memory_record_metadata as record_meta
@@ -103,6 +103,7 @@ from kiro_crew.vector_memory_runtime import migration as _migration
 from kiro_crew.vector_memory_runtime import recall as _recall
 from kiro_crew.vector_memory_runtime import retirement as _retirement
 from kiro_crew.vector_memory_runtime import semantic as _semantic
+from kiro_crew.vector_memory_runtime import text_scoring as _text_scoring
 from kiro_crew.vector_memory_runtime.embedding import (  # noqa: F401
     _EmbeddingVector,
     _RecallQuery,
@@ -169,6 +170,9 @@ from kiro_crew.vector_memory_runtime.text_scoring import (  # noqa: F401
     _stem_words,
     _tokenize,
 )
+
+if TYPE_CHECKING:
+    from kiro_crew.config.loader import KiroCrewConfig
 
 logger = logging.getLogger(__name__)
 
@@ -688,11 +692,58 @@ def open_member_database(
     path: Path, *, member_id: str, store_id: str, **vector_options
 ) -> "VectorMemoryStore":
     """Open a canonically admitted member store without creating or migrating it."""
+    store = _member_store(path, member_id=member_id, store_id=store_id, **vector_options)
+    store.init()
+    return store
+
+
+def _member_store(
+    path: Path, *, member_id: str, store_id: str, **vector_options
+) -> "VectorMemoryStore":
+    """A member store bound to its canonical identity, not yet opened."""
     store = VectorMemoryStore(path, **vector_options)
     store._member_identity = (member_id, store_id)
     store._memory_store_name = store_id
-    store.init()
     return store
+
+
+def declared_store(
+    path: Path, *, store_id: str, config: KiroCrewConfig, **vector_options
+) -> "VectorMemoryStore":
+    """The store *store_id* declares, bound the way its declaration says, NOT yet opened.
+
+    A declared V2 store is bound to its canonical member identity, so ``init()``
+    admits it through the ``mode=rw`` identity check :func:`open_member_database`
+    takes and never creates or migrates it. Every other declaration gets the V1
+    store, whose ``init()`` refuses a member file. That is the one choice every
+    opener of a NAMED store has to make. A caller making it by hand has to know
+    that a member store must not be opened with a bare ``init()``, which raises
+    "Private memory requires canonical member admission" on every V2 file.
+
+    Returned unopened, so a caller holds the handle before ``init()`` runs and
+    can close it on any path out of the open (a cancellation, the CLI's settlement
+    of a database it created). *config* is the loaded config, read for the
+    declaration and passed on as the store's own ``config=``.
+
+    The global store is V1 whatever its entry says, as it is to
+    :func:`kiro_crew.memory_stores.memory_store_version`, so a hand-edited
+    ``default`` record cannot route the operator's own memory through member
+    admission.
+    """
+    declaration = config.memory_stores.get(store_id)
+    if (
+        memory_stores.named_store_or_empty(store_id)
+        and declaration is not None
+        and declaration.memory_version == 2
+    ):
+        return _member_store(
+            path,
+            member_id=declaration.owner_member_id,
+            store_id=store_id,
+            config=config,
+            **vector_options,
+        )
+    return VectorMemoryStore(path, config=config, **vector_options)
 
 
 class VectorMemoryStore:
@@ -2024,7 +2075,7 @@ class VectorMemoryStore:
                     reason = None
                     old_conf = existing["confidence"]
                     if source != "user_explicit":
-                        if _is_degenerate_value_json(existing["value_json"]):
+                        if _semantic._is_degenerate_value_json(existing["value_json"]):
                             # Neither precedence rule has content to protect here, and
                             # refusing is what makes such a row permanent: the automated
                             # writer this branch turns away is the only writer that would
@@ -2082,12 +2133,12 @@ class VectorMemoryStore:
                 changed = bool(
                     existing
                     and (
-                        not _json_value_equal(existing["value_json"], value_json)
+                        not _semantic._json_value_equal(existing["value_json"], value_json)
                         or existing["is_deleted"]
                     )
                 )
                 if (
-                    private_policy
+                    (private_policy or (existing and existing["is_deleted"]))
                     and (changed or metadata_changed)
                     and source != "user_explicit"
                     and not verified
@@ -2186,7 +2237,7 @@ class VectorMemoryStore:
             if (
                 existing
                 and not existing["is_deleted"]
-                and not _json_value_equal(existing["value_json"], value_json)
+                and not _semantic._json_value_equal(existing["value_json"], value_json)
             ):
                 old_text = json.loads(existing["value_json"])
                 if isinstance(old_text, str) and len(old_text) >= 3:
@@ -2945,7 +2996,7 @@ class VectorMemoryStore:
         self, limit: int = 50, offset: int = 0, tag_filter: list[str] | None = None, *, q: str = ""
     ) -> list[dict]:
         """Active episodes, with optional literal text/tag search before pagination."""
-        query = _normalize_memory_search_query(q)
+        query = _text_scoring._normalize_memory_search_query(q)
         if tag_filter:
             # Use JSON-quoted exact match to avoid substring false positives
             # e.g. "cr" should not match "cron" or "datacraft"
@@ -2973,7 +3024,10 @@ class VectorMemoryStore:
         if query:
             with self._db_lock:
                 self.db.create_function(
-                    "memory_text_contains", 3, _contains_memory_search_text, deterministic=True
+                    "memory_text_contains",
+                    3,
+                    _text_scoring._contains_memory_search_text,
+                    deterministic=True,
                 )
                 rows = self._fetch_all_locked(sql, params)
         else:
@@ -3573,7 +3627,7 @@ class VectorMemoryStore:
                     # exactly as before this pass existed.
                     backfill_generation = self._space_generation
                     existing_emb = self._try_embed(
-                        _lesson_embed_text(json.loads(existing["value_json"])),
+                        _lessons._lesson_embed_text(json.loads(existing["value_json"])),
                         PRIORITY_BULK,
                     )
                     if existing_emb:
@@ -3743,7 +3797,7 @@ class VectorMemoryStore:
                     # the display rendering -- the vector must live in the same
                     # space as the query vectors it is compared against.
                     existing_emb = self._try_embed(
-                        _lesson_embed_text(json.loads(existing["value_json"])),
+                        _lessons._lesson_embed_text(json.loads(existing["value_json"])),
                         PRIORITY_BULK,
                     )
                     if existing_emb:
@@ -3968,6 +4022,27 @@ class VectorMemoryStore:
             hard_cap=hard_cap,
             directive_budget=directive_budget,
             experience_budget=experience_budget,
+        )
+
+    def turn_lessons(
+        self,
+        query_text: str,
+        *,
+        shown: Callable[[str], bool],
+        project_dir: str | Path | None = None,
+        max_rows: int,
+        max_chars: int,
+        render_lesson: Callable[[str], str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """``(key, text)`` of the lessons a follow-up message should add, best first."""
+        return _lessons.turn_lessons(
+            self,
+            query_text,
+            shown=shown,
+            project_dir=project_dir,
+            max_rows=max_rows,
+            max_chars=max_chars,
+            render_lesson=render_lesson,
         )
 
     def _rank_lessons(

@@ -118,7 +118,12 @@ agent kind holding that agent's sessions:
 ```
 
 A conductor that floats at the top level while its workers sit in a folder is
-the failure this step exists to remove. **Running as a crew member is the one
+the failure this step exists to remove. **If you already sit in a folder, stay
+there.** When your `[FOLDER]` line names a folder the person put you in (say
+`Ops`, and not a parent conductor's `kirocrew-conductor` subfolder, covered
+below), that folder IS your goal's folder: skip `chat_folder_file_self` and
+create your workers under `Ops/<agent>`. Never create a second folder with the
+same name as one that exists; the tools refuse it. **Running as a crew member is the one
 exception**: your session is then the member's pinned DM thread on the Crew
 page, one thread across every goal, and it is not filed — the tool refuses
 and says so. Skip this step and create your workers under `<goal>/<agent>`
@@ -183,6 +188,16 @@ read `<crew-home>/skills/kirocrew-dev/prepare-pr/SKILL.md` (`<crew-home>` is
 `KIROCREW_HOME` when set, else `~/.kiro/crew`) and follow its loop to drive
 the PR to review-ready. Optional — the worker's own method is fine too.
 
+**A large item's seed may name `workflow_run`.** You see the item's size
+before the worker does. When it has several dependent phases or many
+independent pieces AND a failed piece should re-run without redoing the rest,
+add one line: run it with `workflow_run` (check `workflow_library_list` for a
+saved one first) and put the run id in `artifacts`. A run's steps do not
+inherit the worker's directory, so for an item in a checkout the line also says
+every step passes that checkout as `ctx.agent(cwd=)`. Leave the line out for a
+single task or a one-shot fan-out; the worker does those itself. This is
+advice to the worker: you still never call `workflow_run` yourself.
+
 **Bind BEFORE you seed.** The opposite order — seed first, record after —
 protects against a ledger row with no session behind it. This one protects
 against a running worker with no binding, and that is the failure the worker can
@@ -220,8 +235,15 @@ pass the agent name to `session_create` yourself.
 ### Patrol
 
 After dispatching, arm a loop on your own session with `monitor_start`. Put the
-check AND the exit condition in the message and pass explicit positive
-`interval_secs`, `max_cycles` and `max_runtime_secs`. Take the runtime from the
+check AND the exit condition in the message, pass `watch="work-ledger"`, and
+pass explicit positive `interval_secs`, `max_cycles` and `max_runtime_secs`.
+`watch="work-ledger"` gates the loop on the ledger you dispatched into: a cycle
+where no worker reported anything costs no turn, and a worker's report, a worker
+session closing, or a worker turn ending pulls the next cycle forward to within
+seconds. The interval then only sets how often a silent fleet is re-checked, not
+how fast a report reaches you. A loop armed without it is a plain timer and pays
+a turn every interval, so if you find yours without it, add it with
+`monitor_update(watch="work-ledger")` rather than re-arming. Take the runtime from the
 operator's time budget, or 86,400 seconds when none is set. **The bounds come
 from the script, not from you:**
 
@@ -264,12 +286,15 @@ python3 <this skill's dir>/scripts/patrol_budget.py renew \
 
 Each cycle:
 
-1. **`work_ledger_read` first, every cycle.** It returns the conductor record,
-   every item with all its fields, each item's derived `orphaned`, `stale` and
-   `acceptance_concrete` flags, the newest events per item, and a ready-to-pipe
+1. **`work_ledger_read` with `compact=true` first, every cycle.** It returns the
+   conductor record and, per item, the status columns plus the derived
+   `orphaned`, `stale` and `acceptance_concrete` flags — no events, acceptance or
    `accept_batch`. This one read replaces the whole transcript-reading cycle, and
-   it is O(record) — which is why this loop's cost does not grow with its own
-   history. An item is never `stale` on the strength of silence alone: its worker
+   it stays small however many items the board holds. The full read (no
+   `compact`) adds every field, the newest events and a ready-to-pipe
+   `accept_batch`; take it, or `item_id=<id>` for one item, only when a `done`
+   item needs its bar (step 3). A full read too large for the tool-result limit
+   comes back trimmed with `truncated: true` and says what it left out. An item is never `stale` on the strength of silence alone: its worker
    also has to be not running, and its last word has to have left the next move
    with the worker, so a `done` item waiting on you is not flagged.
 2. **Act on three statuses, and only three:**
@@ -285,7 +310,7 @@ Each cycle:
    values, and why you must not treat one as the other.
 3. **Verify every `done` with the evaluator — never by reading the child's
    transcript and judging, and never by believing the claim.** Take the
-   `accept_batch` that `work_ledger_read` already built, **keep only the entries
+   `accept_batch` from a full `work_ledger_read` (no `compact`), **keep only the entries
    whose item is currently `status: done`** — each entry carries that status, so
    the filter is a read of the document you already have — and pipe that filtered
    document through a **quoted heredoc**:
@@ -496,12 +521,6 @@ what the composer renders:
 
 ## Known limits of this version
 
-- **The patrol loop is on a timer, not on the ledger.** `monitor_start` gates on
-  a single pull-request URL and nothing else today, so a cycle fires whether or
-  not anything was reported. When it accepts a `watch: "work-ledger"` field,
-  arm that instead and the quiet cycles stop costing a turn. Until then, size
-  the interval for the report cadence you expect rather than for the latency you
-  want.
 - **A question card can be displaced by your own later turns.** `ask_question` posts a card into the dashboard transcript, and every patrol turn you take while it is outstanding can push it out of the user's view.
 - **The session and ledger tools may not be in your tool list yet.** With MCP
   Tool Search active their specs are deferred, so a first `session_create` fails

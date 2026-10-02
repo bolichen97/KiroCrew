@@ -204,6 +204,20 @@ export interface ChatState {
    *  generation replaces the floor instead of being ordered against it. */
   lastChunkGen: string | undefined
   _wsChunkedDuringFetch: boolean
+  /** Count of live frames reduced into the ACTIVE view (`applyActiveFrame`),
+   *  for the life of this tab. A thunk that awaits across several requests
+   *  samples it before and after, and declines to replace `messages` when it
+   *  moved: that is the one exact test for "a live chunk or row landed while I
+   *  was away", where any structural comparison of the array either misses an
+   *  in-place chunk on a non-tail row or trips on an unrelated nested write. */
+  liveFrameSeq: number
+  /** Per slot, the dispatch order (`refreshSeq`) of the newest `refreshSlot`
+   *  whose payload was applied. A refresh's payload describes the transcript as
+   *  of its own reads, and a walking one reads for several round trips, so two
+   *  overlapping refreshes can settle newest-first; the older one must then be
+   *  dropped rather than restore what the newer one already replaced (a variant
+   *  switch, a reconcile). Same rule `warmSlotCache` orders by with `warmSeq`. */
+  refreshAppliedSeq: Record<string, number>
   /** How many `chat_message` frames were dropped as redeliveries (see
    *  `isRedeliveredMessage`), across every slot, for the life of this tab.
    *
@@ -503,6 +517,8 @@ export const initialState: ChatState = {
   lastChunkSeq: undefined,
   lastChunkGen: undefined,
   _wsChunkedDuringFetch: false,
+  liveFrameSeq: 0,
+  refreshAppliedSeq: {},
   _redeliveredFramesDropped: 0,
   history: [],
   historyHasMore: false,

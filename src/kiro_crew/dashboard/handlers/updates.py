@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import functools
+import hmac
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 from kiro_crew.dashboard.state import DashboardState, chat_message_frame
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.gateway_restart import resolve_restart_launcher
 from kiro_crew.git_divergence import (
@@ -45,6 +47,7 @@ from kiro_crew.git_divergence import (
 )
 from kiro_crew.platform import feed_trust
 from kiro_crew.platform.update_capability import (
+    AUTO_EFFECT_UNKNOWN,
     CHECK_DEFERRED,
     CHECK_FAILED,
     CHECK_SUCCEEDED,
@@ -60,7 +63,9 @@ from kiro_crew.platform.update_capability import (
     MANAGED_BY_GIT,
     MODE_NONE,
     MODE_NOTIFY,
+    AutoUpdateEffect,
     UpdateCapability,
+    auto_update_effect,
     derive_capability,
 )
 from kiro_crew.platform.update_governance import (
@@ -150,6 +155,17 @@ _update_info: dict[str, object] = {
 _check_generation = 0
 
 _UPDATE_CHECK_INTERVAL = 43200  # 12 hours
+
+#: How long a derived ``auto_update_effect`` is served before the status surface
+#: re-derives it (off the loop). Install shape changes by hand (a branch switch,
+#: a policy edit), so five minutes is fresh enough while keeping the git probes
+#: it costs off every frame.
+_AUTO_EFFECT_TTL_SECS = 300.0
+#: (when derived, effect). ``None`` until the update loop's first derivation,
+#: which is also what arms the status path's re-derivation: a process that runs
+#: no update loop never shells out to git from its status frame.
+_auto_effect: tuple[float, str] | None = None
+_auto_effect_task: "asyncio.Task[None] | None" = None
 _last_update_check: float = 0.0
 
 #: The finite operation shared by concurrent manual checks and the automatic
@@ -333,6 +349,49 @@ def _downgrade_target_below_min_version(version: str, channel: str) -> bool:
     return target_below_floor and target_below_running
 
 
+def record_auto_update_effect(effect: AutoUpdateEffect) -> None:
+    """Serve *effect* on the status surface; the update loop records each one it acts on.
+
+    Also arms the status path's own re-derivation, so a branch switch or policy
+    edit shows within one TTL rather than at the loop's next cycle.
+    """
+    global _auto_effect
+    _auto_effect = (time.monotonic(), effect.effect)
+
+
+async def _refresh_auto_update_effect() -> None:
+    global _auto_effect
+    try:
+        effect = await asyncio.to_thread(auto_update_effect)
+    except Exception:
+        logger.debug("auto_update_effect could not be derived", exc_info=True)
+        # Stamp the attempt so a persistent failure is retried once per TTL,
+        # not on every frame; the last answer keeps being served.
+        if _auto_effect is not None:
+            _auto_effect = (time.monotonic(), _auto_effect[1])
+        return
+    record_auto_update_effect(effect)
+
+
+def _status_auto_update_effect() -> str:
+    """The last derived effect; re-derived off the loop once it is stale.
+
+    ``unknown`` only until the update loop's first derivation lands: deriving
+    runs git and reads policy, which the status frame must not wait on.
+    """
+    global _auto_effect_task
+    cached = _auto_effect
+    stale = cached is not None and time.monotonic() - cached[0] > _AUTO_EFFECT_TTL_SECS
+    if stale and (_auto_effect_task is None or _auto_effect_task.done()):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            _auto_effect_task = loop.create_task(_refresh_auto_update_effect())
+    return cached[1] if cached is not None else AUTO_EFFECT_UNKNOWN
+
+
 def status_update_fields() -> dict[str, object]:
     """The update fields ``/api/status`` and the WebSocket push both carry.
 
@@ -407,6 +466,13 @@ def status_update_fields() -> dict[str, object]:
         # gates its Update button on this, never on managed_by alone — that
         # value also covers bare source installs whose arm would 409.
         "update_can_arm": bool(_update_info.get("can_arm")),
+        # What an available update leads to here: ``install`` (with the
+        # auto-update switch on), ``notify`` (the switch cannot install on this
+        # install), ``mandatory`` (a policy floor installs it regardless), or
+        # ``unknown`` before the first derivation. The same derivation the
+        # gateway's update loop acts on, so the switch's label cannot promise
+        # what the loop will not do.
+        "update_auto_effect": _status_auto_update_effect(),
         # The RUNNING build's version folded for display (clean base on the
         # stable channel), so the About page's version chip can show `0.4.0`
         # instead of the promoted candidate's baked-in `0.4.0rc14` stamp.
@@ -1546,6 +1612,26 @@ async def _restart_gateway(
             await state.sessions.close_all()
         except Exception:
             logger.debug("Session cleanup before restart failed", exc_info=True)
+        # The broker this gateway spawned dies with it, the same as on a clean
+        # shutdown; an adopted daemon belongs to its own owner and is left alone,
+        # as ``GatewayManager.shutdown`` already does. The exec below does not run
+        # that shutdown, and the successor can only replace a survivor whose owner
+        # pid is its own (an exec that kept the pid) or gone. Through a launcher
+        # that runs the new gateway as a child, this pid lives on as its
+        # supervisor: the daemon's owner-liveness check keeps passing, and the
+        # successor refuses a broker "owned by another live gateway" for its whole
+        # lifetime. Sessions are closed, so nothing is mid-call. The stop is
+        # bounded: the daemon's own drain budget on SIGTERM, then a SIGKILL and
+        # a reap of its pooled backends if the drain does not finish.
+        # Wired by the orchestrator after dashboard init; absent means no broker.
+        stop_broker = getattr(state, "_mcp_gateway_stop", None)
+        if stop_broker is not None:
+            try:
+                await stop_broker()
+            except Exception:
+                # Past the point of no return: a broker that will not stop must
+                # not strand a gateway whose sessions are already closed.
+                logger.debug("MCP broker stop before restart failed", exc_info=True)
         sys.stdout.flush()
         sys.stderr.flush()
         # The safety-override record publishes on a worker thread (its callers sit
@@ -2419,6 +2505,64 @@ async def api_update_channel(request: web.Request) -> web.Response:
             ),
         }
     )
+
+
+async def api_update_revalidate(request: web.Request) -> web.Response:
+    """POST /api/update/revalidate — drop the cached verdict and re-check now.
+
+    A terminal ``kirocrew update`` on a git checkout moves the tree while THIS
+    gateway keeps running, so its cached ``_update_info`` verdict still describes
+    the pre-update HEAD. The About panel keeps showing "Update available" for a
+    checkout that is now current until the 12-hourly poll, a manual check, or a
+    restart. This endpoint lets the CLI reconcile the badge the moment the update
+    finishes.
+
+    It does MORE than the recompute ``GET /api/update/check`` already performs:
+    it first calls :func:`_invalidate_update_check`, which bumps the check
+    GENERATION. That is the load-bearing half — an update check ALREADY in flight
+    against the pre-update state (the 12-hourly coordinator, or a dashboard poll
+    that overlapped the update) cannot be cancelled, and without the generation
+    bump it finishes after the recompute and re-pins its stale verdict plus the
+    12-hourly clock. A bare re-check cannot close that race; the invalidation can.
+
+    Authenticated like the other CLI→gateway endpoints (``/api/token/local``,
+    ``/api/logout``): loopback origin plus the per-generation local secret in
+    ``X-Local-Secret``, compared in constant time. This is a CLI-only endpoint —
+    the dashboard panel reconciles through ``GET /api/update/check`` — so it does
+    NOT use the browser owner gate, whose identity the raw local-secret request
+    never carries.
+    """
+    if not is_loopback(request.remote or ""):
+        await _audit_update_event(
+            request, operation="update.revalidate", outcome="denied", resources="non-loopback"
+        )
+        return web.json_response({"error": "loopback only", "code": "loopback_only"}, status=403)
+    expected = request.app.get("local_secret", "")
+    provided = request.headers.get("X-Local-Secret", "")
+    # Compare as bytes: hmac.compare_digest raises TypeError on a str carrying a
+    # non-ASCII character, and this header is attacker-controllable on the
+    # tokenless bypass path, so a str compare would turn an auditable 403 into an
+    # unaudited 500. Encoding both sides makes a non-ASCII secret an ordinary
+    # constant-time mismatch instead.
+    if (
+        not expected
+        or not provided
+        or not hmac.compare_digest(str(expected).encode("utf-8"), provided.encode("utf-8"))
+    ):
+        await _audit_update_event(
+            request, operation="update.revalidate", outcome="denied", resources="invalid-secret"
+        )
+        return web.json_response({"error": "invalid secret", "code": "invalid_secret"}, status=403)
+
+    # A config read is disk I/O on a path the operator may have put on a network
+    # mount, so keep the reads off the event loop for the same reason the channel
+    # switch does.
+    channel = await asyncio.to_thread(_release_channel)
+    _invalidate_update_check(channel)
+    await _do_update_check()
+    await _audit_update_event(request, operation="update.revalidate", outcome="completed")
+    # The CLI reads only the HTTP status, so the body carries nothing more.
+    return web.json_response({"ok": True})
 
 
 async def api_gateway_restart(request: web.Request) -> web.Response:

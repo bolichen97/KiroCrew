@@ -44,12 +44,14 @@ from __future__ import annotations
 
 import fnmatch
 import ipaddress
+import logging
 import os
 import re
 import socket
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from typing import NamedTuple
 
 # fcntl/struct drive the Linux per-interface address sweep in
@@ -75,6 +77,14 @@ from .host_addresses import (  # noqa: F401  (parser re-imported as a test entry
     _linux_netlink_addresses,
     _parse_netlink_addr_dump,
     _windows_interface_addresses,
+)
+from .hosts_file import (  # noqa: F401  (re-bound here: the seam tests monkeypatch)
+    _decoded_chunks,
+    _hosts_content_digest,
+    _hosts_content_digest_enabled,
+    _HostsFileTooLarge,
+    _HostsFileUnreadable,
+    _parse_hosts_chunks,
 )
 from .inline_payload import (
     _INLINE_DYNAMIC_EXEC_RE,
@@ -121,6 +131,8 @@ from .shell_normalizer import (
     _xargs_here_string_rebuild,
 )
 from .vocabulary import _KILL_BY_NAME_PROGRAMS, _SELF_FILE_DELIVERY_VERBS, _SELF_NAME_RE
+
+logger = logging.getLogger(__name__)
 
 # ── Git publish detection (verb-anchored) ──
 # ``git push`` must be blocked, but ``push`` appearing anywhere in arbitrary
@@ -1406,68 +1418,307 @@ def _hosts_file_paths() -> "tuple[str, ...]":
 # falls through to the async DNS revalidation path, whose resolver reads the
 # real (untruncated) hosts database.
 _HOSTS_FILE_READ_CAP = 4 * 1024 * 1024
+# Characters read per chunk of that bounded read (GIL hold per chunk).  A
+# file no larger than one chunk is also small enough for the gate path to
+# parse in the same call on a miss: a typical file in well under a
+# millisecond, one at the cap in a few.
+_HOSTS_FILE_READ_CHUNK = 64 * 1024
 
 
-# path -> ((mtime, size, published), {name -> maps-to-local}) — reparsed when
-# the file changes or netlink publication flips.  Unlocked by design: a racing
-# double-parse writes the same value; the dict swap is atomic under the GIL.
-_HOSTS_FILE_CACHE: "dict[str, tuple[tuple[float, int, bool], dict[str, bool]]]" = {}
+# path -> (key, {name -> maps-to-local}), key = (mtime, ctime, size, content
+# digest or None, published, own set).  Background threads parse
+# (``_warm_hosts_file_cache``).  On a miss the gate path parses in the
+# same call only a file no larger than one read chunk; a larger file
+# answers pending and schedules one warm thread.
+# A changed file, publication or own-address set is a new key, so an own
+# address learned later re-marks an alias.  Two threads
+# (the enrichment worker and the on-demand warm) may parse at once without a
+# lock: each publishes a complete table in one dict assignment, and only for
+# the key it was judged by, so the worst case is a duplicated parse (last
+# write wins), never a half-built or stale table.
+_HostsKey = tuple[float, float, int, "bytes | None", bool, frozenset[str]]
+_HOSTS_FILE_CACHE: "dict[str, tuple[_HostsKey, dict[str, bool]]]" = {}
+# Single-flight latch for the on-demand warm the gate path schedules.
+_HOSTS_WARM_LOCK = threading.Lock()
+_HOSTS_WARM_IN_FLIGHT = False
 
 
-def _hosts_file_verdict(host: str) -> "bool | None":
-    """Hosts-file verdict: True local, False remote, None absent/deferred.
+def _read_hosts_bytes(path: str, limit: int, *, strict: bool) -> bytes:
+    """At most *limit* bytes of *path*, read one chunk at a time.
 
-    This is the round-18 attack vector itself — a hosts-file alias for a
-    loopback/local address — answered by a LOCAL file read: no DNS, no
-    resolver thread, no event-loop concern, and a same-call verdict where
-    the async layer can only fail closed or revalidate later.  A name on
-    several lines is local if ANY of them maps local (deny-floor direction).
+    *strict* raises ``_HostsFileTooLarge`` when the file holds more than
+    *limit* (the gate's in-call cap); otherwise the read stops at *limit*,
+    the truncation described at ``_HOSTS_FILE_READ_CAP``.
+    """
+    parts: "list[bytes]" = []
+    remaining = limit
+    with open(path, "rb") as fh:
+        while remaining > 0:
+            chunk = fh.read(min(_HOSTS_FILE_READ_CHUNK, remaining))
+            if not chunk:
+                break
+            parts.append(chunk)
+            remaining -= len(chunk)
+        if strict and remaining <= 0 and fh.read(1):
+            raise _HostsFileTooLarge(path)
+    return b"".join(parts)
+
+
+def _hosts_file_key(path: str) -> "_HostsKey":
+    """Cache key for *path*: stat identity, content digest, and the own-address state.
+
+    A same-size rewrite that restores mtime must still be a new key.  On
+    POSIX ``st_ctime`` catches it: any write or chmod sets ctime, and no
+    extra read is done (the digest field is None).  On Windows
+    ``st_ctime`` is creation time and catches nothing, so for a file no
+    larger than one read chunk the key also carries a blake2b digest of
+    that file, from one read bounded by the chunk size; a read that fails
+    or finds more than a chunk raises ``_HostsFileUnreadable``.  A Windows
+    file over one chunk keeps digest None and is never cached or served:
+    its content cannot be verified without a gate read past the chunk, so
+    ``_hosts_file_verdict`` answers every dotless name pending.  The last
+    two fields are the publication flag and the own set.
+    """
+    stat = os.stat(path)
+    digest: "bytes | None" = None
+    if _hosts_content_digest_enabled() and stat.st_size <= _HOSTS_FILE_READ_CHUNK:
+        try:
+            data = _read_hosts_bytes(path, _HOSTS_FILE_READ_CHUNK, strict=True)
+        except (OSError, _HostsFileTooLarge) as exc:
+            raise _HostsFileUnreadable(path) from exc
+        digest = _hosts_content_digest(data)
+    return (
+        stat.st_mtime,
+        stat.st_ctime,
+        stat.st_size,
+        digest,
+        _NETLINK_ADDRS_PUBLISHED,
+        _own_host_names(),
+    )
+
+
+def _parse_hosts_file(
+    path: str,
+    own: "frozenset[str]",
+    limit: "int | None" = None,
+    content: "bytes | None" = None,
+) -> "dict[str, bool]":
+    """``{name -> maps-to-local}`` for *path*, judged against the own set *own*.
+
+    *limit* bounds the read itself, in bytes: the gate passes it so a file
+    replaced by a larger one after its stat is never read past the in-call
+    cap on the event loop, and raises ``_HostsFileTooLarge`` instead.
+    *content*, when given, is parsed instead of reading *path*: the bytes
+    already read and hashed for a digest key, so the table is built from
+    exactly the content its key names.
+    """
+    if content is None and limit is not None:
+        content = _read_hosts_bytes(path, limit, strict=True)
+    if content is not None:
+        return _parse_hosts_chunks(_decoded_chunks(content, _HOSTS_FILE_READ_CHUNK), own)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        # Bounded read (the repo-wide handle-iteration guard, and a real
+        # cap): see _HOSTS_FILE_READ_CAP for the overflow degradation path.
+        # Read in chunks; see _parse_hosts_chunks for why and how edges join.
+        def _read_chunks() -> "Iterator[str]":
+            remaining = _HOSTS_FILE_READ_CAP
+            while remaining > 0:
+                chunk = fh.read(min(_HOSTS_FILE_READ_CHUNK, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+                yield chunk
+
+        return _parse_hosts_chunks(_read_chunks(), own)
+
+
+def _parse_and_cache_for_key(
+    path: str,
+    key: "_HostsKey",
+    limit: "int | None" = None,
+) -> "dict[str, bool] | str":
+    """Parse *path* against *key*'s own set; cache and return it if *key* still holds.
+
+    Callers must first rule the key verifiable (``_unverifiable_hosts_file``):
+    a Windows key for a file over one chunk carries no digest and is never
+    parsed or cached here.
+
+    Returns the table, or a status string when nothing was cached:
+    ``"changed"`` when the key moved mid-parse (the enrichment worker can
+    publish the address table or grow the own set, and a table built across
+    that change could mark an alias for the new address remote),
+    ``"too-large"`` when the file holds more than *limit*, and ``"failed"``
+    when it could not be read or decoded.  A failed parse is never cached,
+    so the next gate call reads again; the gate answers it pending (fail
+    closed), since a hosts-file alias for this machine cannot be ruled out
+    while the file cannot be read.  May raise OSError from the second stat.
+
+    When *key* carries a digest (Windows), the bytes are read once, hashed,
+    and parsed from that same buffer, so the digest names exactly the
+    content the table came from; a digest that differs from *key*'s is
+    ``"changed"``.
+    """
+    try:
+        if key[3] is not None:
+            cap = _HOSTS_FILE_READ_CAP if limit is None else limit
+            data = _read_hosts_bytes(path, cap, strict=limit is not None)
+            if _hosts_content_digest(data) != key[3]:
+                return "changed"
+            table = _parse_hosts_file(path, key[-1], limit=limit, content=data)
+        else:
+            table = _parse_hosts_file(path, key[-1], limit=limit)
+    except _HostsFileTooLarge:
+        return "too-large"
+    except (OSError, ValueError):
+        return "failed"
+    try:
+        if _hosts_file_key(path) != key:
+            return "changed"
+    except _HostsFileUnreadable:
+        return "changed"
+    _HOSTS_FILE_CACHE[path] = (key, table)
+    return table
+
+
+def _unverifiable_hosts_file(key: "_HostsKey") -> bool:
+    """True for a Windows file over one chunk: no digest, so its content cannot be checked."""
+    return key[3] is None and _hosts_content_digest_enabled()
+
+
+def _warm_hosts_file_cache() -> None:
+    """Parse the hosts file(s) for the current key, off the gate path.
+
+    One parse per path per call (``_parse_and_cache_for_key``).  A changed
+    key caches nothing; the gate keeps answering pending for a file over the
+    in-call cap, and the next pass, or the next gate miss, retries.  An
+    up-to-date table costs a stat and an own-set read (plus, on Windows, a
+    bounded read and hash).  A Windows file over one chunk is skipped: the
+    gate never serves its table.  Best-effort.
     """
     for path in _hosts_file_paths():
         try:
-            stat = os.stat(path)
-            key = (stat.st_mtime, stat.st_size, _NETLINK_ADDRS_PUBLISHED)
+            key = _hosts_file_key(path)
+            if _unverifiable_hosts_file(key):
+                continue
             cached = _HOSTS_FILE_CACHE.get(path)
-            if cached is None or cached[0] != key:
-                table: "dict[str, bool]" = {}
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    # Bounded read (the repo-wide handle-iteration guard, and
-                    # a real cap): see _HOSTS_FILE_READ_CAP for the overflow
-                    # degradation path.
-                    for line in fh.read(_HOSTS_FILE_READ_CAP).splitlines():
-                        fields = line.partition("#")[0].split()
-                        if len(fields) < 2:
-                            continue
-                        addr = fields[0].split("%", 1)[0]
-                        try:
-                            ip: ipaddress.IPv4Address | ipaddress.IPv6Address = (
-                                ipaddress.ip_address(addr)
-                            )
-                        except ValueError:
-                            continue
-                        mapped = getattr(ip, "ipv4_mapped", None)
-                        if mapped is not None:
-                            ip = mapped
-                        local = (
-                            ip.is_loopback
-                            or ip.is_unspecified
-                            or str(ip).lower() in _own_host_names()
-                        )
-                        for name in fields[1:]:
-                            lowered = name.lower()
-                            table[lowered] = table.get(lowered, False) or local
-                cached = (key, table)
-                _HOSTS_FILE_CACHE[path] = cached
-            verdict = cached[1].get(host)
-            if verdict is False and not _NETLINK_ADDRS_PUBLISHED:
-                # Not-local is untrustworthy while the own-address set
-                # is incomplete: defer to the async verdict layer.
-                verdict = None
-            if verdict is not None:
-                return verdict
+            if cached is not None and cached[0] == key:
+                continue
+            _parse_and_cache_for_key(path, key)
+        except Exception:
+            continue
+
+
+def _hosts_file_warm_worker() -> None:
+    """Thread body for the on-demand warm; clears the single-flight latch."""
+    global _HOSTS_WARM_IN_FLIGHT
+    try:
+        _warm_hosts_file_cache()
+    finally:
+        with _HOSTS_WARM_LOCK:
+            _HOSTS_WARM_IN_FLIGHT = False
+
+
+def _schedule_hosts_file_warm() -> None:
+    """Start one background warm unless one is already running.  Never blocks."""
+    global _HOSTS_WARM_IN_FLIGHT
+    with _HOSTS_WARM_LOCK:
+        if _HOSTS_WARM_IN_FLIGHT:
+            return
+        _HOSTS_WARM_IN_FLIGHT = True
+    try:
+        threading.Thread(
+            target=_hosts_file_warm_worker, name="kirocrew-hosts-warm", daemon=True
+        ).start()
+    except Exception:
+        # A thread that cannot start leaves the latch clear so a later
+        # check retries; this check still answers pending (deny).
+        with _HOSTS_WARM_LOCK:
+            _HOSTS_WARM_IN_FLIGHT = False
+
+
+def _hosts_file_verdict(host: str) -> "bool | None":
+    """Hosts-file verdict: True local or pending, False remote, None absent/deferred.
+
+    This is the round-18 attack vector itself — a hosts-file alias for a
+    loopback/local address — answered from the table cached for the file's
+    current key.  Per call the gate stats each file (on Windows, also one
+    bounded read and hash of a file no larger than one chunk; a miss adds
+    two more, for the parse and its key re-check) and reads the
+    own-address set (twice when a remote entry is served: once for the
+    key, once to confirm it at return; each read is one lock round-trip
+    while enrichment is incomplete or due a refresh).  When a path has no
+    table for its current key (first check after start, file edited, own
+    addresses changed), a file no larger than one read chunk is parsed in
+    this call, so a cold dotless target still gets a
+    same-call verdict; that read is itself bounded by the chunk size, so a
+    file replaced by a larger one after the stat stops at the cap and is
+    pending.  A read that fails caches nothing and is pending too (fail
+    closed, where main allowed): the next call reads again, inline for a
+    small file and by re-scheduling the warm for a large one, so the
+    refusal lasts only while the file cannot be read.  A larger file is
+    not parsed here: the answer is True, a pending refusal, checked before
+    any path's verdict is used, and one single-flight warm thread is
+    started; the same command succeeds once the warm lands.
+
+    A same-size rewrite that restores mtime is a new key: on POSIX through
+    ``st_ctime``, with no extra read; on Windows, where ``st_ctime`` is
+    creation time, through a content digest taken on every call from one
+    read bounded by the chunk size, for a file no larger than one chunk.
+    A Windows file over one chunk cannot be verified without reading past
+    that bound, so every dotless name is pending there (True), with no
+    stale window; the refusal note tells the agent to use the full
+    hostname or an IP address.  An in-call parse whose key changed
+    while it ran is also pending.  A remote answer is given
+    only if publication and the own set still match the table's key at the
+    moment of return.  A name on several lines is local if ANY of them maps
+    local (deny-floor direction).
+    """
+    tables: "list[tuple[_HostsKey, dict[str, bool]]]" = []
+    for path in _hosts_file_paths():
+        try:
+            key = _hosts_file_key(path)
+        except _HostsFileUnreadable:
+            _schedule_hosts_file_warm()
+            return True
         except OSError:
             continue
-    return None
+        if _unverifiable_hosts_file(key):
+            return True
+        cached = _HOSTS_FILE_CACHE.get(path)
+        if cached is None or cached[0] != key:
+            if key[2] > _HOSTS_FILE_READ_CHUNK:
+                # Every call on an uncached key re-schedules the warm, so a
+                # retry does not hang on one thread that failed to start.
+                _schedule_hosts_file_warm()
+                return True
+            try:
+                result = _parse_and_cache_for_key(path, key, limit=_HOSTS_FILE_READ_CHUNK)
+            except OSError:
+                result = "changed"
+            if isinstance(result, str):
+                _schedule_hosts_file_warm()
+                return True
+            cached = (key, result)
+        tables.append(cached)
+    remote = []
+    for key, table in tables:
+        verdict = table.get(host)
+        if verdict is True:
+            return True
+        if verdict is False:
+            remote.append(key)
+    if not remote:
+        return None
+    # The worker may have published or grown the own set since the key was
+    # read; a not-local entry judged by the older state is not served.
+    own_state = (_NETLINK_ADDRS_PUBLISHED, _own_host_names())
+    if any((key[-2], key[-1]) != own_state for key in remote):
+        _schedule_hosts_file_warm()
+        return True
+    # Not-local counts only when judged after publication; while the
+    # own-address set is incomplete it defers to the async verdict layer.
+    # (Every remote key's publication bit equals own_state[0] here.)
+    return False if own_state[0] else None
 
 
 def _resolved_host_verdict(host: str, *, fail_closed: bool = True) -> bool:
@@ -1822,6 +2073,52 @@ _NETLINK_ADDRS_PUBLISHED: bool = not (
 )
 
 
+def warm_own_host_names() -> None:
+    """Start the own-address enrichment worker now instead of at the first ssh.
+
+    Without it the first IP-literal ssh check of a process is what starts the
+    worker, and that check sees the still-unpublished flag in the same instant,
+    so it is always refused.  The worker reads the netlink table before any DNS
+    lookup and publishes it at once.  This only runs the synchronous seed and
+    schedules the worker; the gateway startup hook calls it through
+    ``asyncio.to_thread`` so the seed stays off the event loop.
+    """
+    _own_host_names()
+
+
+def _publish_netlink_addresses(addrs: "set[str]") -> None:
+    """Merge the netlink table into the own-name cache, THEN open the window.
+
+    The order is load-bearing: flipping ``_NETLINK_ADDRS_PUBLISHED`` before
+    the addresses are in the cache would let a concurrent check see the
+    window open while an own secondary IP is still missing from the set,
+    and admit it.
+    """
+    global _OWN_HOST_NAMES_CACHE, _NETLINK_ADDRS_PUBLISHED
+    with _OWN_HOST_RESOLVE_LOCK:
+        base = _OWN_HOST_NAMES_CACHE if _OWN_HOST_NAMES_CACHE is not None else _own_host_seed()
+        _OWN_HOST_NAMES_CACHE = base | frozenset(a for a in addrs if a)
+        _NETLINK_ADDRS_PUBLISHED = True
+
+
+# Consecutive worker passes whose netlink dump did not complete.  A host
+# where every dump fails keeps IP-literal ssh refused for good, so the third
+# miss in a row logs one warning an operator can find.
+_NETLINK_MISSES = 0
+_NETLINK_MISS_WARN_AT = 3
+
+
+def _note_netlink_result(ok: bool) -> None:
+    global _NETLINK_MISSES
+    _NETLINK_MISSES = 0 if ok else _NETLINK_MISSES + 1
+    if _NETLINK_MISSES == _NETLINK_MISS_WARN_AT:
+        logger.warning(
+            "own-address netlink read has not completed in %d attempts; ssh/scp/sftp/rsync "
+            "to IP-literal targets stays refused until it does",
+            _NETLINK_MISSES,
+        )
+
+
 def _resolve_own_host_names() -> "tuple[frozenset[str], bool]":
     """Resolve this machine's own hostname/FQDN/addresses (lowered).
 
@@ -1835,6 +2132,30 @@ def _resolve_own_host_names() -> "tuple[frozenset[str], bool]":
     """
     names: set[str] = set(_own_host_seed())
     complete = True
+    # The netlink RTM_GETADDR dump lists EVERY assigned address (secondary
+    # IPv4s the SIOCGIFADDR sweep cannot see).  Its recv blocks, so it lives
+    # here in the worker.  Unlike the sweeps below it is LOAD-BEARING: the
+    # IP-literal window stays closed until it publishes, so an empty pass on
+    # a netlink-capable host keeps ``complete`` False and the backoff retry
+    # alive rather than caching a table-less process for its lifetime.
+    #
+    # It runs FIRST and publishes at once: it is a kernel-local read, while
+    # the DNS lookups below can take many seconds on a host whose name is not
+    # in DNS, and every IP-literal ssh is refused until this publishes.
+    nl = _linux_netlink_addresses()
+    if nl:
+        _note_netlink_result(True)
+        names |= nl
+        _publish_netlink_addresses(nl)
+    elif sys.platform.startswith("linux") and hasattr(socket, "AF_NETLINK"):
+        complete = False
+        _note_netlink_result(False)
+    # Parse the hosts file now, before the DNS lookups below (which can take
+    # seconds), with or without a netlink dump: until a table is cached a
+    # dotless ssh target is parsed for in the gate call (small file) or
+    # refused as pending (large file).  The pass re-warms after the
+    # DNS merge, which re-parses only if DNS added an own address.
+    _warm_hosts_file_cache()
     try:
         fqdn = socket.getfqdn().strip().lower()
         if fqdn and fqdn != "localhost":
@@ -1860,19 +2181,6 @@ def _resolve_own_host_names() -> "tuple[frozenset[str], bool]":
     # enrichment, and a host with no IPv6 route is not a partial pass -- so this
     # never touches ``complete`` (and the helper is best-effort, never raising).
     names |= _own_interface_addresses()
-    # The netlink RTM_GETADDR dump lists EVERY assigned address (secondary
-    # IPv4s the SIOCGIFADDR sweep cannot see).  Its recv blocks, so it lives
-    # here in the worker.  Unlike the sweeps above it is LOAD-BEARING: the
-    # IP-literal window stays closed until it publishes, so an empty pass on
-    # a netlink-capable host keeps ``complete`` False and the backoff retry
-    # alive rather than caching a table-less process for its lifetime.
-    global _NETLINK_ADDRS_PUBLISHED
-    nl = _linux_netlink_addresses()
-    if nl:
-        names |= nl
-        _NETLINK_ADDRS_PUBLISHED = True
-    elif sys.platform.startswith("linux") and hasattr(socket, "AF_NETLINK"):
-        complete = False
     return frozenset(n for n in names if n), complete
 
 
@@ -1893,11 +2201,19 @@ def _resolve_own_host_names_into_cache() -> None:
     try:
         resolved, complete = _resolve_own_host_names()
         if resolved:
-            existing = _OWN_HOST_NAMES_CACHE or frozenset()
-            _OWN_HOST_NAMES_CACHE = existing | resolved
+            # Under the lock: ``_publish_netlink_addresses`` merges into the
+            # same cache mid-pass, and an unlocked read-modify-write here
+            # could drop its addresses after the window already opened.
+            with _OWN_HOST_RESOLVE_LOCK:
+                existing = _OWN_HOST_NAMES_CACHE or frozenset()
+                _OWN_HOST_NAMES_CACHE = existing | resolved
         if complete:
             _OWN_HOST_RESOLVE_DONE = True
             _OWN_HOST_RESOLVE_STAMP = time.monotonic()
+        # Re-warm after the DNS-derived own addresses are merged, and on every
+        # refresh pass: a grown own set re-parses, an unchanged one costs a
+        # stat and an own-set read.
+        _warm_hosts_file_cache()
     finally:
         with _OWN_HOST_RESOLVE_LOCK:
             _OWN_HOST_RESOLVE_IN_FLIGHT = False
@@ -1982,9 +2298,13 @@ def _host_is_self(host: str, *, dns_fallback: bool = True) -> bool:
             ip = mapped
         if ip.is_loopback or ip.is_unspecified:
             return True
+        # Read the window flag BEFORE the names: the publisher stores the
+        # addresses and then sets the flag under one lock, so a True flag seen
+        # first guarantees the names read next already hold the netlink table.
+        published = _NETLINK_ADDRS_PUBLISHED
         if str(ip).lower() in _own_host_names():
             return True
-        if dns_fallback and not _NETLINK_ADDRS_PUBLISHED:
+        if dns_fallback and not published:
             # Same unread-table window as the ``inet_aton`` branch below --
             # this branch is the one IPv6 literals take (round-33).
             return True
@@ -1995,9 +2315,10 @@ def _host_is_self(host: str, *, dns_fallback: bool = True) -> bool:
         ip4 = ipaddress.IPv4Address(packed)
         if ip4.is_loopback or ip4.is_unspecified:
             return True
+        published = _NETLINK_ADDRS_PUBLISHED
         if str(ip4) in _own_host_names():
             return True
-        if dns_fallback and not _NETLINK_ADDRS_PUBLISHED:
+        if dns_fallback and not published:
             # The kernel address table is unread; this literal could be an
             # unlisted secondary of this machine.  Deny until the worker
             # publishes (round-33) -- host position only.
@@ -2013,8 +2334,9 @@ def _host_is_self(host: str, *, dns_fallback: bool = True) -> bool:
     if dns_fallback and _DNS_CANDIDATE_RE.fullmatch(host) is not None:
         if "." not in host:
             # round-21: a DOTLESS name is the hosts-file alias class the
-            # round-18 finding named -- and the hosts file is a local read
-            # that answers that vector SAME-CALL.  Absent an entry, answer
+            # round-18 finding named -- and the hosts table answers that
+            # vector SAME-CALL (a file over one read chunk is pending, i.e.
+            # refused, until a background parse for the current key lands).  Absent an entry, answer
             # OPEN while one async worker revalidates through DNS: the
             # fail-closed first contact broke the everyday ``ssh dev-dsk``
             # shape (CI allow pin), and a dotless loopback alias that lives

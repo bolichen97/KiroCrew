@@ -405,6 +405,26 @@ class LLMProvider(ABC):
         """
         return ""
 
+    @property
+    def model_pin_refused(self) -> str:
+        """The pinned model the backend refused at session start, or ``""``.
+
+        A refusal on a non-strict model push leaves the session on the backend
+        default without raising, so this is how a caller billing or labelling a
+        turn by the pin learns the pin never ran. Default: ``""``, no refusal.
+        """
+        return ""
+
+    @property
+    def model_pin_partial(self) -> str:
+        """The bare model a ``<model>[<effort>]`` pin landed as, or ``""``.
+
+        Set when the model half of a pair pin applied and the effort half did
+        not: the session runs this bare model, not the pin and not the default.
+        Default: ``""``, no partial application.
+        """
+        return ""
+
     def touch_activity(self) -> None:
         """Refresh the RUNTIME's activity timestamp without I/O. Default no-op.
 
@@ -493,6 +513,13 @@ class LLMProvider(ABC):
         """True if a native turn has not reached its done boundary, independent
         of cancel state (drives the shutdown drain). Default False."""
         return False
+
+    def background_launch(self) -> tuple[float, str] | None:
+        """``(seconds since, description)`` of the newest work this session's
+        harness launched to run on after the prompt returned (a backgrounded
+        command, a Workflow), or ``None``. Read by the session watchdog, which
+        cannot otherwise see that work. Default ``None``: nothing launched."""
+        return None
 
     async def wait_turn_done(self, timeout: float) -> str:
         """Wait for the current native turn's done boundary and return its stop

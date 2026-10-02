@@ -23,12 +23,15 @@ from typing import Any
 
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_NO_BUDGET,
+    DENY_CAUSE_APPROVAL_OVERSIZE,
     DENY_CAUSE_APPROVAL_TIMEOUT,
     DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+    DENY_CAUSE_AUDIT_UNAVAILABLE,
     DENY_CAUSE_BATCH_CASCADE,
     DENY_CAUSE_HOOK_ERROR,
     DENY_CAUSE_INVALID_NAME,
     DENY_CAUSE_POLICY,
+    DENY_CAUSE_SURFACE_POLICY,
     STEER_NOTICE_BOUND_SECS,
 )
 from kiro_crew.deny_guidance import remediation_for
@@ -54,6 +57,15 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "use an allowed alternative (for a shell command, a read-only variant), use "
         "a different tool, or — if the block is correct and you genuinely cannot "
         "proceed — say so and stop with the reason.",
+    ),
+    DENY_CAUSE_SURFACE_POLICY: (
+        "was refused by the tool policy of the surface this turn runs on, not by a "
+        "safety rule about the call itself",
+        "the reason above says what this surface permits -- nothing at all, or only "
+        "calls provably read-only. Nothing about the action was judged, so do not "
+        "look for a sanctioned form of it here: continue with what you can do "
+        "without the tool, and if you genuinely cannot, say so and stop with the "
+        "reason.",
     ),
     DENY_CAUSE_INVALID_NAME: (
         "was refused because its tool name failed validation",
@@ -99,6 +111,23 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "delivery failed, so the action itself was never judged — do not "
         "abandon it or route around it on this evidence. State the permission "
         "you need and why, then continue with what you can do without it.",
+    ),
+    DENY_CAUSE_APPROVAL_OVERSIZE: (
+        "was auto-declined because its approval card was too long for this "
+        "channel to show in full",
+        "a reader who cannot see the whole request cannot approve it, so the "
+        "action itself was never judged — do not abandon it or route around it "
+        "on this evidence. The reason above gives the limit: split the request "
+        "into shorter steps that each fit it and reissue them one at a time; if "
+        "it cannot be split, say so and stop with the reason.",
+    ),
+    DENY_CAUSE_AUDIT_UNAVAILABLE: (
+        "was refused because the host could not write the audit record its "
+        "unattended approval requires",
+        "treat this as a host fault, not a verdict on the action: nothing judged "
+        "the call itself, and the surface refused it rather than run it "
+        "unrecorded. Retrying the identical call is reasonable once; if it is "
+        "refused again, say what happened rather than working around it silently.",
     ),
 }
 
@@ -149,8 +178,9 @@ def build_refusal_steer_notice(
     # Class-specific remediation, for the policy cause only. The non-policy
     # causes judged nothing about the action — an invalid tool name is the
     # model's own malformed output, a hook fault is a host fault, a cascaded
-    # batch member was never reached, and an expired approval prompt was simply
-    # never answered — so naming a sanctioned alternative there would answer a
+    # batch member was never reached, an expired approval prompt was simply
+    # never answered, and a surface-policy refusal says only what the surface
+    # permits — so naming a sanctioned alternative there would answer a
     # question nobody asked and imply the action itself had been refused.
     remediation = (
         remediation_for(reason, title, credential_tool_hint=credential_tool_hint)

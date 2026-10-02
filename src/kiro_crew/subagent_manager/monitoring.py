@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from ..subagent import (
         _CLK_TCK,
         _REAPER_INTERVAL,
-        _SAMPLE_MAX_AGE_SECS,
         _SUPPRESS_CEILING,
         OUTCOME_FAILED,
         OUTCOME_INTERRUPTED,
@@ -46,7 +45,6 @@ if TYPE_CHECKING:
         cap_buckets,
         compact_cost_log,
         consult_offloaded,
-        cost_log_identity,
         has_dashboard_surface,
         list_orphans,
         logger,
@@ -487,30 +485,32 @@ class OrphanStallMonitor(ManagerComponent):
                                     else None
                                 )
                             try:
+                                # Never ``killed`` for a process the kill
+                                # left standing: the folder is reconciled
+                                # below either way, so this row is the only
+                                # place the process's fate is recorded. A
+                                # refusal and a failed signal are separate
+                                # outcomes because only one of them means
+                                # something tried and could not.
+                                #
+                                # TWO ways to be refused, and both must read as
+                                # one: the gate declining, and the teardown
+                                # barrier declining because a tenant arrived
+                                # after it allowed. The second leaves
+                                # ``kill_failed`` None -- no signal was even
+                                # attempted -- which is indistinguishable from a
+                                # clean kill by that field alone.
+                                if not authorized or not barriered:
+                                    outcome = "refused"
+                                elif kill_failed is None:
+                                    outcome = "killed"
+                                else:
+                                    outcome = "failed"
                                 sel().log_tool_invocation(
                                     session_key=f"subagent:{agent_id}",
                                     source="subagent",
                                     tool_name="orphan_reconcile_kill",
-                                    # Never ``killed`` for a process the kill
-                                    # left standing: the folder is reconciled
-                                    # below either way, so this row is the only
-                                    # place the process's fate is recorded. A
-                                    # refusal and a failed signal are separate
-                                    # outcomes because only one of them means
-                                    # something tried and could not.
-                                    #
-                                    # TWO ways to be refused, and both must read as
-                                    # one: the gate declining, and the teardown
-                                    # barrier declining because a tenant arrived
-                                    # after it allowed. The second leaves
-                                    # ``kill_failed`` None -- no signal was even
-                                    # attempted -- which is indistinguishable from a
-                                    # clean kill by that field alone.
-                                    outcome=(
-                                        "refused"
-                                        if not authorized or not barriered
-                                        else ("killed" if kill_failed is None else "failed")
-                                    ),
+                                    outcome=outcome,
                                     error=kill_failed or "",
                                     metadata={"subagent_id": agent_id, "pid": pid},
                                 )
@@ -780,6 +780,10 @@ class OrphanStallMonitor(ManagerComponent):
         """
         now = time.monotonic()
         agents = list(self._manager._agents.values())
+        # Sessions that shared children run on, by their parent's session key: a
+        # dedicated run that is one of these carries its children's sessions --
+        # and their per-session MCP servers -- in its own process tree.
+        hosting = {a.parent_session_key for a in agents if not a.done and a._session_sharing}
         for info in agents:
             if info.done or not info._pid:
                 continue
@@ -797,7 +801,34 @@ class OrphanStallMonitor(ManagerComponent):
                 self._manager._live_shared_count(info._pid, agents) if info._session_sharing else 1
             )
             generation = info._rss_generation
-            sample = _proc_subtree_sample(info._pid)
+            # Settled-runtime reading (dynamic-subagent-sizing.md §4.1): the first
+            # quiet sample of a DEDICATED process once its own session has
+            # answered (``_first_stream_started``), with no tool in flight before
+            # the read, none after it, and no activity during it (``_stall_gen``
+            # unchanged; snapshot BEFORE the off-loop read, so a tool that started
+            # or came and went during it voids the reading). That subtree is the
+            # runtime itself -- kiro-cli and the MCP servers up at that moment --
+            # not the builds or tests a tool launches, which is what
+            # ``peak_rss_gb`` follows. Never a shared run (its pid's tree holds the
+            # other tenants and the parent's own tools) nor a dedicated run whose
+            # own children share its runtime (its tree holds theirs). Read in PSS
+            # from the same walk, the unit the unlearned price is measured in:
+            # summed RSS counts pages a tree of processes shares once per process.
+            # Keyed on the LOCAL generation the recheck below proves current, so a
+            # respawn re-captures for its fresh process and a reading of the dead
+            # one is never stamped as the new one's. ``_inflight_tool`` holds one
+            # tool, so a second overlapping tool still running can pass; that
+            # over-counts, which errs toward reserving more.
+            tool_before = info._inflight_tool
+            stall_before = info._stall_gen
+            want_settled = (
+                not info._session_sharing
+                and info._settled_rss_generation != generation
+                and info._first_stream_started is not None
+                and tool_before is None
+                and (info.conversation_key or f"subagent:{info.id}") not in hosting
+            )
+            sample = _proc_subtree_sample(info._pid, **({"pss": True} if want_settled else {}))
             if info._rss_generation != generation:
                 # The run was respawned while this off-loop read was in flight:
                 # the reading describes the dead process and must not settle
@@ -809,6 +840,9 @@ class OrphanStallMonitor(ManagerComponent):
                 info._rss_samples += 1
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
+                if want_settled and info._inflight_tool is None and info._stall_gen == stall_before:
+                    info.settled_rss_gb = sample.pss_kb / (1024 * 1024) if sample.pss_kb > 0 else gb
+                    info._settled_rss_generation = generation
             info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
             info.last_stubs = _attributed_count(sample.matched, shared_n, info.last_stubs)
             jiffies = sample.jiffies
@@ -821,86 +855,6 @@ class OrphanStallMonitor(ManagerComponent):
                         info.peak_cpu_cores = cores
             info._cpu_jiffies_prev = jiffies
             info._cpu_sample_ts = now
-        # Same off-loop sweep, same store the samples above feed: publish the
-        # learned p90 the spawn guard prices an unmeasured start at. A plain
-        # attribute write of one float, read by the gate on the loop; the file
-        # itself is never opened there.
-        self._refresh_learned_cost_impl()
-
-    def _refresh_learned_cost_impl(self) -> None:
-        """Re-read the learned per-run memory p90 onto the manager. BLOCKING, off-loop.
-
-        The cost log is agent-writable and tiny (FIFO-trimmed to 50 records per
-        agent), but it is still a whole-file parse, so it runs on the maintenance
-        executor -- here and once at reaper start -- and the gate reads
-        ``_learned_costs_gb`` as arithmetic.
-
-        Three outcomes. An ABSENT log (first boot, or the operator's documented
-        reset: delete ``subagents/cost_samples.jsonl``) clears the map. A
-        COMPLETE read of a present, inspectable log REPLACES it -- the whole log
-        was parsed, so a bucket it does not yield has expired past the age
-        horizon or fallen below ``min_samples`` and its price retires on this
-        running process; a log that was replaced (new inode, or shrunk) is read
-        the same way. An INCOMPLETE read -- a refused record ended the parse
-        early, the present log could not be opened, or its identity could not be
-        inspected -- is MERGED, so a bucket the read could not reach keeps its
-        figure rather than being lowered silently. Only dedicated runs' samples
-        are read: a shared run's figure is a per-session share of one runtime,
-        not what a start that may run as its own process will cost.
-        """
-        try:
-            # Identity on both sides of the read: a log replaced DURING the read
-            # would otherwise pair pre-reset figures with the new file's identity
-            # and carry them into every later merge. A mismatch keeps the prior
-            # state; the next sweep reads a settled file.
-            before = cost_log_identity()
-            # Dedicated runs only: a start priced here may run as its own
-            # process, and a shared run's sample is a per-session share.
-            costs, complete = read_learned_costs_checked(
-                "mem_gb", dedicated_only=True, max_age_secs=_SAMPLE_MAX_AGE_SECS
-            )
-            identity = cost_log_identity()
-        except Exception:
-            logger.debug(
-                "learned subagent cost unreadable; keeping the previous value", exc_info=True
-            )
-            return
-        if identity != before:
-            logger.debug("cost log changed during the read; keeping the previous value")
-            return
-        manager = self._manager
-        if identity is None:
-            # Absent log: first boot, or the operator's reset. Nothing learned.
-            manager._learned_costs_gb = {}
-            manager._learned_costs_source = None
-            return
-        if len(identity) != 3:
-            # Present but not inspectable: nothing this read says is proven, so
-            # it is additive at most.
-            complete = False
-        previous = manager._learned_costs_source
-        replaced = (
-            previous is not None
-            and len(previous) == 3
-            and len(identity) == 3
-            and (identity[:2] != previous[:2] or identity[2] < previous[2])  # type: ignore[operator]
-        )
-        if replaced or previous is None or complete:
-            # Authoritative read: the whole log was parsed, so a bucket it does
-            # not yield has genuinely expired past the age horizon or fallen
-            # below min_samples, and its held price retires with it. Also the
-            # path for a log that was deleted and re-created within one sweep
-            # (the operator's reset), a compaction rewrite, and the first
-            # publication.
-            manager._learned_costs_gb = dict(costs)
-        else:
-            # Incomplete read -- an over-cap record ended the parse before the
-            # buckets after it: MERGE, so a bucket the read could not reach
-            # keeps its held figure while one it did reach takes the new value,
-            # up or down. Merge is reserved for exactly this degraded case.
-            manager._learned_costs_gb = cap_buckets({**manager._learned_costs_gb, **costs})
-        if len(identity) == 3:
-            manager._learned_costs_source = identity
 
     def _record_cost_impl(self, info: SubagentInfo) -> None:
         """Persist this run's high-water RSS/CPU to the learned-cost store."""
@@ -912,9 +866,37 @@ class OrphanStallMonitor(ManagerComponent):
                 info.peak_rss_gb,
                 info.peak_cpu_cores,
                 shared=bool(info._session_sharing),
+                settled_gb=info.settled_rss_gb,
             )
+            if info.settled_rss_gb > 0:
+                self._manager._learned_settled_dirty = True
         except Exception:
             logger.debug("Failed to record subagent cost for %s", info.id, exc_info=True)
+
+    def _refresh_learned_settled_impl(self) -> None:
+        """Re-read the learned settled RSS per bucket into the manager's map.
+
+        BLOCKING (it streams the cost log), so it runs on
+        :func:`maintenance_executor` -- at reaper start and after every cost
+        sweep -- and the admission gate only ever reads the map it leaves. The
+        map is replaced whole, never mutated, so a reader on the loop sees one
+        consistent version. An incomplete read (a refused or unreadable record)
+        keeps every figure it did not see, folded under the bucket bound. Runs
+        only after a run recorded a settled reading (or once at start): nothing
+        else changes what the per-bucket window holds.
+        """
+        if not self._manager._learned_settled_dirty:
+            return
+        self._manager._learned_settled_dirty = False
+        try:
+            costs, complete = read_learned_costs_checked("settled_gb", dedicated_only=True)
+        except Exception:
+            logger.debug("learned settled RSS unreadable; keeping the previous map", exc_info=True)
+            return
+        held = self._manager._learned_settled_gb
+        self._manager._learned_settled_gb = (
+            dict(costs) if complete else cap_buckets({**held, **costs})
+        )
 
     async def _reaper_loop_impl(self) -> None:
         """Periodically force-kill subagents that exceed the timeout.
@@ -927,15 +909,14 @@ class OrphanStallMonitor(ManagerComponent):
             compact_cost_log()  # startup FIFO trim (§4.2)
         except Exception:
             logger.debug("Reaper: startup cost-log compaction failed", exc_info=True)
-        # Publish the learned cost BEFORE the first sleep: a fan-out in the
-        # first minute after boot must already be priced at it, not at the
-        # first-boot fallback. Off-loop for the same reason the sweep is.
+        # Seed the dedicated start projection before the first sweep, off-loop,
+        # so the first interval after boot does not price at the start cost only.
         try:
             await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(), self._manager._refresh_learned_cost
+                maintenance_executor(), self._manager._refresh_learned_settled
             )
         except Exception:
-            logger.debug("Reaper: startup learned-cost refresh failed", exc_info=True)
+            logger.debug("Reaper: learned settled RSS seed failed", exc_info=True)
         while True:
             await asyncio.sleep(_REAPER_INTERVAL)
             now = time.time()
@@ -962,6 +943,12 @@ class OrphanStallMonitor(ManagerComponent):
                 )
             except Exception:
                 logger.debug("Reaper: live-cost sample failed", exc_info=True)
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    maintenance_executor(), self._manager._refresh_learned_settled
+                )
+            except Exception:
+                logger.debug("Reaper: learned settled RSS refresh failed", exc_info=True)
             # Wave liveness backstop: reconcile waves wedged by submissions
             # lost before the process boundary (see _sweep_stuck_waves).
             try:
@@ -1142,8 +1129,16 @@ class OrphanStallMonitor(ManagerComponent):
             # attributable on a shared runtime — so decline rather than guess.
             return VERDICT_UNKNOWN, "no tool in flight"
         if not tool.is_shell:
-            # A non-shell MCP tool has no child process to match, so the oracle
-            # can only offer the same unattributable subtree aggregate. Decline.
+            # The kirocrew-core wait tool's declared-duration contract reads only
+            # this agent's own tool input and dispatch instant, so it is as
+            # attributable as the shell-child match and needs no /proc walk. It is
+            # selected by the adapter-authored identity, never the model-authored
+            # title, because it lifts the suppression ceiling below.
+            if tool.is_trusted_wait():
+                return tool.declared_wait_verdict(time.monotonic())
+            # Any other non-shell MCP tool has no child process to match, so the
+            # oracle can only offer the same unattributable subtree aggregate.
+            # Decline.
             return VERDICT_UNKNOWN, "non-shell tool — not attributable"
         if info._stall_oracle is None:
             info._stall_oracle = LivenessOracle()
@@ -1220,9 +1215,13 @@ class OrphanStallMonitor(ManagerComponent):
         idle = now - info.last_activity
         if not info.stalled and idle > self._manager._stall_idle_secs:
             verdict, evidence = await self._manager._stall_verdict(info)
-            if (
-                verdict == VERDICT_WORKING
-                and idle < self._manager._stall_idle_secs * _SUPPRESS_CEILING
+            # The wait contract bounds itself at seconds + slack and cannot land
+            # on another session's process, so the ceiling below (which exists
+            # for a fallible cmdline match) does not apply to its WORKING.
+            tool = info._inflight_tool
+            self_bounded = tool is not None and tool.is_trusted_wait()
+            if verdict == VERDICT_WORKING and (
+                self_bounded or idle < self._manager._stall_idle_secs * _SUPPRESS_CEILING
             ):
                 # Attributable progress in this subagent's own child: silent, not
                 # stalled. Leave the suspicion open (do not reset

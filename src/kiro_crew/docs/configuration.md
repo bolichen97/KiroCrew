@@ -31,10 +31,11 @@ on disk even if you never set it — and a stored value always beats the shipped
 default. Changing a default therefore reaches new installs only: yours keeps
 whatever was written the last time it saved.
 
-Kiro Crew now fixes that for itself on the two agent timeout budgets — the subagent
-timeout and the chat-turn ceiling. On the first start after an upgrade, a stored value
-that is exactly an old shipped default is removed so the current default applies, in
-that same run. It happens once per key: set one back afterwards and it stays yours.
+Kiro Crew now fixes that for itself on three keys: the two agent timeout budgets (the
+subagent timeout and the chat-turn ceiling) and the subagent memory floor
+(`agent.spawn_min_memory_gb`, whose old `4.0` kept subagents from starting on a
+16 GB laptop). On the first start after an upgrade, a stored value that is exactly
+an old shipped default is removed so the current default applies, in that same run. It happens once per key: set one back afterwards and it stays yours.
 Affirming a value with `--keep` before that first start also keeps it.
 
 Everything else is reported, not changed, because a stored value can be a real
@@ -157,7 +158,7 @@ Set a registered value with, for example,
     "max_channel_agents": 3,
     "max_subagents": 0,
     "subagent_max_turns": 1000,
-    "spawn_min_memory_gb": 4.0,
+    "spawn_min_memory_gb": 2.0,
     "soft_stop_budget_secs": 10.0,
     "completion_keep": "head",
     "completion_keep_chars": 3000
@@ -242,7 +243,7 @@ Set a registered value with, for example,
 | `agent.soft_stop_budget_secs` | Seconds to wait for a cooperative cancel before hard-killing the session | `10.0` |
 | `agent.max_subagents` | Max concurrent subagents. `0` auto-sizes the cap at startup from host memory/CPU and a learned per-agent cost. A pin of 1 or 2 is raised to 3, because a cap below 3 would disable auto-sizing and still run under the default | `0` |
 | `agent.subagent_max_turns` | Default tool-call budget per subagent; stored user values are preserved on upgrade | `1000` |
-| `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
+| `agent.spawn_min_memory_gb` | Free memory (GB) that must remain available after a subagent start is admitted. A dedicated-process start is priced at what such a runtime settles at: about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below `agent.subagent_cost_gb`. A start that shares its parent's runtime is priced about 0.35 GB lower. A spawn that does not fit waits in the durable queue; one with no durable queue (a temporary or incognito memory mode) is refused. An install still carrying the old `4.0` default moves to `2.0` once; a value set back afterwards is kept. 0 disables the check | `2.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
 | `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent. Measured from the moment the completion reaches the parent, not from when the run finished | `3600` (1h) |
@@ -263,6 +264,7 @@ Set a registered value with, for example,
 | `session.eager_spawn` | Create a chat session when its slot is created, switched, or retargeted instead of waiting for the first message | `true` |
 | `session.archive_retention_days` | Days to keep compacted/rotated session archives before auto-cleanup. `-1` disables cleanup | `30` |
 | `session.watchdog_rss_max_mb` | Recycle an idle session when its process tree resident memory exceeds this many MiB, so a runaway session tree is bounded by default. 0 disables. A session with a turn in flight is never recycled. `kirocrew status` and `kirocrew doctor` show the ceiling next to the gateway's own resident memory | `1536` |
+| `session.reconcile_max_kills` | Unowned root candidates the runtime reconciler may signal the process tree of in one pass — one candidate can signal several processes. The ceiling equals the default, so this setting can only lower the budget, never raise it. Lower it where more than one install shares this data home: the agent slice is keyed on the data home, so a runtime owned by another install has no record here and reads as unowned. `0` leaves the kill arm observing — it still publishes the `unowned_alive` / `owned_dead` leak reading and audits each candidate it would have signalled as `would_kill`, and signals nothing. Re-read every cleanup tick, so a change needs no restart | `5` |
 
 ### Dashboard
 
@@ -440,9 +442,10 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 | `memory.backup_enabled` | Periodic rotating backups of every active memory store (the default store, named V1 stores and member V2 stores); retention does not delete active memories | `true` |
 | `memory.backup_keep` | Backup copies retained per store, with a minimum of one | `7` |
-| `memory.persistence_enabled` | Global switch for persistent memory. Off: no automatic memory writes anywhere — `learn_add` and `kirocrew learn add` refuse, history consolidation pauses entirely (no LLM turn spent), task-runner lesson extraction skips — and stored memory/lessons are not injected into new sessions. Within-conversation context is unaffected, and explicit dashboard edits/deletions (the right to forget) stay available. One documented exception: an installed app's own ingestion sweep (Ops Mission Control's ledger import) still writes app-scoped episodic rows, because it is reached only through that app's trigger | `true` |
+| `memory.persistence_enabled` | Global switch for persistent memory. Off: no automatic memory writes anywhere — `learn_add` and `kirocrew learn add` refuse, history consolidation pauses entirely (no LLM turn spent), task-runner lesson extraction skips, and app-owned projections such as Ops Mission Control's ledger import are no-ops before opening the memory store — and stored memory/lessons are not injected into new sessions. Within-conversation context is unaffected, and explicit dashboard edits/deletions (the right to forget) stay available. | `true` |
 | `memory.inject_memory` | Inject the stored memory block (preferences, the memory activity index, recent-session snippets) into new-session context, including the re-injection after a compaction. On-demand `memory_recall` and writes are unaffected | `true` |
 | `memory.inject_lessons` | Inject the learned-corrections and user-profile blocks into new-session context. Writes are unaffected | `true` |
+| `memory.inject_lessons_per_turn` | On each follow-up message, add up to three stored lessons (2,000 characters) that match it and that the session has not been shown yet: the session-start block holds only what fits its budget. A lesson matches when it shares at least two distinct words with the message that are each rare among stored lessons: carried by at most 1% of them, and never fewer than one. Request words on the lesson stop list and words of two letters or fewer are ignored. Each lesson is sent at most once until a compaction drops it from context, even when the turn that carried it was cancelled or failed; a gateway restart, or turning this on mid-session, can send one once more; it can also be sent once more after 256 newer lessons in that session or after its record is dropped past 256 sessions. Vector stores only. Requires `inject_lessons` | `false` |
 | `memory.inject_activity` | Inject the recent activity block (active projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts and relevant past episodes) into new-session context as a budgeted background block the context budget may drop whole. Off: only preferences and the activity index ship at session start, and older material is read through `memory_recall`. Requires `inject_memory` | `true` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.
@@ -519,7 +522,7 @@ member-memory sandbox is required.
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `auto_update` | Enable automatic update checks | `true` |
+| `auto_update` | Where the install can apply updates, `true` installs them once no work is running and restarts the gateway; `false` only notifies. Elsewhere it has no effect. On those same installs a policy minimum version applies regardless. See [Updates](#updates) | `true` |
 | `timezone` | IANA timezone name, e.g. `"America/Los_Angeles"` | `""` (falls back to UTC) |
 | `snapshot_dir` | Where `kirocrew snapshot` writes tarballs | `""` (`~/.kiro/crew/snapshots`) |
 
@@ -551,6 +554,99 @@ The `timezone` key affects three things:
 - `skip_dates` evaluation for cron jobs
 
 A per-job `timezone` on a cron job wins over this global value.
+
+## Updates
+
+### When the gateway checks
+
+The gateway checks for a newer release when it starts (its own restarts
+included), every 12 hours, and every five minutes while an update is waiting
+for running work to finish. Depending on the install, the check is a `git
+fetch` or a release-feed fetch. Docker and the desktop app's bundled gateway
+skip it (see below); everywhere else it runs whatever `auto_update` is set to.
+
+`auto_update` decides what happens when the check finds something. With `true`
+(the default), the gateway applies the update and restarts itself, on the
+installs that can apply. With `false`, it only notifies.
+
+The gateway applies only when no turn or background job is running. If work is
+in flight, it keeps serving and tries again five minutes later, so steady
+activity can postpone even a mandatory update. While the update applies, the
+gateway does not start new turns.
+
+### What each install does
+
+A security policy that names update commands replaces everything in this
+section: its commands then check and apply on every install shape except
+Windows, where they never run and the gateway does not update itself. See the
+[governance spec](../../../docs/system-specs/modules/governance.md#update-pins-updates--policy-only).
+
+| Install | With `auto_update` on |
+|---|---|
+| Git or source checkout (any OS) on a primary branch: `main`, `mainline` or `master` <!-- wokeignore:rule=master --> | Applies |
+| The `cli.sh` managed venv (macOS, Linux) | Applies |
+| pipx (what `cli.sh` uses when pipx is on `PATH`) or plain `pip` | Notifies only |
+| Docker | Neither checks nor applies. The About page says to pull a newer image |
+| The gateway bundled in the desktop app | Neither. The app's own updater owns it |
+
+Of the installs that update by re-running the installer, the gateway re-runs it
+itself only for the `cli.sh` managed venv, so pip and pipx only notify.
+
+A checkout applies when the tip of its branch carries a newer `__version__` than
+the running code, and then hard-resets to that tip and restarts. It does not
+apply over local changes, local commits or untracked files the update would
+overwrite, and it does not restart a gateway whose checkout you already pulled
+by hand. Other branches,
+`release/*` included, never auto-apply. `main` is always one minor version ahead
+of the release line, so a `main` checkout moves onto nightly code each time a
+release branch is cut. Below a policy minimum version, a primary-branch checkout
+skips the version test and resets to every new upstream commit, released or
+not.
+
+### Turning it off and updating by hand
+
+Set `auto_update` with `kirocrew config set auto_update false`, from
+**Developer → Config → Auto Update** in the dashboard, or with the gateway's
+update switch on the About page when the dashboard is open in a browser.
+
+Updating by hand never restarts a running gateway, so finish with
+`kirocrew restart`:
+
+- **Git checkout, `cli.sh` managed venv or pipx:** run `kirocrew update`, then
+  `kirocrew restart`. On pipx it re-runs the installer, which replaces the pipx
+  install.
+- **Plain `pip`:** upgrade with pip in the same environment, from the channel
+  index you installed from (Kiro Crew is not on PyPI; see
+  [Installing a published wheel with pip](../../../docs/guides/install.md#installing-a-published-wheel-with-pip)),
+  then `kirocrew restart`. Here `kirocrew update` installs a separate copy
+  instead of upgrading that environment.
+
+`kirocrew --version` prints the version installed on disk. The About page shows
+the version the running gateway serves.
+
+### What can still update a host with `auto_update` off
+
+- **A policy minimum version.** An administrator can set `min_version` in the
+  `updates` block of `security_policy.json`. On an install whose gateway updates
+  itself, a gateway below that version applies the update even with
+  `auto_update` off. The scope per install is in the
+  [governance spec](../../../docs/system-specs/modules/governance.md#update-pins-updates--policy-only).
+- **The desktop app's own updater.** On a desktop install, the app's update
+  switch on the About page is the one that stops automatic updates. It updates
+  the app and the gateway bundled in it. `auto_update` matters there only if a
+  policy names update commands, or if the app is attached to a separately
+  installed gateway (from the CLI, as a service, or reached over an SSH tunnel),
+  which follows its own `auto_update` per the table above. The app
+  keeps its switch in its own settings file (**Open Config File** in the tray
+  menu or the **Connection** menu), not in the gateway's
+  `~/.kiro/crew/config.json`. How the app's updater downloads and installs is in
+  [release.md](../../../docs/build/release.md#client-auto-update).
+
+An edition can hand updates to a package manager, through policy
+`check_command` / `apply_command` or a packaged app marker's `checkCommand` /
+`updateCommand`. While its updates are on, a pause set in that package manager
+holds only if the edition's check command honours it; see
+[externally managed installs](../../../docs/build/desktop-app.md#externally-managed-installs-repackagers).
 
 ## Credentials
 

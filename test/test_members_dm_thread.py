@@ -16,7 +16,9 @@ Covers spec task 2 of the Crew Members page:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
+import logging
 import os
 import threading
 import time
@@ -47,6 +49,60 @@ from kiro_crew.validation import normalize_unicode
 
 CREW = "code-reviewer"
 OTHER = "other-agent"
+
+
+class _RenderedLogs(logging.Handler):
+    """Keeps each record as RENDERED TEXT only, never the record itself.
+
+    A record carrying ``exc_info`` keeps its traceback, the traceback keeps the
+    frame, and a frame in the crew-log write path holds a ``CrewLog`` handle and
+    its write lease (see ``crew_log.store.log_exception_text``). Rendering on
+    arrival and dropping the record keeps nothing alive.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.lines: list[str] = []
+        self.setFormatter(logging.Formatter("%(threadName)s %(name)s %(levelname)s %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
+
+
+def _record_or_explain(member, session_key, memory_mode, **kwargs) -> bool:
+    """``record_activity``, run off the event loop, with the reason for a ``False``.
+
+    ``record_activity`` is blocking file IO and documents that async callers run it
+    through ``asyncio.to_thread``: on the event-loop thread the crew-log
+    ``file_lock`` makes ONE attempt and refuses rather than stall the loop. Most of
+    the tests here are coroutines, so the call runs on a worker thread, as it does
+    in production.
+
+    It is also best-effort by contract -- every failure is swallowed and logged at
+    DEBUG -- so a bare ``assert record_activity(...)`` fails as ``assert False``
+    with the cause discarded. When the answer is ``False`` this raises with the
+    member, crew-log and event-log records the call produced.
+    """
+    handler = _RenderedLogs()
+    names = ("kiro_crew.members", "kiro_crew.eventlog", "kiro_crew.crew_log")
+    loggers = [logging.getLogger(n) for n in names]
+    levels = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.addHandler(handler)
+        lg.setLevel(logging.DEBUG)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            ok = pool.submit(record_activity, member, session_key, memory_mode, **kwargs).result()
+    finally:
+        for lg, level in zip(loggers, levels):
+            lg.removeHandler(handler)
+            lg.setLevel(level)
+    if not ok:
+        detail = "\n".join(handler.lines) or "(no log records)"
+        raise AssertionError(
+            f"record_activity({member!r}, {session_key!r}) returned False:\n{detail}"
+        )
+    return ok
 
 
 def _fake_config(names, default=CREW):
@@ -288,10 +344,9 @@ class TestMemberRoutes:
     async def test_free_form_name_round_trips_roster_thread_and_activity(self, tmp_path):
         name = "dr. eggbot"
         state = _make_state(tmp_path)
-        from kiro_crew.members import record_activity
 
         cfg = _fake_config([name], default=name)
-        assert record_activity(name, "dashboard_chat-1", "persistent", via="chat")
+        assert _record_or_explain(name, "dashboard_chat-1", "persistent", via="chat")
         with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 roster_response = await client.get("/api/members")
@@ -326,7 +381,7 @@ class TestMemberRoutes:
         assert normalize_unicode(name) != name
         state = _make_state(tmp_path)
         cfg = _fake_config([name], default=name)
-        assert record_activity(name, "dashboard_chat-1", "persistent", via="chat")
+        assert _record_or_explain(name, "dashboard_chat-1", "persistent", via="chat")
         with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 roster_response = await client.get("/api/members")
@@ -1361,19 +1416,40 @@ class TestResumeGuards:
         assert slot.mode == DM_SLOT_MODE
 
     @pytest.mark.asyncio
-    async def test_concurrent_member_resume_does_not_duplicate_history(self, tmp_path):
-        """A resume racing the binding await must yield to the winner's slot.
+    @pytest.mark.parametrize(
+        ("window", "expected"),
+        [
+            # The agent read: the last await before the post-transcript re-check.
+            ("restored_agent", ["check", "binding", "agent", "publish", "dedup"]),
+            # The late binding read: the one await between that re-check and the publish.
+            (
+                "late_binding_read",
+                ["check", "binding", "agent", "check", "binding", "publish", "dedup"],
+            ),
+        ],
+    )
+    async def test_concurrent_member_resume_does_not_duplicate_history(
+        self, tmp_path, monkeypatch, window, expected
+    ):
+        """A resume racing an await before the publish must yield to the winner's slot.
 
-        The late binding read is the one suspension point between the earlier
-        live-slot re-checks and the publish. A concurrent resume that
-        publishes during it must be SEEN: the loser answers with the live
-        slot instead of get_or_create-ing the existing slot and hydrating the
-        disk transcript onto it a second time (duplicated history on the next
-        flush).
+        The handler re-checks for a live slot after each await that precedes the
+        publish. A concurrent resume that publishes inside one of those windows must be
+        SEEN by the re-check right after it: the loser answers with the live slot
+        instead of get_or_create-ing the existing slot and hydrating the disk transcript
+        onto it a second time (duplicated history on the next flush). Each case pins the
+        ORDER of the awaits and re-checks, so the re-check that saw the winner is the
+        one right after the window: deleting either re-check fails its case.
+
+        The winner runs on the loop, where a real resume publishes, from the function
+        the handler awaits in that window. It is never a side effect on
+        ``members.read_dm_binding``: the member event log's legacy fold calls that on
+        its ``eventlog-io`` worker, queued by the winner's own row, so a side effect
+        there can fire a second time from that thread and append a second copy.
         """
-        from unittest.mock import patch as _patch
-
         from chat_test_helpers import _make_app
+
+        import kiro_crew.dashboard.chat_handlers as handlers
 
         state = _make_state(tmp_path)
         write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
@@ -1382,29 +1458,62 @@ class TestResumeGuards:
         log.append(key, "user", "hello")
         log.update_metadata(key, {"agent": CREW, "mode": DM_SLOT_MODE})
 
-        real_read = read_dm_binding
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        # The handler's awaits and re-checks, in order, with the winner's publish in the
+        # window it landed in. A re-check that answers with the winner's slot is a
+        # "dedup"; one that finds nothing is a "check".
+        timeline: list[str] = []
 
-        def _publish_mid_await(slug):
-            # Simulate the concurrent WINNER: it published the slot (and
-            # hydrated the one disk message) while this request was suspended
-            # in the binding read.
+        async def _publish_winner():
             slot = state.get_or_create_slot(member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE)
             slot.append("user", "hello", "msg msg-u")
-            return real_read(slug)
 
-        with _patch(
-            "kiro_crew.members.read_dm_binding",
-            side_effect=_publish_mid_await,
-        ):
-            async with TestClient(TestServer(_make_app(state))) as client:
-                resp = await client.post(
-                    f"/api/chat/slots/{member_slot_key(CREW)}/resume", json={"key": key}
-                )
-                assert resp.status == 200
+        def _publish_from_worker(where):
+            # Both seams run under asyncio.to_thread. From the loop thread, waiting on
+            # the loop would deadlock instead of failing.
+            assert threading.get_ident() != loop_thread, f"{where} ran on the loop thread"
+            asyncio.run_coroutine_threadsafe(_publish_winner(), loop).result(timeout=10)
+            timeline.append("publish")
+
+        real_agent = handlers._restored_agent_name
+        real_read = handlers.members_mod.read_dm_binding_for_slot
+        real_check = handlers._live_slot_for_resume
+
+        def _agent(*args):
+            timeline.append("agent")
+            if window == "restored_agent":
+                _publish_from_worker(window)
+            return real_agent(*args)
+
+        def _read_binding(slot_key):
+            timeline.append("binding")
+            # The late read is the binding read that follows the agent read.
+            if window == "late_binding_read" and "agent" in timeline and "publish" not in timeline:
+                _publish_from_worker(window)
+            return real_read(slot_key)
+
+        async def _check(*args, **kwargs):
+            outcome = await real_check(*args, **kwargs)
+            timeline.append("dedup" if outcome is not None and outcome.already_live else "check")
+            return outcome
+
+        monkeypatch.setattr(handlers, "_restored_agent_name", _agent)
+        monkeypatch.setattr(handlers.members_mod, "read_dm_binding_for_slot", _read_binding)
+        monkeypatch.setattr(handlers, "_live_slot_for_resume", _check)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                f"/api/chat/slots/{member_slot_key(CREW)}/resume", json={"key": key}
+            )
+            assert resp.status == 200
+        assert timeline == expected, (
+            f"the winner's publish inside {window}, or the re-check that must see it, is "
+            f"not where it belongs: {timeline}"
+        )
         slot = state._slots[member_slot_key(CREW)]
         # The loser did NOT hydrate a second copy of the transcript.
         hellos = [m for m in slot.messages if m.get("content") == "hello"]
-        assert len(hellos) == 1, f"history duplicated: {len(hellos)} copies"
+        assert len(hellos) == 1, f"history duplicated: {len(hellos)} copies: {hellos!r}"
 
     @pytest.mark.asyncio
     async def test_resume_of_a_closed_member_thread_succeeds(self, tmp_path):
@@ -1480,10 +1589,14 @@ class TestResumeGuards:
         hydrate against the replacement metadata and the next flush would
         overwrite the replacement transcript. The identity barrier compares
         the two metadata snapshots and refuses on any drift.
+
+        The replacement lands only inside the LATE binding read, so a re-read
+        moved ahead of that await reads the old metadata and the refusal is
+        lost.
         """
         from chat_test_helpers import _make_app
 
-        import kiro_crew.members as members_real
+        import kiro_crew.dashboard.chat_handlers as handlers
 
         state = _make_state(tmp_path)
         write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
@@ -1492,23 +1605,32 @@ class TestResumeGuards:
         log.append(key, "user", "old incarnation message")
         log.update_metadata(key, {"agent": CREW, "mode": DM_SLOT_MODE, "title": "old"})
 
-        real_read = members_real.read_dm_binding
+        real_agent = handlers._restored_agent_name
+        real_read = handlers.members_mod.read_dm_binding_for_slot
+        agent_read: list[bool] = []
 
-        def _racing_read(slug):
-            # The replacement lands DURING the binding await — after the
-            # message read, before the metadata re-read.
-            log.update_metadata(key, {"agent": CREW, "mode": DM_SLOT_MODE, "title": "replaced"})
-            return real_read(slug)
+        def _agent(*args):
+            agent_read.append(True)
+            return real_agent(*args)
 
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_handlers.members_mod.read_dm_binding", _racing_read
-        )
+        def _racing_read(slot_key):
+            # The late read is the binding read that follows the agent read: after
+            # the message read, before the metadata re-read.
+            if agent_read:
+                log.update_metadata(key, {"agent": CREW, "mode": DM_SLOT_MODE, "title": "replaced"})
+            return real_read(slot_key)
+
+        monkeypatch.setattr(handlers, "_restored_agent_name", _agent)
+        monkeypatch.setattr(handlers.members_mod, "read_dm_binding_for_slot", _racing_read)
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post(
                 f"/api/chat/slots/{member_slot_key(CREW)}/resume", json={"key": key}
             )
             assert resp.status == 409
             assert (await resp.json())["code"] == "member_resume_conflict"
+        assert (
+            log.get_metadata(key).get("title") == "replaced"
+        ), "the late binding read never ran, so nothing raced it"
         # Nothing was hydrated onto the key — reopening reads fresh.
         assert member_slot_key(CREW) not in state._slots
 
@@ -2319,10 +2441,9 @@ class TestMemberActivityRoute:
     @pytest.mark.asyncio
     async def test_returns_recorded_entries_newest_first_with_allowlist_fields(self, tmp_path):
         state = _make_state(tmp_path)
-        from kiro_crew.members import record_activity
 
-        assert record_activity(CREW, "dashboard_chat-1", "persistent", via="chat")
-        assert record_activity(
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
+        assert _record_or_explain(
             CREW, "dashboard_chat-2", "persistent", project="/repo", via="select_crew"
         )
         with _patched_config([CREW]):
@@ -2363,9 +2484,11 @@ class TestMemberActivityRoute:
 
         from kiro_crew.eventlog import service as svc_mod
         from kiro_crew.eventlog import types as _types
-        from kiro_crew.members import record_activity, slug_for_name
+        from kiro_crew.members import slug_for_name
 
-        assert record_activity(CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat")
+        assert _record_or_explain(
+            CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat"
+        )
         svc = svc_mod.get_service()
         slug = slug_for_name(CREW)
         for i in range(1001):
@@ -2413,9 +2536,11 @@ class TestMemberActivityRoute:
         state = _make_state(tmp_path)
         from kiro_crew.eventlog import types as _types
         from kiro_crew.eventlog.service import get_service
-        from kiro_crew.members import record_activity, slug_for_name
+        from kiro_crew.members import slug_for_name
 
-        assert record_activity(CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat")
+        assert _record_or_explain(
+            CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat"
+        )
         # Bury it behind more envelopes than the former read window held.
         svc = get_service()
         slug = slug_for_name(CREW)
@@ -2443,11 +2568,10 @@ class TestMemberActivityRoute:
         other's events.
         """
         state = _make_state(tmp_path)
-        from kiro_crew.members import record_activity
 
         other = "Code_Reviewer"  # distinct exact name, same derived slug
-        assert record_activity(CREW, "dashboard_chat-1", "persistent", via="chat")
-        assert record_activity(other, "dashboard_chat-2", "persistent", via="chat")
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
+        assert _record_or_explain(other, "dashboard_chat-2", "persistent", via="chat")
         with _patched_config([CREW, other]):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 mine = await (
@@ -2493,9 +2617,9 @@ class TestMemberActivityRoute:
         timeline — including a numeric epoch from a foreign writer, which
         must read as unplaceable rather than crash the endpoint."""
         state = _make_state(tmp_path)
-        from kiro_crew.members import ACTIVITY_FILE_NAME, member_dir, record_activity
+        from kiro_crew.members import ACTIVITY_FILE_NAME, member_dir
 
-        assert record_activity(CREW, "dashboard_chat-1", "persistent", via="chat")
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
         path = member_dir("code-reviewer") / ACTIVITY_FILE_NAME
         # Only the LEGACY file lives in the member directory now -- the log moved
         # under the fenced crew-log tree -- so nothing has created it yet.
@@ -2518,9 +2642,8 @@ class TestMemberActivityRoute:
         credential; the response is a network boundary, so it runs the same
         redaction chain as the roster's message preview."""
         state = _make_state(tmp_path)
-        from kiro_crew.members import record_activity
 
-        assert record_activity(
+        assert _record_or_explain(
             CREW,
             "dashboard_chat-1",
             "persistent",
@@ -2544,10 +2667,9 @@ class TestMemberActivityRoute:
         derived counters as floors ("N+") instead of asserting exact totals."""
         state = _make_state(tmp_path)
         from kiro_crew.dashboard.handlers import members as handler_mod
-        from kiro_crew.members import record_activity
 
         for i in range(handler_mod._ACTIVITY_LIMIT + 3):
-            assert record_activity(CREW, f"dashboard_chat-{i}", "persistent", via="chat")
+            assert _record_or_explain(CREW, f"dashboard_chat-{i}", "persistent", via="chat")
         with _patched_config([CREW]):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 resp = await client.get(
@@ -2557,6 +2679,156 @@ class TestMemberActivityRoute:
                 data = await resp.json()
         assert data["capped"] is True
         assert len(data["entries"]) == handler_mod._ACTIVITY_LIMIT
+
+
+@pytest.mark.xdist_group(name="eventlog_singleton_leak_across_tests")
+class TestEventlogSingletonDoesNotLeakAcrossTests:
+    """The process-wide ``get_service()`` singleton must not survive a test.
+
+    Grouped onto ONE worker: the pair is ordered, and under ``--dist loadgroup`` an
+    ungrouped pair is split across workers, where the second test asserts nothing.
+
+    ``get_service()`` memoises one service per process and rebuilds it only when
+    the crew-log root moves. The root follows ``KIROCREW_HOME``, which the autouse
+    ``_isolate_kirocrew_home`` fixture repoints at a fresh tmp dir per test -- so a
+    test that touches the service leaves a live singleton BOUND TO ITS OWN HOME,
+    and the next test on the same xdist worker inherits it after that home is torn
+    down. On POSIX ``get_service()`` then rebuilds against the new home and the
+    inheritor is fine; on Windows the leaked ``MemberLog`` handles under the dead
+    directory block teardown and the inheritor's first ``record_activity`` write
+    fails, returning ``False`` -- the Windows-only shard-8 red on the class above,
+    reproduced by any predecessor that used the service without resetting it
+    (``test_members_roster_recency``'s roster-read tests do exactly that).
+
+    These two tests run in order WITHOUT a local reset fixture, so they exercise
+    only the ``_reset_member_eventlog_singleton`` floor in ``conftest.py``. The
+    first builds a service bound to its own home; the second asserts it did NOT
+    inherit that binding. Platform-independent: it pins the leak's CAUSE (a
+    singleton crossing the boundary) rather than the Windows-only SYMPTOM, so it is
+    a real regression guard on Linux CI too.
+    """
+
+    #: Set by the first test to the home its service bound to, read by the second
+    #: to prove the singleton did not carry that binding across the boundary.
+    _bound_home: str = ""
+
+    def test_a_service_built_here_binds_to_this_home(self, tmp_path):
+        from kiro_crew.eventlog import service as svc_mod
+        from kiro_crew.members import slug_for_name
+
+        # Touch the service the way a real test does, leaving it live at teardown.
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
+        svc = svc_mod.get_service()
+        assert slug_for_name(CREW) in set(svc.slugs())
+        type(self)._bound_home = str(svc.root)
+        # The singleton is live now; the conftest floor must clear it at teardown.
+        assert svc_mod._singleton is not None
+
+    def test_the_next_test_does_not_inherit_that_service(self, tmp_path):
+        from kiro_crew.eventlog import service as svc_mod
+
+        # The floor reset the singleton at the previous test's teardown (and this
+        # test's setup), so nothing is inherited: the first read here rebuilds
+        # against THIS test's own home, never the previous, torn-down one.
+        assert svc_mod._singleton is None, (
+            "eventlog service leaked across the test boundary; a Windows worker "
+            "would then write into the previous test's torn-down home"
+        )
+        # And a fresh read binds to this test's home, not the leaked one.
+        svc = svc_mod.get_service()
+        assert str(svc.root) != type(self)._bound_home
+
+
+class TestEventlogServiceRetirementReleasesHandles:
+    """Retiring the service must release its cached handles NOW, not at a GC pass.
+
+    The class above pins that the singleton reference does not cross a test
+    boundary. That is necessary but not sufficient for the Windows-only shard-8
+    red on ``TestMemberActivityRoute``: ``get_service()`` and its cached
+    ``MemberLog`` -> ``CrewLog`` chain sit in a REFERENCE CYCLE (the projection
+    registry holds ``set_on_change(service._on_change)``, a bound method back to
+    the service), so ``set_service(None)`` drops the last EXTERNAL reference but
+    does not free the graph -- the cycle keeps it alive until the cyclic collector
+    runs. Each cached ``CrewLog`` releases its write lease through a
+    ``weakref.finalize`` that fires only then, and holds its file descriptor until
+    then. On POSIX that deferral is invisible; on Windows the still-open descriptor
+    keeps a mandatory lock that pins the (torn-down) home directory and fails the
+    next writer on the inheriting worker -- ``record_activity`` returns ``False``,
+    which is exactly the observed traceback (`assert _record_or_explain(...) is False`).
+
+    So retirement (``set_service`` replacing the singleton, and ``get_service``
+    rebuilding on a home change) must DETERMINISTICALLY release those handles and
+    sever the cycle rather than wait for GC. These tests pin that contract on the
+    retired instance directly, so they fail on Linux the moment the release is
+    dropped -- the CAUSE, provable without Windows.
+    """
+
+    def test_set_service_none_clears_cached_logs_and_breaks_cycle(self, tmp_path):
+        from kiro_crew.eventlog import service as svc_mod
+
+        # Touch the service so it caches a MemberLog whose CrewLog took the lease.
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
+        svc = svc_mod.get_service()
+        assert len(svc._logs) >= 1
+        assert svc._registry._on_change is not None
+
+        # Retire exactly as the conftest floor does.
+        svc_mod.set_service(None)
+
+        # Without the deterministic close these both stay put: the service is
+        # cycle-pinned, so its _logs dict (and the Windows file handles those logs
+        # hold) survive the reset until a GC pass that may never come mid-run.
+        assert len(svc._logs) == 0, (
+            "retired service still caches MemberLog handles; on Windows their open "
+            "descriptors pin the torn-down home and fail the next worker's write"
+        )
+        assert svc._registry._on_change is None, (
+            "registry -> service cycle not severed on retirement; the service and "
+            "its handles then live until the cyclic collector runs"
+        )
+
+    def test_home_change_rebuild_retires_the_previous_service(self, tmp_path, monkeypatch):
+        from kiro_crew.eventlog import service as svc_mod
+
+        # First home: build a live service with a cached log.
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
+        first = svc_mod.get_service()
+        assert len(first._logs) >= 1
+
+        # Move the home so the NEXT get_service() rebuilds (production never does
+        # this; a test boundary does). The rebuild must retire `first`.
+        new_home = tmp_path / "second-home"
+        new_home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(new_home))
+        import kiro_crew.config.paths as paths
+
+        monkeypatch.setattr(paths, "_resolved_home", None, raising=False)
+
+        second = svc_mod.get_service()
+        assert second is not first
+        assert str(second.root) != str(first.root)
+        # The replaced service was retired by the rebuild, not left for GC.
+        assert len(first._logs) == 0
+        assert first._registry._on_change is None
+
+    def test_close_is_idempotent_and_reopens_on_demand(self, tmp_path):
+        from kiro_crew.eventlog import service as svc_mod
+        from kiro_crew.members import slug_for_name
+
+        assert _record_or_explain(CREW, "dashboard_chat-1", "persistent", via="chat")
+        svc = svc_mod.get_service()
+        slug = slug_for_name(CREW)
+
+        svc.close()
+        assert len(svc._logs) == 0
+        svc.close()  # second call must not raise
+
+        # close() releases the cached handle; it does not delete data. A read after
+        # it re-opens the on-disk log on demand (the same behaviour a fresh service
+        # gives), so the member's history is still there -- what was released is the
+        # HANDLE, not the record.
+        history = svc.history(slug)
+        assert [ev["data"].get("session") for ev in history] == ["dashboard_chat-1"]
 
 
 # The briefing read fails CLOSED on platforms without O_NOFOLLOW (Windows) --

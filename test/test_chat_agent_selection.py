@@ -77,6 +77,102 @@ def test_global_session_binding_matches_equivalent_alias(monkeypatch):
     assert not stored.same_dispatch_binding(replace(requested, memory_store_name="other-store"))
 
 
+@pytest.fixture
+def pruned_marker(monkeypatch):
+    monkeypatch.setattr(
+        "kiro_crew.crewmate_prune_migration.removed_crewmate_names",
+        lambda: frozenset({"synced-agent"}),
+    )
+
+
+def _pruned_crewmate_record(execution_context, *, store="default", member_id=None):
+    return execution_context.ExecutionContext(
+        member_id,
+        execution_context.MemoryStoreRef(store, member_id),
+        "member",
+        "synced-agent",
+        selection_name="synced-agent",
+    )
+
+
+def test_resume_after_crewmate_prune_resolves_installed_agent(monkeypatch, pruned_marker):
+    """A chat bound to a sync-generated crewmate stays resumable after the prune.
+
+    The startup prune deletes the crewmate's ``config.agents`` row but leaves the
+    agent installed. The chat's record still says ``member``, and a member
+    selection never takes the installed-agent lookup, so without the fallback
+    every resumed turn is refused with "Crew Member ... is unavailable".
+    """
+    from kiro_crew import execution_context, session_agent_selection
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {"kirocrew": KiroCrewAgentConfig(kiro_agent="kirocrew")}
+    cfg.default_agent = "kirocrew"
+    record = _pruned_crewmate_record(execution_context)
+    monkeypatch.setattr(session_agent_selection, "read_session_execution", lambda _: record)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader._materialized_kiro_agent",
+        lambda name, project_dir=None: name if name == "synced-agent" else "",
+    )
+
+    bindings = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, "dashboard:pruned", "synced-agent"
+    )
+
+    assert bindings.requested_resolved
+    assert bindings.kiro_agent == "synced-agent"
+    assert bindings.memory_store_name == "default"
+    assert bindings.selection_kind == "template"
+    assert bindings.execution_context == replace(record, selection_kind="template")
+
+
+@pytest.mark.parametrize(
+    "store, member_id",
+    [("private-store", None), ("member-store", "member-1")],
+)
+def test_resume_after_crewmate_prune_keeps_refusing_owned_members(
+    monkeypatch, pruned_marker, store, member_id
+):
+    """Only the identity-less, Global-store shape the prune removes falls back."""
+    from kiro_crew import execution_context, session_agent_selection
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {"kirocrew": KiroCrewAgentConfig(kiro_agent="kirocrew")}
+    cfg.default_agent = "kirocrew"
+    record = _pruned_crewmate_record(execution_context, store=store, member_id=member_id)
+    monkeypatch.setattr(session_agent_selection, "read_session_execution", lambda _: record)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader._materialized_kiro_agent",
+        lambda name, project_dir=None: name if name == "synced-agent" else "",
+    )
+
+    bindings = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, "dashboard:owned", "synced-agent"
+    )
+
+    assert not bindings.requested_resolved
+
+
+def test_resume_after_crewmate_prune_refuses_uninstalled_agent(monkeypatch, pruned_marker):
+    """The fallback reaches only an agent that is still installed."""
+    from kiro_crew import execution_context, session_agent_selection
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {"kirocrew": KiroCrewAgentConfig(kiro_agent="kirocrew")}
+    cfg.default_agent = "kirocrew"
+    record = _pruned_crewmate_record(execution_context)
+    monkeypatch.setattr(session_agent_selection, "read_session_execution", lambda _: record)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader._materialized_kiro_agent", lambda name, project_dir=None: ""
+    )
+
+    bindings = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, "dashboard:gone", "synced-agent"
+    )
+
+    assert not bindings.requested_resolved
+
+
 def _turn_state(tmp_path, monkeypatch):
     builder = ContextBuilder(
         memory=MemoryStore(workspace=tmp_path / "workspace"),

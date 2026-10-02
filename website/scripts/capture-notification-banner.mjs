@@ -86,6 +86,8 @@ async function openPage({ theme = 'dark', viewport = DESKTOP, permission = 'gran
   let ws = null
   await stubDashboardApi(page, {
     theme,
+    // Liquid Glass is opt-in; the notification panes are glass only with it on.
+    localStorageEntries: { 'mc-liquid-glass': 'on' },
     extra: async (path, route) => {
       if (path === '/api/notifications' && route.request().method() === 'GET') {
         await json(route, { notifications: seeded, unread: seeded.filter(n => !n.acked).length })
@@ -245,12 +247,12 @@ for (const theme of ['dark', 'light']) {
   }
   for (const permission of ['default', 'granted', 'denied']) {
     const { context, page } = await openPage({ theme, permission })
-    await page.goto(`${base}/settings?tab=notifications`, { waitUntil: 'domcontentloaded' })
+    await page.goto(`${base}/settings/notifications/alerts`, { waitUntil: 'domcontentloaded' })
     const row = page.getByTestId('system-notifications-row')
     await row.waitFor({ timeout: 20000 })
     await page.waitForTimeout(800)
     // The whole Desktop alerts card: the permission row plus the banner toggle.
-    const cardEl = row.locator('xpath=ancestor::*[contains(@class,"rounded")][1]')
+    const cardEl = row.locator('xpath=ancestor::*[@data-settings-card][1]')
     await cardEl.screenshot({ path: join(OUT, `settings-permission-${permission}-${theme}.png`) })
     console.log(`settings-permission-${permission}-${theme}`)
     await context.close()

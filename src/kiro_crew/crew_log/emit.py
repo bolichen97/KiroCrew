@@ -103,7 +103,7 @@ import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from kiro_crew.constants import CREW_LOG_ENV, crew_log_enabled
 from kiro_crew.executors import crew_log_executor
@@ -147,13 +147,20 @@ _CHUNK_TEXT_CHARS = 8 * 1024
 #: log, and the cost of over-reserving is one extra chunk.
 _ENVELOPE_HEADROOM = 4 * 1024
 
-#: The label a block with no marker of its own is reported under. ``split_blocks``
-#: classifies by opening marker, and three blocks the design names -- steering,
-#: tool specs, injected crew log context -- have none, so their characters land in
-#: its unclassified bucket. Renaming that bucket here keeps the entry honest
-#: about being a remainder rather than inventing three zeroed sources.
+#: The label a source with NO NAME AT ALL is reported under. ``split_blocks``
+#: classifies by opening marker, and three blocks the design names -- steering, tool
+#: specs, injected crew log context -- have none, so their characters land in its
+#: ``unclassified`` bucket.
+#:
+#: That bucket keeps its own name and is NOT renamed here. It is a label the readers
+#: already know: the Context panel carries a translated string for ``unclassified``
+#: and none for ``other``, so folding the two together made a named remainder render
+#: as an untranslated word in every shipped locale -- visible the moment that panel
+#: started reading these sources instead of the token row's own ``split_blocks``
+#: output. Only the empty label lands here, because an empty label names nothing and
+#: a reader cannot be given a translation for it.
 _OTHER_SOURCE = "other"
-_UNCLASSIFIED_LABELS = frozenset({"unclassified", ""})
+_UNCLASSIFIED_LABELS = frozenset({""})
 
 #: Who caused a turn to run. Every value names a STRUCTURAL producer the
 #: dispatch layer identifies; ``user`` means a person typed the message,
@@ -979,6 +986,65 @@ def _notify_growth(session_id: str) -> None:
             listener(session_id)
         except Exception as exc:  # pragma: no cover - a listener's own failure
             _report("growth listener", exc, op="growth-listener")
+
+
+#: The one entry type whose payload names a BOARD other than its unit's own slot. A
+#: worker's report carries the conductor's ``slot``, so that is the fold it belongs to.
+#: Spelled here rather than imported from ``entry_types``: this module is the boot-path
+#: import gate (see ``_crew_log``), and one string is cheaper than pulling the vocabulary
+#: in. ``test_the_real_append_path_wakes_the_eager_fold`` drives this path end to end.
+_WORK_TYPE: Final[str] = "work/recorded"
+
+
+def _note_eager(entry: Any, entry_type: str, session_id: str, data: Mapping[str, Any]) -> None:
+    """Tell the eager folder one entry of *entry_type* committed. Never raises.
+
+    Called from inside the append job, immediately after the append returned -- the same
+    place the causal-order publish goes, and for the same reason: until the entry is
+    really on disk there is nothing to fold, and a fold run before it would have to be
+    run again.
+
+    The whole call is one ``put_nowait`` behind a set membership test
+    (:func:`kiro_crew.crew_log.eager.note_commit`). It does not resolve the slot, fold
+    anything or build a frame: this runs on the writer thread that every append of this
+    session is serialized through, so work done here is latency for the next entry.
+
+    The BOARD is read from *data* here rather than at each call site, so the rule lives in
+    one place. Only ``work/recorded`` carries a board of its own: a worker's report names
+    the CONDUCTOR's slot, which is not what the worker unit's header says, so folding by
+    the header would advance the worker's board and leave the conductor's -- the one a
+    dashboard reads -- stale. Every other type has no board field and the header is right
+    for it, which is what an empty value asks the folder to use.
+
+    The import is function-local, which is this module's standing rule for anything that
+    reaches the fold surface -- a launch that never commits an eager entry never loads
+    it.
+    """
+    seq = int(getattr(entry, "seq", 0) or 0)
+    if seq <= 0:
+        return
+    try:
+        # boot-path import gate, the same one ``_crew_log`` above documents: this module is
+        # reachable from the gateway's boot path and the fold surface is not, so the import
+        # is paid by the first process that actually commits an eager entry.
+        from kiro_crew.crew_log import eager
+
+        board = str(data.get("slot") or "") if entry_type == _WORK_TYPE else ""
+        eager.note_commit(session_id, entry_type, seq, board)
+    except Exception:  # pragma: no cover - a cache must not cost a committed entry
+        # Rendered text, never ``exc_info``: this runs inside the append job, whose frame
+        # binds the live ``CrewLog`` whose finalizer releases the write lease, so a record
+        # carrying the traceback would keep that handle and its lease alive past the drop
+        # that should have released it. The store's ``log_exception_text`` does exactly
+        # this, but this module is the boot-path import gate (see ``_crew_log``) and may
+        # not import the store at module level, so the render uses the ``traceback``
+        # module already imported above. Pinned by test_crew_log_exc_info_sites.py.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "crew log eager wake not delivered for %s:\n%s",
+                entry_type,
+                traceback.format_exc().rstrip(),
+            )
 
 
 def _on_event_loop() -> bool:
@@ -2868,7 +2934,12 @@ def _write(
         log = _handle(session_id)
         if log is None:
             return
-        log.append(entry_type, data, src=src, ignorable=ignorable)
+        entry = log.append(entry_type, data, src=src, ignorable=ignorable)
+        # Here rather than at each emitter: this is the append every ordinary entry type
+        # goes through, so an entry type that becomes eager later is covered without a
+        # second edit. The hook's own membership test drops the types no eager fold
+        # names, which is nearly all of them.
+        _note_eager(entry, entry_type, session_id, data)
 
     _submit(
         _job,
@@ -4026,8 +4097,24 @@ def on_turn_completed(
     model: str = "",
     provider: str = "",
     depth: int = 0,
+    context_used: int = 0,
+    context_window: int = 0,
 ) -> None:
-    """Record a turn's terminal event and what it cost."""
+    """Record a turn's terminal event and what it cost.
+
+    ``context_used`` / ``context_window`` are the PROVIDER's own occupancy reading
+    for this turn, and they are a different quantity from ``tokens`` beside them.
+    ``tokens`` is what was BILLED: it is summed over every model call the turn made,
+    so it answers what the turn cost. Occupancy answers how full the window was, and
+    a reader wanting "how close to full did this session get" needs the second --
+    dividing a billed total by a window size is not that number, and on a
+    tool-using turn it is larger than the window it is divided by.
+
+    The pair travels TOGETHER on one entry for the same reason: a used count from one
+    turn over a window size from another describes no turn at all, and a model switch
+    moves the window. Both are absent when the provider reports neither, so an
+    unmeasured turn reads as unmeasured rather than as an empty window.
+    """
     data = _turn_closer(
         turn,
         duration_ms=duration_ms,
@@ -4043,6 +4130,11 @@ def on_turn_completed(
         "cache_read": int(cache_read_tokens),
         "cache_write": int(cache_write_tokens),
     }
+    # Written only when the provider actually reported them. ``read_context_tokens``
+    # answers (0, 0) for a provider without the accessors, and a stored zero would
+    # be indistinguishable from a window of nothing.
+    if int(context_used) > 0 or int(context_window) > 0:
+        data["context"] = {"used": int(context_used), "window": int(context_window)}
     _write(
         session_id,
         "turn/completed",
@@ -4486,6 +4578,7 @@ def on_context_composed(
     step: int = 0,
     blocks: "dict[str, int] | None" = None,
     total_chars: int = 0,
+    phase: str = "",
 ) -> None:
     """Record what the gateway put in front of the model, block by block.
 
@@ -4496,11 +4589,22 @@ def on_context_composed(
     spec says so. The one tokenizer available is the wrong one for the served
     model, and a fabricated exact count would be worse than an admitted estimate.
 
-    Every label ``split_blocks`` does not classify is folded into a single
-    ``other`` source. Three blocks the design names -- steering, tool specs and
-    injected crew log context -- have no opening marker, so their characters are
-    genuinely in that remainder; reporting them as three zeroed sources would
-    claim a measurement that was never taken.
+    Labels pass through as ``split_blocks`` named them, including its
+    ``unclassified`` remainder -- three blocks the design names (steering, tool specs
+    and injected crew log context) have no opening marker, so their characters are
+    genuinely in that bucket, and reporting them as three zeroed sources would claim a
+    measurement nobody took. Only a source whose label is EMPTY is renamed, to
+    :data:`_OTHER_SOURCE`; see there for why the named remainder keeps its name.
+
+    ``phase`` says which POPULATION this composition belongs to
+    (:data:`~kiro_crew.context_blocks.PHASE_SESSION_START` or
+    :data:`~kiro_crew.context_blocks.PHASE_PER_TURN`). A session-start injection is
+    many times the size of a per-turn one, so a reader that cannot separate them
+    either pools two populations into one meaningless distribution or lets the
+    single largest composition set the scale for every other. Only the composer
+    knows which it built, so the field is recorded here and DERIVED nowhere: an
+    unstated phase is left absent, because the nearest available guess -- the first
+    composition in a unit -- is wrong for the rebuild a replay triggers mid-session.
     """
     if not session_id or not enabled() or not blocks:
         return
@@ -4530,6 +4634,8 @@ def on_context_composed(
     }
     if step:
         data["step"] = int(step)
+    if phase:
+        data["phase"] = str(phase)
     _write(session_id, "context/composed", data, src=_SRC_GATEWAY)
 
 
@@ -5589,7 +5695,7 @@ def on_panel_published(session_id: str, data: dict[str, Any], *, timeout: float 
             log = _handle(session_id)
             if log is None:
                 return
-            log.append("panel/published", data, src=_SRC_GATEWAY)
+            entry = log.append("panel/published", data, src=_SRC_GATEWAY)
             # The panel fold spans replacement sessions, and a unit header's clock can
             # step BACKWARD, which would fold a retired session's publish last and make
             # it the current panel with history built against the wrong predecessor.
@@ -5597,6 +5703,12 @@ def on_panel_published(session_id: str, data: dict[str, Any], *, timeout: float 
             from kiro_crew import session_ledger
 
             session_ledger.note_panel_unit_recorded("", session_id)
+            # AFTER the order is recorded, never before. The fold the wake triggers reads
+            # that order to decide which unit applies last, so a wake enqueued first can
+            # be folded on a thread that still sees this unit unordered -- and the panel
+            # fold takes the newest entry whole, so it would serve a retired session's
+            # panel as the current one.
+            _note_eager(entry, "panel/published", session_id, data)
             outcome["ok"] = True
 
     _submit(_job, "appending panel/published", session_id, after=landed.set)
@@ -5654,12 +5766,15 @@ def on_work_recorded(session_id: str, data: dict[str, Any], *, timeout: float = 
             log = _handle(session_id)
             if log is None:
                 return
-            log.append("work/recorded", data, src=_SRC_GATEWAY)
+            entry = log.append("work/recorded", data, src=_SRC_GATEWAY)
             # The work fold spans replacement sessions, so header wall clocks are
             # not a causal order. Publish only after this append has really landed.
             from kiro_crew import session_ledger
 
             session_ledger.note_work_unit_recorded(str(data.get("by") or ""), session_id)
+            # AFTER the order is recorded, for the reason the panel emitter gives: the
+            # fold this wake triggers reads that order.
+            _note_eager(entry, "work/recorded", session_id, data)
             outcome["ok"] = True
 
     _submit(_job, "appending work/recorded", session_id, after=landed.set)

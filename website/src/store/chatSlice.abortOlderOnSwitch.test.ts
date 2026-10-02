@@ -32,9 +32,11 @@ vi.mock('../api/client', () => ({
       const end = before !== undefined ? Math.max(0, Math.min(before, TOTAL)) : TOTAL
       const start = Math.max(0, end - lim)
       const body = { messages: HISTORY.slice(start, end), has_more: start > 0, total: TOTAL, next_before: start }
-      // switchSlot's fetch is unpaginated and normally must not block; only the
-      // older page is held open, because that is the request under test.
-      if (before === undefined) {
+      // switchSlot's legs normally must not block; only the user's older page is
+      // held open, because that is the request under test. A switch leg is the
+      // window itself (no cursor) or a step of its coverage walk (a cursor but no
+      // abort signal -- `loadOlderMessages` is the caller that passes one).
+      if (before === undefined || signal === undefined) {
         if (!holdSwitchDetail) return Promise.resolve(body)
         return new Promise((resolve) => { releaseSwitch.push(() => resolve(body)) })
       }
@@ -457,13 +459,13 @@ describe('a background refresh must not re-validate a cursor a pending switch in
 
     // The second switch's own settle does not end it either, because this slot
     // carries cached rows with no previously-known server total: a bounded window
-    // cannot be proven to cover the gap, so the switch retries UNBOUNDED. Its
+    // cannot be proven to cover the gap, so the switch walks the window older. Its
     // claim has to outlive the bounded leg for the same reason the first release
     // must not clear it — releasing between the two legs reopens the window.
     releaseSwitch[1]()
     await flush()
     await flush()
-    // A retry WAS issued (the count is not pinned: a superseded leg may retry too,
+    // A walk leg WAS issued (the count is not pinned: a superseded leg may walk too,
     // and its answer is discarded rather than being this test's business).
     expect(releaseSwitch.length).toBeGreaterThan(2)
     expect(store.getState().chat.slotSwitchRequestId).not.toBeNull()

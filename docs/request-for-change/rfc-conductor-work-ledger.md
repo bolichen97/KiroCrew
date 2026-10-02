@@ -48,7 +48,7 @@ The reason this is not simply "let the worker call `session_send`" is in the cod
 
 This section describes what `kirocrew-conductor` cost BEFORE the ledger, and it is now a historical account: the swap in §Rollout note — swap done made the ledger flow what `kirocrew-conductor` runs, so the four costs below are what it no longer pays. `kirocrew-ledger-conductor` is a deprecated alias of it for one release.
 
-The conductor agent spec is built by `_install_conductor_agent` in [`src/kiro_crew/agent.py`](../../src/kiro_crew/agent.py). Its operating loop is [`goal-conductor/SKILL.md`](../../src/kiro_crew/builtin_skills/goal-conductor/SKILL.md): dispatch with `session_create` plus `session_send`, then patrol on an AutoNudge loop armed by `monitor_start`, and each cycle read `session_ledger_read`, run `accept_eval.py` over every open item, and call `session_read_message` against a stored cursor.
+The conductor agent spec is built by `_install_conductor_agent` in [`src/kiro_crew/agent_materialization/conductor_agents.py`](../../src/kiro_crew/agent_materialization/conductor_agents.py). Its operating loop is [`goal-conductor/SKILL.md`](../../src/kiro_crew/builtin_skills/goal-conductor/SKILL.md): dispatch with `session_create` plus `session_send`, then patrol on an AutoNudge loop armed by `monitor_start`, and each cycle read `session_ledger_read`, run `accept_eval.py` over every open item, and call `session_read_message` against a stored cursor.
 
 Four costs follow from that shape.
 
@@ -667,7 +667,7 @@ The seed is sent **after** the bind, which inverts the current skill's "seed bef
 
 ### Wake gate and liveness
 
-`monitor_start` gates on exactly one subject kind today. `infer` in [`src/kiro_crew/probes/targets.py`](../../src/kiro_crew/probes/targets.py) scans the loop message for a single GitHub pull-request URL and returns a `Target`; `build` in [`src/kiro_crew/probes/__init__.py`](../../src/kiro_crew/probes/__init__.py) maps the kind to a probe; `_monitor_tick_is_quiet` in [`src/kiro_crew/autonudge.py`](../../src/kiro_crew/autonudge.py) runs it and re-arms without firing on a positive quiet verdict. The kernel in [`src/kiro_crew/irq.py`](../../src/kiro_crew/irq.py) needs no change: its state, dedupe, coalescing and failure backstop are already kind-agnostic.
+`monitor_start` gates on exactly one subject kind today. `infer` in [`src/kiro_crew/probes/targets.py`](../../src/kiro_crew/probes/targets.py) scans the loop message for a single GitHub pull-request URL and returns a `Target`; `build` in [`src/kiro_crew/probes/__init__.py`](../../src/kiro_crew/probes/__init__.py) maps the kind to a probe; `_monitor_tick_is_quiet` in [`src/kiro_crew/autonudge_service/gate.py`](../../src/kiro_crew/autonudge_service/gate.py) runs it and re-arms without firing on a positive quiet verdict. The kernel in [`src/kiro_crew/irq.py`](../../src/kiro_crew/irq.py) needs no change: its state, dedupe, coalescing and failure backstop are already kind-agnostic.
 
 A work-ledger gate adds a `work-ledger` kind and a probe, and needs one thing the pull-request gate does not: the subject is the calling session's own identity, which no regex over the message can find. So `monitor_start` gains an explicit `watch: "work-ledger"` field rather than inferring the gate from session state. Implicit selection would be more convenient and would make a quiet loop unexplainable — a conductor could not tell whether it was gated on its ledger or not, and neither could a maintainer reading the loop.
 
@@ -984,7 +984,7 @@ Two decisions reviewers keep re-opening on this branch, recorded so each round s
 - **The gate has no configuration switch, and that is the decision.** `test_no_config_switch_gates_the_wake` asserts the subtraction rather than the absence of a line: arming is already opt-in because a conductor must name the subject, and a loop is already stoppable, so a third off-position was a setting with one consumer — and the one it had never read a persisted value, because no loader hydration was written for it. Two review lanes asked for the removal on those grounds.
 - **The two `_PERMITTED_STORE_IMPORTERS` entries are a human's edit, by design.** `ledger_wake.py` and `probes/work_ledger.py` both import the store directly, and the allowlist in `test/test_work_ledger.py` names only the routes module and the operator cleanup sweep, so `test_only_the_phase_2_seams_import_the_module` fails on the branch naming exactly those two files. That red is the guard working as specified: its own note says a second importer is a design change that must argue for itself in review "rather than arrive with a passing suite", so the entries belong to whoever accepts the seam, not to the change that needs them.
 
-**The one-call arm is not in #12781 and is a follow-up PR.** Arming the gate in a single call takes four linked pieces — a `watch` field on `monitor_start` and `monitor_update`, the payload that carries it, the applier that turns it into a subject, and the authorization forward — and the last of those lands in [`autonudge_authz.py`](../../src/kiro_crew/autonudge_authz.py), which this branch does not touch. The field is held back deliberately so the whole chain lands together: a `watch` parameter that is accepted and then ignored is worse than one that does not exist yet, because a conductor cannot tell the difference from the call site. Until that PR lands, the probe is reachable but a conductor cannot arm it in one call.
+**The one-call arm is not in #12781; it is [#15691](https://github.com/kirodotdev/KiroCrew/pull/15691).** Arming the gate in a single call takes four linked pieces — a `watch` field on `monitor_start` and `monitor_update`, the payload that carries it, the applier that turns it into a subject, and the authorization forward — and the last of those lands in [`autonudge_authz.py`](../../src/kiro_crew/autonudge_authz.py), which this branch does not touch. The field is held back deliberately so the whole chain lands together: a `watch` parameter that is accepted and then ignored is worse than one that does not exist yet, because a conductor cannot tell the difference from the call site. That PR carries the whole chain together, along with [`rfc-crew-log-wake`](rfc-crew-log-wake.md), which hooks the crew log so a worker's report pulls the gate's next tick forward instead of waiting out the cadence. Until it lands, the probe is reachable but a conductor cannot arm it in one call.
 
 Scope: a `work-ledger` probe, its registration in `build`, the `watch` field on `monitor_start`'s schema, and the target-inference branch. No kernel change. The actionable event set is `done`, `blocked`, `question` and `request`; `progress`, `message`, `channel_open` and `channel_close` advance the fingerprint without firing.
 
@@ -1172,9 +1172,10 @@ doctor scans every config surface that persists an agent name -- cron jobs
 crew bindings (`agents.<name>.kiro_agent`), the config's own selectors
 (`agent.default_agent`, `session.pool_agent`, per-channel `agent` overrides), and
 open chat slots -- and reports any that names a deprecated spec, naming the
-replacement. The check is data-driven off `DEPRECATED_AGENT_SPECS` in `agent.py`,
-defined beside the alias installer so a future rename adds a row instead of a new
-check, and a row is deleted together with its alias. The notice is a
+replacement. The check is data-driven off `DEPRECATED_AGENT_SPECS` in
+`agent_materialization/conductor_agents.py`, defined beside the alias installer so a
+future rename adds a row instead of a new check, and a row is deleted together with
+its alias. The notice is a
 **precondition for deleting the alias**, not for the swap: while the alias
 exists, an unmigrated config keeps working.
 

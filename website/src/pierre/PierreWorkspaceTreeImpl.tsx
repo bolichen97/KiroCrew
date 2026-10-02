@@ -391,6 +391,33 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   }
 }
 
+/**
+ * Collapse a path list into something `@pierre/trees` will accept.
+ *
+ * Two hazards, both reachable after egress redaction flattens differing
+ * segments to one `[REDACTED: ...]` string:
+ *  - identical strings: `appendPresortedPaths` throws 'Duplicate path';
+ *  - a FILE whose path is also a DIRECTORY (an explicit `dir/` entry or the
+ *    implied parent of another path): the tree indexes a directory's children
+ *    by name, so `createFileChild` throws 'Path collides with an existing
+ *    entry'. Both throws are uncaught inside the resetPaths layout effect and
+ *    take down the whole Files route.
+ *
+ * Order and first occurrence are preserved. The directory wins a collision so
+ * its subtree still renders; the shadowed file degrades to a missing row.
+ */
+function dedupeTreePaths(paths: string[]): string[] {
+  const unique = Array.from(new Set(paths))
+  const directories = new Set<string>()
+  for (const path of unique) {
+    const bare = path.endsWith('/') ? path.slice(0, -1) : path
+    if (path.endsWith('/')) directories.add(bare)
+    const segments = bare.split('/')
+    for (let i = 1; i < segments.length; i++) directories.add(segments.slice(0, i).join('/'))
+  }
+  return unique.filter(path => path.endsWith('/') || !directories.has(path))
+}
+
 export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, searchQuery, mode = 'all', selectedPath, persistExpansion = false }: {
   projectDir: string
   onFileOpen?: (absPath: string) => void
@@ -428,7 +455,11 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     queryKey: ['project-tree', projectDir],
     queryFn: () => api.projectTree(projectDir),
     enabled: !!projectDir,
-    refetchInterval: 10_000,
+    // No poll while the read is failing: `api.projectTree` runs under a deadline, so a
+    // wedged gateway would otherwise be re-walked every interval for as long as the tree
+    // is mounted, each pass rejecting on the same deadline. A failed read recovers through
+    // the host's Refresh (it refetches this key), and the poll resumes once that succeeds.
+    refetchInterval: q => (q.state.error ? false : 10_000),
     refetchOnWindowFocus: true,
   })
   // The Refresh under the not-readable root state (below). The listing is the
@@ -735,22 +766,22 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   stateRowsRef.current = fedStateRows?.paths ?? NO_STATE_ROWS
   stateRowFoldersRef.current = fedStateRows?.folders ?? NO_STATE_ROWS
   const paths = useMemo<string[]>(() => {
-    if (mode === 'changed') return statusEntries.map(e => e.path)
+    if (mode === 'changed') return dedupeTreePaths(statusEntries.map(e => e.path))
     // The full-workspace list can still carry a duplicate — e.g. two
     // genuinely different paths that collapse to the same string once
     // egress redaction flattens a differing segment. @pierre/trees
     // `appendPresortedPaths` throws 'Duplicate path' on adjacent
     // identical entries, and that throw is uncaught inside the
     // resetPaths useLayoutEffect below, taking down the whole route.
-    // De-dup here (preserving order + first occurrence, mirroring the
-    // `changed` branch's statusEntries seen-Set) so a duplicate degrades
-    // to a single (missing) row instead of a render crash. Explicit
+    // De-dup here (preserving order + first occurrence) so a duplicate
+    // degrades to a single (missing) row instead of a render crash; see
+    // `dedupeTreePaths` for the file-vs-directory collision it also drops. Explicit
     // trailing-slash paths keep directory rows even when every direct
     // file in that directory fell beyond the file budget.
-    const listed = Array.from(new Set([
+    const listed = dedupeTreePaths([
       ...(tree?.paths ?? []),
       ...(tree?.directories ?? []).map(path => `${path.replace(/\/$/, '')}/`),
-    ]))
+    ])
     return fedStateRows ? [...listed, ...fedStateRows.paths] : listed
   }, [mode, statusEntries, tree, fedStateRows])
   const ready = mode === 'changed' ? status != null : tree != null

@@ -372,7 +372,7 @@ export function midOccurrences(rows: Array<{ meta?: Record<string, unknown> }>):
  *  sites, and the safe default is therefore different:
  *
  *    - `refreshSlot`'s pre-fulfil check pays ONE ROUND TRIP for a decline (it
- *      refetches unbounded), so it can afford the strict form and passes
+ *      walks the window older), so it can afford the strict form and passes
  *      `requireTs: true`: both rows must carry a `ts` and it must match. That is
  *      what rules out two genuinely different rows sharing a caller-supplied id.
  *    - `olderHeadAbovePage` pays the KEPT HEAD for a decline -- the scrollback it
