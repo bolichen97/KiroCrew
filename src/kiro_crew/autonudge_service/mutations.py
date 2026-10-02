@@ -74,6 +74,7 @@ async def add(
     gate: bool = False,
     judge: dict | None = None,
     watch: str = "",
+    standby: bool = False,
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -105,6 +106,7 @@ async def add(
             gate=gate,
             judge=judge,
             watch=watch,
+            standby=standby,
             replace_existing=replace_existing,
             replace_stopped=replace_stopped,
             self_armed=self_armed,
@@ -156,6 +158,7 @@ async def _add_locked(
     gate: bool = False,
     judge: dict | None = None,
     watch: str = "",
+    standby: bool = False,
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -175,6 +178,7 @@ async def _add_locked(
             gate=gate,
             judge=judge,
             watch=watch,
+            standby=standby,
             replace_existing=replace_existing,
             replace_stopped=replace_stopped,
             self_armed=self_armed,
@@ -197,6 +201,7 @@ async def _add_unserialized(
     gate: bool = False,
     judge: dict | None = None,
     watch: str = "",
+    standby: bool = False,
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -206,6 +211,10 @@ async def _add_unserialized(
     from kiro_crew import autonudge as seams  # read at call time: the facade imports us
 
     validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
+    if standby and (
+        standby is not True or watch != "work-ledger" or max_cycles or max_runtime_secs
+    ):
+        raise ValueError("standby requires a work-ledger watch without lifetime bounds")
     idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
     async with self._lock:
         if admission_check is not None and not admission_check():
@@ -232,6 +241,14 @@ async def _add_unserialized(
             # orphaned by a replacement.
             if not replace_existing and (existing.active or not replace_stopped):
                 raise MonitorUpdateConflict("session already has an automation")
+            from kiro_crew import conductor_standby
+
+            if existing.standby or await asyncio.to_thread(
+                conductor_standby.has_record, existing.id
+            ):
+                raise MonitorUpdateConflict(
+                    "use monitor_update for standby; the owner must remove it before replacement"
+                )
             existing_monitor = existing.monitor
             if (
                 not replace_existing
@@ -354,7 +371,10 @@ async def _add_unserialized(
             gate=bool(gate or watch),
             banner=banner,
             self_armed=self_armed,
+            standby=standby,
         )
+        if loop.standby and loop.monitor is not None:
+            loop.monitor.token_usage_known = False
         self._loops[loop.id] = loop
         # Persist WITHOUT blocking the event loop (no-blocking-call rule:
         # _write_state fsyncs, and a wedged disk must not freeze the
@@ -564,6 +584,20 @@ async def _update_unserialized(
             raise AutoNudgeStaleBaseline(loop_id)
         # Keep typed nested values intact. ``asdict`` recursively converts
         # MonitorState to a plain dict, which is not a valid rollback value.
+        from kiro_crew import conductor_standby
+
+        if loop.standby or await asyncio.to_thread(conductor_standby.has_record, loop.id):
+
+            if watch is not None and watch != "work-ledger":
+                raise ValueError("standby must watch its own work ledger")
+            if max_cycles or max_runtime_secs:
+                raise ValueError("standby uses a rolling execution limit, not lifetime bounds")
+            if active is False:
+                await conductor_standby.joined_io(conductor_standby.revoke, loop.id)
+            elif active is True:
+                record = await asyncio.to_thread(conductor_standby._read, loop.id)
+                if not record["enabled"] or record["claimed"]:
+                    raise ValueError("standby requires an explicit owner resume")
         previous = {item.name: getattr(loop, item.name) for item in fields(loop)}
         # Set only if a retarget takes this loop's pending wake claim, so the
         # rollback below restores exactly what it removed and nothing else.
@@ -1006,6 +1040,14 @@ def remove_sync(
 ) -> NudgeLoop | None:
     """Remove a loop. ``persist=False`` skips the blocking save — used by
     async callers that snapshot+offload the write themselves right after."""
+    from kiro_crew import conductor_standby
+
+    if (
+        persist
+        and loop_id in self._loops
+        and (self._loops[loop_id].standby or conductor_standby.has_record(loop_id))
+    ):
+        conductor_standby.revoke(loop_id)
     if persist and loop_id in self._loops:
         from kiro_crew import autonudge_provider_trust
 
@@ -1221,6 +1263,12 @@ async def _remove_unserialized(
             if not precondition(current):
                 return False
         restore_provider_credentials = False
+        from kiro_crew import conductor_standby
+
+        if current is not None and (
+            current.standby or await asyncio.to_thread(conductor_standby.has_record, loop_id)
+        ):
+            await conductor_standby.joined_io(conductor_standby.revoke, loop_id)
         if existed:
             assert current is not None
             was_active = current.active

@@ -114,8 +114,9 @@ class TestConductorInstaller:
         """
         data = self._install(tmp_path, monkeypatch)
         prompt = " ".join(data["prompt"].split())
-        assert "Arm a loop on your own session with `monitor_start`" in prompt
-        assert "If arming is refused outright" in prompt
+        assert "Only when standby is absent, arm a finite loop on your own session" in prompt
+        assert "standby stays armed without lifetime renewal" in prompt
+        assert "If arming is refused" in prompt
         assert "drive that one round with `wait`" in prompt
         assert "autonudge_stop" in prompt
 
@@ -492,14 +493,14 @@ class TestConductorInstaller:
         assert "`work_report` at round boundaries" in body
         assert "root conductor gets `not_bound`" in body
 
-    def test_prompt_notes_the_patrol_gate_is_still_a_timer(self, tmp_path, monkeypatch):
-        """``monitor_start`` gates on one pull-request URL and nothing else today, so
-        a cycle fires whether or not anything was reported. The prompt says so, and
-        says what to switch to, rather than implying a gate that does not exist.
-        """
-        prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "monitor_start" in prompt
-        assert 'watch: "work-ledger"' in prompt
+    def test_prompt_keeps_standby_and_schedules_pending_acceptance(self, tmp_path, monkeypatch):
+        """The installed charter must not replace standby with a renewed timer."""
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        assert 'watch="work-ledger"' in prompt
+        assert "monitor_update(check_after_secs=300)" in prompt
+        assert "check_after_secs=0" in prompt
+        assert "when an individual task completes" in prompt
+        assert "Never grant yourself standby authority or resume after a user Stop" in prompt
 
     def test_prompt_names_its_own_skill_and_not_the_deprecated_alias(self, tmp_path, monkeypatch):
         """The procedure lives in ``goal-conductor``. ``goal-ledger-conductor`` is a

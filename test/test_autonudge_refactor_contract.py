@@ -165,9 +165,9 @@ _BASE_REACHED_IMPORTS = frozenset(
 _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "__init__": ("method", "38ac57f125dd"),
     "_acquire_mutation_lock": ("method+async", "e26080a5a8bc"),
-    "_add_locked": ("method+async", "923a1f34e18b"),
+    "_add_locked": ("method+async", "b0737a5c9d51"),
     "_add_monitor_locked": ("method+async", "55179b26aeff"),
-    "_add_unserialized": ("method+async", "923a1f34e18b"),
+    "_add_unserialized": ("method+async", "b0737a5c9d51"),
     "_append_judge_labels": ("method", "05f9e694d3d7"),
     "_apply_monitor_budget_stop": ("method", "c05b26fec956"),
     "_apply_monitor_user_stop": ("method", "0d02c6c3b88e"),
@@ -239,7 +239,7 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "_write_quarantine_sidecar": ("method", "35d06f40fb45"),
     "_write_quarantine_sidecar_locked": ("method", "35d06f40fb45"),
     "_write_state": ("method", "b02c548f23ec"),
-    "add": ("method+async", "d723f7c062d9"),
+    "add": ("method+async", "999293445365"),
     "add_monitor": ("method+async", "b07c1299b741"),
     "apply_monitor_probe": ("method+async", "7e318e77ec64"),
     "clear_terminal_monitor": ("method+async", "82db71923663"),
@@ -323,6 +323,7 @@ _BASE_NUDGELOOP_FIELDS: list[tuple[str, str | None]] = [
     ("terminal_notification_stopped_at", "0.0"),
     ("banner", "''"),
     ("self_armed", "False"),
+    ("standby", "False"),
     ("config_generation", "0"),
 ]
 

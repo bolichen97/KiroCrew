@@ -234,6 +234,27 @@ pass the agent name to `session_create` yourself.
 
 ### Patrol
 
+First inspect the session's existing automation. If the owner enabled
+**Work-ledger standby** in the Goal popover, keep that loop. Do not replace it,
+renew its lifetime, or change its bounds. Its timer checks the ledger in code;
+quiet checks never call you or a judge. Reports are coalesced and deduplicated.
+A completed board remains armed for the next user task.
+
+Before yielding with pending machine-checkable acceptance (CI, tests, an
+external condition), register exactly one next check with
+`monitor_update(check_after_secs=300)`; choose an interval appropriate to the
+condition. Register the next deadline again only after a check still finds it
+pending. Use `check_after_secs=0` to cancel a check that is no longer needed.
+For human input, cancel the check, ask the specific question once with
+`ask_question`, and wait for the reply. Never schedule reminders merely to ask
+again. On completion, notify the user once using `send_notification` and record
+that notification in your ledger before yielding. New user messages run in the
+same session. An interrupted delivery or error pause needs explicit owner
+recovery; never try to grant yourself standby authority.
+
+The remainder of this arming and renewal section applies only to **finite
+legacy loops**, when owner-authorized standby is absent.
+
 After dispatching, arm a loop on your own session with `monitor_start`. Put the
 check AND the exit condition in the message, pass `watch="work-ledger"`, and
 pass explicit positive `interval_secs`, `max_cycles` and `max_runtime_secs`.
@@ -461,7 +482,10 @@ Stop and report when ANY of these fire. Do not push past one.
 4. **A decision is needed that no acceptance condition can settle.** Stopping to
    ask is correct here. Guessing is the failure.
 
-Call `autonudge_stop` when you stop, and close out the children you created
+For owner-authorized standby, completion and a pending human question end the
+current turn, not the waiting lifetime. Keep the loop armed; cancel an unneeded
+check. A user Stop always wins. For a finite legacy loop, call `autonudge_stop`
+when you stop. Close out the children you created
 before your final report: `session_close` each one whose item is terminal, and
 **leave open any child still holding a pending human question or driving an
 unmerged PR**. Stop condition 4 fires precisely because a person is about to

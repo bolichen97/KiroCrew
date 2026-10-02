@@ -487,6 +487,8 @@ class NudgeLoop:
     # tell apart). Reuses the module's generation/fence pattern rather than a new
     # concurrency framework. Absent in a store written before this field ->
     # decodes to 0, and a first fire simply captures 0.
+    standby: bool = False
+
     config_generation: int = 0
 
 

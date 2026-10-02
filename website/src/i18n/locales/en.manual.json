@@ -1958,7 +1958,15 @@
       "judge_outcome_terminal": "finished",
       "judge_outcome_fallback": "could not judge",
       "judge_outcome_unknown": "unknown",
-      "default_goal": "Your north star is in {{northStar}}, roadmap in {{roadmap}}, tasks in {{tasks}}. Pick the single highest-leverage next step toward the goal and execute it. Update {{tasks}}. Post a blocker ONCE if genuinely stuck. When the goal is met, call the {{stopTool}} tool to halt the loop."
+      "default_goal": "Your north star is in {{northStar}}, roadmap in {{roadmap}}, tasks in {{tasks}}. Pick the single highest-leverage next step toward the goal and execute it. Update {{tasks}}. Post a blocker ONCE if genuinely stuck. When the goal is met, call the {{stopTool}} tool to halt the loop.",
+      "standby": "Work-ledger standby",
+      "standby_help": "Wait without model calls. Wake for worker events or scheduled checks, up to 12 turns per hour. Stop pauses standby; completed tasks leave it armed.",
+      "probe_interval": "Seconds between ledger checks",
+      "standby_instruction": "Read the work ledger, verify completed work, and notify me once. Schedule a check for pending acceptance. Keep standby armed after completion.",
+      "standby_paused_auth": "Standby paused: authorization is unavailable. Check the owner grant before resuming.",
+      "standby_paused_failure": "Standby paused after repeated read or delivery failures. Check the service log before resuming.",
+      "standby_paused_interrupted": "Standby paused after an interrupted turn. Check its side effects before resuming.",
+      "standby_rate_limit": "Standby wake limit reached; pending work resumes when the hourly window opens."
     },
     "bottomTerminalPanel": {
       "close_failed": "Couldn't stop this terminal's shell on the server. It will be cleaned up automatically.",

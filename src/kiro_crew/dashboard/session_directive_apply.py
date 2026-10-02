@@ -1053,6 +1053,7 @@ async def _monitor_update(
         # the tool drops a blank rather than forwarding one, so anything that arrives
         # here names the watch to arm.
         watch=patch.get("watch"),
+        check_after_secs=patch.get("check_after_secs"),
         # A message write with NO baseline SKIPS the stale check rather than failing it, so
         # hand it the token read above -- scoped to the message case, as the handler's 409 is.
         expect_fingerprint=(baseline_token if patch.get("message") is not None else None),
@@ -1134,7 +1135,9 @@ async def _structured_monitor_update(
     # holds no brief, so the field has nowhere to go here -- and an owner who is told
     # their criterion was armed, while every tick keeps firing on the typed probe
     # alone, has no way to discover that from the acknowledgement.
-    legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner", "judge"})
+    legacy_only = sorted(
+        set(patch) & {"message", "max_cycles", "active", "banner", "judge", "check_after_secs"}
+    )
     if legacy_only:
         raise _DirectiveDenied(
             "monitor_update cannot apply legacy fields to a structured monitor: "

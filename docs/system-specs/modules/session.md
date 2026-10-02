@@ -1468,6 +1468,12 @@ applier — a raised turn budget is in force on the next prompt.
 
 ## Stop Orchestration
 
+Dashboard chat Stop also revokes owner-authorized work-ledger standby, even
+when its session is idle. It fences queued admission before awaiting durable
+revocation. A persistence failure still cancels the current turn and reports
+an error instead of claiming the standby stop survived a restart. Legacy
+finite auto-nudge loops keep their existing chat-Stop behavior.
+
 `stop_turn()` is the shared orchestration layer for every stop surface (dashboard Stop button, Slack `/kirocrew stop`, transport stop verbs). Sequence:
 
 0. Decline a cooperative stop while the session's own automatic `/compact` turn

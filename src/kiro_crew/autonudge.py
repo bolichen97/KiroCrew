@@ -853,6 +853,7 @@ class AutoNudgeService:
         # its accepted fingerprint. Durable delivery state remains authoritative
         # after the dispatcher returns or the process restarts.
         self._accepted_monitor_turns: dict[str, str] = {}
+        self._standby_deliveries: set[str] = set()
         # The periodic reconciler task (see _reconcile_forever). Owned by
         # start()/stop(); None while the service is not running.
         self._reconciler: asyncio.Task | None = None
@@ -1080,7 +1081,10 @@ class AutoNudgeService:
                             _cg,
                         )
                         loop_values["config_generation"] = 0
+                loop_values["standby"] = loop_values.get("standby") is True
                 loop = NudgeLoop(**loop_values)
+                if loop.standby and loop.monitor is not None:
+                    loop.monitor.token_usage_known = False
                 # Rotated on EVERY load: a human may have hand-edited the goal while we
                 # were down, so a pre-restart token must not authorise overwriting it.
                 loop.goal_token = new_goal_token()
@@ -1637,6 +1641,7 @@ class AutoNudgeService:
         self._timers.clear()
         self._reconcile_candidates.clear()
         self._accepted_monitor_turns.clear()
+        self._standby_deliveries.clear()
         self._maintenance_quiescing.clear()
         self._maintenance_quiesce_events.clear()
         global _INSTANCE

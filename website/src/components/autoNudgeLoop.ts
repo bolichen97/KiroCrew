@@ -10,6 +10,7 @@ import { i18nT } from '../i18n/t'
 import { fmtDuration, fmtTimeNumeric } from '../i18n/format'
 
 export interface AutoNudgeLoop {
+  standby?: boolean
   id: string
   slot_key: string
   message: string
@@ -122,6 +123,11 @@ export function nextCycle(loop: AutoNudgeLoop | null | undefined, nowTs: number)
 
 /** Line for the next trigger, or '' when no active loop. */
 export function nextCycleText(loop: AutoNudgeLoop | null | undefined, nowTs: number): string {
+  if (loop?.active && loop.standby) {
+    return i18nT(loop.stopped_reason === 'standby_rate_limit'
+      ? 'components.autoNudgePopover.standby_rate_limit'
+      : 'components.autoNudgePopover.standby')
+  }
   const next = nextCycle(loop, nowTs)
   switch (next.kind) {
     case 'none':
