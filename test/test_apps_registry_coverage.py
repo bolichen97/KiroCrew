@@ -4676,7 +4676,8 @@ class TestGitFetchAndPullFailClosed:
         monkeypatch.setattr(registry, "_clone_origin_url", _origin)
         monkeypatch.setattr(registry, "_read_clone_branch", lambda path: "main")
         spawned = self._spawns(
-            monkeypatch, [(("git", "pull"), lambda a, k: self._Proc(returncode=1, output=b"no"))]
+            monkeypatch,
+            [(("git", "-c"), lambda a, k: self._Proc(returncode=1, output=b"no"))],
         )
         log: list[str] = []
         result = await registry._git_clone_or_pull(url, "main", dest, log)
@@ -4684,7 +4685,9 @@ class TestGitFetchAndPullFailClosed:
             "ok": False,
             "error": "git pull failed (exit 1); not installing stale code",
         }
-        assert spawned == [("git", "pull", "--ff-only", url, "main")]
+        # The hooks/fsmonitor neutralizer is spliced in right after ``git``.
+        hooks = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false")
+        assert spawned == [("git", *hooks, "pull", "--ff-only", url, "main")]
         assert log[-1] == "git pull failed (exit 1) — aborting"
         assert (dest / ".git").is_dir(), "a failed pull leaves the checkout in place"
 

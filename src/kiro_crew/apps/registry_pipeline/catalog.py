@@ -45,6 +45,7 @@ from kiro_crew.apps.registry_pipeline.indexes import (
 )
 from kiro_crew.apps.registry_pipeline.manifests import _resolve_manifest
 from kiro_crew.apps.registry_pipeline.sources import _effective_registries, _load_registry_file
+from kiro_crew.apps.registry_pipeline.store_art import _prewarm_owner_tier_store_assets
 from kiro_crew.apps.registry_pipeline.subprocess_env import _detect_probe_env
 from kiro_crew.sandbox import (
     create_subprocess_limited,
@@ -450,6 +451,14 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
     refreshed: list[str] = []
     failed: list[str] = []
     results: list[dict[str, Any]] = []
+    # Registries whose index was refetched in this refresh, with the fresh in-memory
+    # rows the fetch returned. Their store art is prewarmed AFTER the loop, not
+    # inside it: the prewarm's provenance gate reads every sibling registry's index
+    # cache, and a sibling later in the loop has not written its cache yet when an
+    # earlier registry's prewarm runs, so an in-loop prewarm would skip the rows a
+    # not-yet-refreshed sibling also names as ambiguous -- the same reason
+    # ``_load_external_registries`` prewarms after its gather settles.
+    fresh: list[tuple[Any, list[dict[str, Any]]]] = []
     for reg in registries:
         name = _external_registry_cache_identity(reg)
         display_name = _public_registry_name(reg)
@@ -478,8 +487,21 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
                 expire_paths.add(_manifest_cache_path(e))
         for cache_path in expire_paths:
             await asyncio.to_thread(_expire_cache_file, cache_path)
+        # Prewarmed after the loop, and AFTER this expiry, so an owner-tier
+        # registry's rows come back warm from this refresh instead of bare: the
+        # expiry above would otherwise discard the manifests the prewarm writes.
+        # ``entries`` is the fresh index ``_fetch_and_cache_external_registry``
+        # returned, the only input the prewarm accepts (see ``store_art``).
+        fresh.append((reg, entries))
         refreshed.append(display_name)
         results.append({"name": display_name, "ok": True})
+
+    # Every refreshed registry has written its index cache and expired its manifest
+    # caches by now, so the prewarm's provenance gate reads a settled set of
+    # siblings. One bounded batch per fresh owner-tier registry, in refresh order;
+    # a failing prewarm still propagates exactly as it did inside the loop.
+    for reg, entries in fresh:
+        await _prewarm_owner_tier_store_assets(reg, entries)
 
     # Re-warm so the response's app count reflects post-refresh state (and
     # untouched registries read their still-valid caches).

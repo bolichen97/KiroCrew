@@ -1002,7 +1002,29 @@ async def test_reused_checkout_pull_never_repoints_origin(monkeypatch, tmp_path)
     err = await registry._git_clone_or_pull("https://example.com/new-home.git", "main", dest, [])
 
     assert err is None
-    assert spawned[0][:2] == ["git", "pull"]
+
+    def _subcommand(argv):
+        # Skip ``git`` and every leading ``-c KEY=VALUE`` pair the hooks/fsmonitor
+        # neutralizer splices in, then read the subcommand slot.
+        i = 1
+        while i < len(argv) and argv[i] == "-c":
+            i += 2
+        return argv[i] if i < len(argv) else ""
+
+    # ``git`` is argv[0]; the hooks/fsmonitor neutralizer ``-c`` pairs follow it,
+    # then the ``pull --ff-only`` the reuse path has always run.
+    git_subs = [_subcommand(cmd) for cmd in spawned if cmd and cmd[0] == "git"]
+    assert git_subs == ["pull"], spawned
+    assert spawned[0][0] == "git" and spawned[0][-4:] == [
+        "pull",
+        "--ff-only",
+        "https://example.com/new-home.git",
+        "main",
+    ], spawned
+    for cmd in spawned:
+        if cmd and cmd[0] == "git":
+            assert f"core.hooksPath={os.devnull}" in cmd, cmd
+    # Never repoints the origin remote.
     assert not any(cmd[:3] == ["git", "remote", "set-url"] for cmd in spawned)
 
 
@@ -1171,6 +1193,9 @@ async def test_credentialed_pull_appends_exec_neutralizers_after_inherited_confi
     _assert_credential_transport_hardening(transport_env, raw_url, public_url)
     for argv, kwargs in spawned:
         if "fetch" not in argv:
+            # The local steps of an INSTALL carry the inherited command config
+            # untouched and are NOT masked (``mask_local_git_config`` is the
+            # prewarm's flag): masking would disable Git LFS for the installed tree.
             assert kwargs["env"] == {
                 "BASE": "1",
                 "GIT_CONFIG_COUNT": "4",
@@ -1587,7 +1612,16 @@ async def test_pinned_fetch_isolates_credentials_to_network_transport(monkeypatc
     assert len(wrapped) == len(spawned) == 4
     assert all(secret not in "\n".join(argv) for argv in wrapped)
     assert all(secret not in "\n".join(argv) for argv, _ in spawned)
-    assert any(argv[:4] == ["git", "remote", "add", "origin"] for argv in wrapped)
+    # Every spawn carries the ``-c`` hooks/fsmonitor neutralizer right after ``git``;
+    # the subcommand is what follows those pairs.
+
+    def _subcommand(argv: list[str]) -> list[str]:
+        rest = argv[1:]
+        while rest[:1] == ["-c"]:
+            rest = rest[2:]
+        return rest
+
+    assert any(_subcommand(argv)[:3] == ["remote", "add", "origin"] for argv in wrapped)
     assert public_url in "\n".join(part for argv in wrapped for part in argv)
 
     for argv, kwargs in spawned:

@@ -17,6 +17,7 @@ from typing import Any
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.registry_pipeline.git_targets import (
+    _GIT_EXEC_NEUTRALIZER_PAIRS,
     _git_output_is_auth_shaped,
     _git_target_is_unsupported,
     _git_transport_env,
@@ -51,6 +52,22 @@ _COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 # Timeout limits (seconds)
 _CLONE_TIMEOUT = 60
+
+
+# Config overrides that stop the REPOSITORY (or the user's global git config)
+# supplying a program git runs, prepended to EVERY git invocation this module
+# spawns -- not just the network one. ``git checkout`` fires ``post-checkout`` and
+# ``git init`` honours ``init.templateDir``, so a repo shipping ``.githooks/`` plus a
+# global ``core.hooksPath`` runs arbitrary code as the gateway user during the local
+# steps that :func:`_git_transport_env` (network only) never reaches. ``-c`` on our
+# own argv beats every config file. ``core.hooksPath`` points at ``os.devnull``, a
+# non-directory OS device under which git finds no hook and into which no directory
+# can be created (the ``_HOOKS_SINK`` reasoning in ``dashboard/handlers/worktree.py``);
+# ``core.fsmonitor=false`` refuses a repo-named filesystem-monitor command git would
+# otherwise spawn on index reads.
+_HOOKS_NEUTRALIZER_ARGV: tuple[str, ...] = tuple(
+    token for key, value in _GIT_EXEC_NEUTRALIZER_PAIRS for token in ("-c", f"{key}={value}")
+)
 
 
 async def _rmtree_force_settled(path: str | Path) -> None:
@@ -346,6 +363,7 @@ async def _git_fetch_ref(
     credential_target: str | None = None,
     clone_env: dict[str, str],
     sandbox_mode: str,
+    mask_local_git_config: bool = False,
 ) -> dict[str, Any] | None:
     """Materialise *dest* from one remote ref. Returns None on success.
 
@@ -376,6 +394,15 @@ async def _git_fetch_ref(
     :func:`minimal_env`, which does not disable the user's global git config, so a
     configured ``init.templateDir`` would install hooks into this repository and
     the checkout below would then execute ``post-checkout``.
+
+    *mask_local_git_config* additionally runs the LOCAL steps (init, remote add,
+    checkout, branch) with ``GIT_CONFIG_NOSYSTEM=1`` / ``GIT_CONFIG_GLOBAL=devnull``
+    so no operator-configured ``filter.<name>.smudge`` program resolves for a
+    driver the repository selects through ``.gitattributes``. It is OFF by default
+    because masking also disables Git LFS: an install would check out LFS pointer
+    files instead of content. Only the pre-install store-art prewarm -- which reads
+    a handful of image files out of a throwaway checkout and never builds or runs
+    the tree -- opts in; every install path keeps *clone_env* as is.
     """
     transport_target = credential_target or git_url
     if _git_target_is_unsupported(transport_target):
@@ -410,11 +437,33 @@ async def _git_fetch_ref(
         timeout: int,
         network: bool = False,
     ) -> tuple[int, str]:
+        # Prepend the hooks/fsmonitor neutralizer to EVERY git spawn (network or
+        # not): the init/checkout steps run with *clone_env*, which carries no such
+        # override, so without this a repo-shipped ``post-checkout`` executes during
+        # checkout. ``argv[0]`` is always ``git``; the ``-c`` overrides go right after
+        # it so they precede the subcommand.
+        argv = [argv[0], *_HOOKS_NEUTRALIZER_ARGV, *argv[1:]]
         sandboxed, _cleanup = await wrap_argv_async(argv, mode=sandbox_mode, _prepare=wrap_argv)
         sandboxed = cgroup_scope_argv(sandboxed)
-        process_env = (
-            _git_transport_env(credential_target, git_url, clone_env) if network else clone_env
-        )
+        if network:
+            process_env = _git_transport_env(credential_target, git_url, clone_env)
+        elif mask_local_git_config:
+            # Prewarm only. The local steps (init, checkout, branch) need no
+            # credential helper, so they run with system and global git config
+            # disabled. A repository selects filter drivers by name through
+            # ``.gitattributes``; the PROGRAM behind that name comes from the
+            # operator's global/system config, and with those files out of scope no
+            # ``filter.<name>.smudge`` resolves, so a checkout can execute nothing a
+            # repository chose. The network step keeps the operator's config for
+            # its credential helpers. Installs do NOT take this branch: the same
+            # masking disables Git LFS and would check out pointer files.
+            process_env = {
+                **clone_env,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+        else:
+            process_env = clone_env
         proc = await create_subprocess_limited(
             *sandboxed,
             cwd=str(cwd) if cwd else None,
@@ -633,8 +682,13 @@ async def _git_fetch_branch(
     credential_target: str | None = None,
     clone_env: dict[str, str],
     sandbox_mode: str,
+    mask_local_git_config: bool = False,
 ) -> dict[str, Any] | None:
-    """Fetch and check out *branch* without exposing credentials to checkout."""
+    """Fetch and check out *branch* without exposing credentials to checkout.
+
+    *mask_local_git_config* is forwarded to :func:`_git_fetch_ref`; see there. It
+    is for the pre-install store-art prewarm only and stays off for installs.
+    """
     return await _git_fetch_ref(
         git_url,
         branch,
@@ -644,6 +698,7 @@ async def _git_fetch_branch(
         credential_target=credential_target,
         clone_env=clone_env,
         sandbox_mode=sandbox_mode,
+        mask_local_git_config=mask_local_git_config,
     )
 
 
@@ -952,9 +1007,10 @@ async def _git_clone_or_pull(
             # Route through wrap_argv (OS sandbox) THEN cgroup_scope_argv, matching
             # the fresh-clone path below — the cgroup DoS ceiling is the outermost
             # layer but must not replace the wrap_argv sandbox on this
-            # agent-influenced git spawn.
+            # agent-influenced git spawn. The hooks/fsmonitor neutralizer is spliced
+            # right after ``git`` so a repo-shipped hook cannot run during the pull.
             pull_cmd, _cleanup = await wrap_argv_async(
-                ["git", "pull", "--ff-only", git_url, branch],
+                ["git", *_HOOKS_NEUTRALIZER_ARGV, "pull", "--ff-only", git_url, branch],
                 mode=sandbox_mode,
                 _prepare=wrap_argv,
             )
@@ -1041,6 +1097,7 @@ async def _git_clone_or_pull(
         dest.parent.mkdir(parents=True, exist_ok=True)
         clone_cmd = [
             "git",
+            *_HOOKS_NEUTRALIZER_ARGV,
             "clone",
             "--depth",
             "1",

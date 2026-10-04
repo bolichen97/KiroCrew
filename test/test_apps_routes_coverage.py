@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import platform as platform_mod
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -3360,6 +3361,140 @@ class TestBlobProxy:
             assert resp.headers["Content-Type"] == "image/png"
             assert resp.headers["Cache-Control"] == "public, max-age=86400"
             assert await resp.read() == b"\x89PNG\r\n"
+
+    @pytest.mark.asyncio
+    async def test_serving_a_cached_blob_refreshes_its_mtime(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``_gc_blob_cache_dir`` reclaims a blob-cache file whose mtime has aged past
+        # the grace, and only the owner-tier prewarm re-dates a live row's art. An
+        # index-tier blob the proxy wrote once is never re-published, so without a
+        # touch on serve a file still being served every day would age out and be
+        # reclaimed, then re-cloned. Serving must bump the mtime so "being served"
+        # keeps a file young exactly as a rewrite does.
+        import os as _os
+        import time as _time
+
+        _setup_env(tmp_path, monkeypatch)
+        monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
+
+        async def _must_not_fetch(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("cache hit must not trigger a clone")
+
+        clone_url = "ssh://forge.example/org/acme.git"
+        monkeypatch.setattr(
+            routes_mod,
+            "get_registry_app_by_repo",
+            lambda repo: {"repo": repo, "gitUrl": clone_url, "branch": "main"},
+        )
+        monkeypatch.setattr(routes_mod, "_fetch_git_blob", _must_not_fetch)
+        cache = (
+            routes_mod._blob_cache_dir()
+            / routes_mod._blob_cache_key("acme", clone_url)
+            / "main"
+            / "assets"
+        )
+        cache.mkdir(parents=True)
+        blob = cache / "logo.png"
+        blob.write_bytes(b"\x89PNG\r\n")
+        # Backdate the file well into the past, as an aging blob would be.
+        old = _time.time() - 10 * 86400
+        _os.utime(blob, (old, old))
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(
+                "/api/apps/blob",
+                params={"repo": "acme", "path": "assets/logo.png", "ref": "main"},
+            )
+            assert resp.status == 200
+            assert await resp.read() == b"\x89PNG\r\n"
+
+        # The serve bumped the mtime back to ~now, so it is young enough to survive GC.
+        assert blob.stat().st_mtime > old + 86400
+
+    @pytest.mark.asyncio
+    async def test_a_touch_failure_does_not_fail_the_serve(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Negative control / robustness: the mtime refresh is best-effort. If the
+        # touch raises (a read-only mount, a racing GC unlink), the blob is served
+        # regardless rather than 500-ing. Without the ``try/except`` around the
+        # ``os.utime`` this serve would raise.
+        import os as _os
+
+        _setup_env(tmp_path, monkeypatch)
+        monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
+
+        async def _must_not_fetch(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("cache hit must not trigger a clone")
+
+        clone_url = "ssh://forge.example/org/acme.git"
+        monkeypatch.setattr(
+            routes_mod,
+            "get_registry_app_by_repo",
+            lambda repo: {"repo": repo, "gitUrl": clone_url, "branch": "main"},
+        )
+        monkeypatch.setattr(routes_mod, "_fetch_git_blob", _must_not_fetch)
+        cache = (
+            routes_mod._blob_cache_dir()
+            / routes_mod._blob_cache_key("acme", clone_url)
+            / "main"
+            / "assets"
+        )
+        cache.mkdir(parents=True)
+        (cache / "logo.png").write_bytes(b"\x89PNG\r\n")
+
+        real_utime = _os.utime
+
+        def _boom(path: Any, *args: Any, **kwargs: Any) -> None:
+            # Fail the serve's refresh touch, but leave the FileResponse's own
+            # stat/open untouched so the rest of the handler behaves normally.
+            if str(path).endswith("logo.png"):
+                raise OSError("read-only cache")
+            return real_utime(path, *args, **kwargs)
+
+        monkeypatch.setattr(routes_mod.os, "utime", _boom)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(
+                "/api/apps/blob",
+                params={"repo": "acme", "path": "assets/logo.png", "ref": "main"},
+            )
+            assert resp.status == 200, "a failed mtime refresh must not fail the serve"
+            assert await resp.read() == b"\x89PNG\r\n"
+
+    def test_touch_without_nofollow_utime_still_refreshes_a_regular_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows has no ``os.utime(follow_symlinks=False)``; the touch must still
+        # land there instead of raising NotImplementedError and being skipped.
+        import os as _os
+        import time as _time
+
+        monkeypatch.setattr(routes_mod.os, "supports_follow_symlinks", set())
+        blob = tmp_path / "logo.png"
+        blob.write_bytes(b"x")
+        old = _time.time() - 10 * 86400
+        _os.utime(blob, (old, old))
+        routes_mod._touch_served_blob(blob)
+        assert blob.stat().st_mtime > old + 86400
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege")
+    def test_touch_without_nofollow_utime_leaves_a_link_target_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import os as _os
+        import time as _time
+
+        monkeypatch.setattr(routes_mod.os, "supports_follow_symlinks", set())
+        target = tmp_path / "outside.png"
+        target.write_bytes(b"x")
+        old = _time.time() - 10 * 86400
+        _os.utime(target, (old, old))
+        link = tmp_path / "logo.png"
+        link.symlink_to(target)
+        routes_mod._touch_served_blob(link)
+        assert target.stat().st_mtime == pytest.approx(old)
 
     @pytest.mark.asyncio
     async def test_repo_key_reuse_across_registries_does_not_serve_stale_bytes(
