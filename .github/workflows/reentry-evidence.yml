@@ -1,0 +1,29 @@
+name: reentry-evidence
+on:
+  push:
+    branches: [evidence/16252-real-unit]
+  workflow_dispatch:
+jobs:
+  real-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start a systemd --user session
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          UID_NUM="$(id -u)"
+          echo "XDG_RUNTIME_DIR=/run/user/${UID_NUM}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${UID_NUM}/bus" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do [ -S "/run/user/${UID_NUM}/bus" ] && break; sleep 1; done
+          XDG_RUNTIME_DIR=/run/user/${UID_NUM} systemctl --user --version | head -1
+      - name: Real unit, healthy and broken
+        run: |
+          git log -1 --format='PR head under test: %H %s' HEAD~1
+          ./evidence/real_unit.sh
