@@ -544,7 +544,7 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
     ),
     DeniedCommandRule(
         id="data-exfil-curl-upload",
-        pattern=".*curl.*(--upload-file|(^|\\s)-T\\s*\\S).*",
+        pattern=".*(?:^|[\\s;&|(`/])curl(?:\\.exe)?\\s.*--upload-file(?:[=\\s]|$).*",
         category="credential-exfil",
         description=(
             "Blocks a `curl` file upload (`--upload-file` / `-T file`), which sends a local file "
