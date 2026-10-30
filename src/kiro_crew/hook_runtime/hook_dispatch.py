@@ -229,7 +229,10 @@ async def permission_pre_tool_block(
         return f"PreToolUse hook could not run: {exc}"[:500]
     for r in results:
         if r.exit_code == 2:
-            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+            reason = r.stderr[:200] or (
+                f"governance: {r.error[:200]}" if r.error else "hook denied"
+            )
+            return f"{r.hook_name}: {reason}"
         if r.exit_code != 0:
             detail = (
                 r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")

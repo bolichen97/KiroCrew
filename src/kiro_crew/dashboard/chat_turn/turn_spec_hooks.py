@@ -418,20 +418,25 @@ async def _fire(
                     },
                 )
             elif r.exit_code == 2:
-                injected.append(
-                    f"BLOCKED:{r.hook_name}:{r.stderr[:200] if r.stderr else 'hook denied'}"
-                )
-                logger.warning(
-                    "Hook %s blocked tool: %s",
-                    r.hook_name,
-                    r.stderr[:200] if r.stderr else "exit 2",
-                )
+                # Exit 2 has two sources: the hook ran and asked to block (its
+                # reason on stderr), or governance refused to run it (the reason
+                # on ``error``, stderr empty). Name which, so a governance denial
+                # no longer logs as a bare "exit 2" indistinguishable from the
+                # hook's own verdict.
+                if r.stderr:
+                    source, reason = "hook exit 2", r.stderr[:200]
+                elif r.error:
+                    source, reason = "governance", r.error[:200]
+                else:
+                    source, reason = "hook exit 2", "hook denied"
+                injected.append(f"BLOCKED:{r.hook_name}:{reason}")
+                logger.warning("Hook %s blocked tool (%s): %s", r.hook_name, source, reason)
                 state.broadcast_ws(
                     "activity_event",
                     {
                         "slot": slot.key,
                         "kind": "hook",
-                        "text": f"Hook {r.hook_name} BLOCKED: {r.stderr[:100] if r.stderr else 'denied'}",
+                        "text": f"Hook {r.hook_name} BLOCKED ({source}): {reason[:100]}",
                     },
                 )
             elif r.exit_code not in (0, 2):
