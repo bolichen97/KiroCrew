@@ -1603,6 +1603,10 @@ class ScriptHook:
       ``ScriptHookResult.error``, then stderr, then "exited with code N").
       Every other event stays warn-only (stderr shown to user). There is no
       per-hook advisory/fail-open opt-out.
+    - Never run, because the shell deny-list refused the command: SKIPPED on
+      every event (``ScriptHookResult.policy_refused``, exit 0, no output),
+      with a warning naming the deny reason. The refusal is the policy's
+      verdict on the hook, not one the hook delivered on the tool.
     """
 
     id: str = ""
@@ -1619,7 +1623,7 @@ class ScriptHook:
     timeout: int = 30  # seconds (Kiro CLI default is 30s)
     enabled: bool = True
     last_run: float = 0.0
-    last_status: str = ""  # "ok", "error", "timeout", "blocked"
+    last_status: str = ""  # "ok", "error", "timeout", "blocked", "refused"
     last_error: str = ""  # human-readable reason for the most recent non-ok status
     run_count: int = 0
 

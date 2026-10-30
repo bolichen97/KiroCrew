@@ -1024,11 +1024,18 @@ class TestRunScriptHookShellDenyList:
             enabled=True,
         )
         result = await run_script_hook(hook, "ctx")
-        assert result.exit_code == 2  # PreToolUse "block tool" convention
         assert not sentinel.exists(), "the denied command reached the shell"
+        # Refused and SKIPPED, not a block: the policy refused the hook, the hook
+        # delivered no verdict on the tool, so it must not read as a hook exit 2.
+        assert result.policy_refused
+        assert result.exit_code == 0
+        assert not result.blocked
+        assert not result.succeeded
+        assert result.stdout == "" and result.stderr == ""
         assert "Blocked by security policy" in result.error
-        assert hook.last_status == "blocked"
+        assert hook.last_status == "refused"
         assert hook.last_error and "Blocked by security policy" in hook.last_error
+        assert hook.last_error.startswith("Refused by the shell deny-list, did not run")
 
     @pytest.mark.asyncio
     async def test_a_benign_command_still_runs_unchanged(self, tmp_path: Path):
@@ -1080,5 +1087,8 @@ class TestRunScriptHookShellDenyList:
         # Asserted on the GATE verdict, not on chmod running: the Windows cmd shell
         # has no chmod, so the spawn's own exit is platform-specific, but "the deny
         # gate did not block it" (exit 2 is the block convention) holds on both.
+        # A refusal is ``policy_refused`` with exit 0, so ``exit_code != 2``
+        # alone cannot see one: assert on the refusal marker itself.
+        assert not result.policy_refused
         assert result.exit_code != 2
-        assert hook.last_status != "blocked"
+        assert hook.last_status not in ("blocked", "refused")

@@ -184,7 +184,9 @@ async def permission_pre_tool_block(
 
     Blocks by the same rule the chat turn loop applies: exit 2 is a delivered
     deny, and any other nonzero exit or a fire that raises is a gate with no
-    verdict, which blocks. With no store registered in this process the saved
+    verdict, which blocks. A hook the shell deny-list refused never ran and is
+    skipped with a warning (``ScriptHookResult.policy_refused``), not a block.
+    With no store registered in this process the saved
     Hooks-page hooks are read from disk (:func:`persisted_hook_store`), and saved
     hooks that cannot be read block.
     """
@@ -228,8 +230,21 @@ async def permission_pre_tool_block(
         logger.warning("PreToolUse hook fire failed; blocking tool", exc_info=True)
         return f"PreToolUse hook could not run: {exc}"[:500]
     for r in results:
+        if getattr(r, "policy_refused", False):
+            # Refused by the deny-list, never ran: skipped, not a block (see
+            # ``ScriptHookResult.policy_refused``). ``run_script_hook`` already
+            # logged the reason; this names the tool it was skipped for.
+            logger.warning(
+                "PreToolUse hook %s skipped for %s (refused by the shell deny-list)",
+                r.hook_name,
+                tool_name,
+            )
+            continue
         if r.exit_code == 2:
-            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+            reason = r.stderr[:200] or (
+                f"governance: {r.error[:200]}" if r.error else "hook denied"
+            )
+            return f"{r.hook_name}: {reason}"
         if r.exit_code != 0:
             detail = (
                 r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")

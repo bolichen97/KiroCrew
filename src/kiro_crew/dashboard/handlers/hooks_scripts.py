@@ -364,6 +364,7 @@ async def api_hook_test(request: web.Request) -> web.Response:
                 "exit_code": result.exit_code,
                 "error": result.error,
                 "duration_ms": result.duration_ms,
+                "policy_refused": result.policy_refused,
             },
         }
     )

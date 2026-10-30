@@ -98,6 +98,14 @@ class ScriptHookResult:
     exit_code: int = -1
     error: str = ""
     duration_ms: int = 0
+    #: Set when the shell deny-list refused the hook's command, so it never ran.
+    #: Such a result carries ``exit_code=0`` and empty output: the refusal is the
+    #: policy's verdict on the HOOK, not a verdict the hook delivered on the
+    #: tool, so it must not veto the tool the way a hook's own exit 2 does (one
+    #: refused telemetry hook otherwise blocked every tool call of every agent
+    #: carrying it). ``error`` holds the deny reason; every gate that reads these
+    #: results logs it and surfaces a warning instead of a block.
+    policy_refused: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -106,7 +114,7 @@ class ScriptHookResult:
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0
+        return self.exit_code == 0 and not self.policy_refused
 
 
 async def run_script_hook(
@@ -187,16 +195,25 @@ async def run_script_hook(
         deny_reason = await asyncio.to_thread(_shell_deny_reason)
         if deny_reason:
             hook.last_run = time.time()
-            hook.last_status = "blocked"
-            hook.last_error = deny_reason[:500]
+            hook.last_status = "refused"
+            hook.last_error = f"Refused by the shell deny-list, did not run: {deny_reason}"[:500]
             hook.run_count += 1
+            logger.warning(
+                "Hook %s (%s) refused by the shell deny-list and skipped: %s",
+                hook.name or hook.id,
+                hook.event,
+                deny_reason[:300],
+            )
+            # Skipped, not a block: see ``ScriptHookResult.policy_refused``. The
+            # command still never runs, so the deny-list holds; what changes is
+            # that the refusal no longer reads as the hook vetoing the tool.
             return ScriptHookResult(
                 hook_id=hook.id,
                 hook_name=hook.name,
                 event=hook.event,
                 error=deny_reason,
-                # PreToolUse "block tool" convention, as the governance deny above.
-                exit_code=2,
+                exit_code=0,
+                policy_refused=True,
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
     # Build hook event JSON for STDIN

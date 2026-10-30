@@ -83,9 +83,7 @@ KIND_USER_MESSAGE_ID_ASSIGNED = "user_message_id_assigned"
 SUMMARIZATION_KINDS = frozenset(
     {KIND_SUMMARIZATION_STARTED, KIND_SUMMARIZATION_COMPLETED, KIND_SUMMARIZATION_FAILED}
 )
-STEERING_KINDS = frozenset(
-    {KIND_STEERING_QUEUED, KIND_STEERING_INJECTED, KIND_STEERING_CLEARED}
-)
+STEERING_KINDS = frozenset({KIND_STEERING_QUEUED, KIND_STEERING_INJECTED, KIND_STEERING_CLEARED})
 
 # ── Payload fields Crew reads ──
 FIELD_KIND = "kind"
@@ -878,11 +876,15 @@ async def hooks_execute(
         session_key,
         agent,
         label,
-        "executed",
+        # A deny-list refusal never ran the command: audit it as refused, not
+        # executed. It answers exit 0 with no output, so KAS proceeds and the
+        # hook is skipped (``ScriptHookResult.policy_refused``).
+        "refused" if getattr(result, "policy_refused", False) else "executed",
         metadata={
             "hook_id": hook.id,
             "exit_code": result.exit_code,
             "duration_ms": result.duration_ms,
+            "policy_refused": bool(getattr(result, "policy_refused", False)),
         },
     )
     response: dict[str, Any] = {"exitCode": result.exit_code, "cancelled": False}
