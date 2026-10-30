@@ -109,6 +109,40 @@ class ScriptHookResult:
         return self.exit_code == 0
 
 
+def hook_command_deny_reason(command: str) -> str | None:
+    """Why the shell deny-list refuses *command* as a hook command, redacted, or ``None``.
+
+    The one deny check ``run_script_hook`` applies before it spawns a hook, so a
+    diagnostic that asks this question gets the answer a firing hook gets. It
+    resolves the effective deny set (``effective_denied_regexes_from_config``) and
+    matches through the active context's PolicyAuthority, so a companion
+    edition's overlay applies. ``is_denied`` records a SEL ``deny_event`` for each
+    refusal, here as at fire time. Blocking: it reads the keystone file and runs
+    regexes, so a caller on the event loop offloads it.
+    """
+    reason = current_context().security.is_denied(
+        command, denied_regexes=effective_denied_regexes_from_config()
+    )
+    return redact_via_context(reason) if reason else None
+
+
+def refused_script_hooks(hooks: Sequence[ScriptHook]) -> list[tuple[str, str, str]]:
+    """``(hook name, event, deny reason)`` for each of *hooks* the deny-list refuses.
+
+    A hook with no command (a skills-only hook) spawns nothing and is skipped.
+    Whether a hook is enabled is the caller's filter: this answers only what
+    ``run_script_hook`` would refuse. Blocking, like :func:`hook_command_deny_reason`.
+    """
+    refused: list[tuple[str, str, str]] = []
+    for hook in hooks:
+        if not hook.command:
+            continue
+        reason = hook_command_deny_reason(hook.command)
+        if reason:
+            refused.append((hook.name or hook.id, hook.event, reason))
+    return refused
+
+
 async def run_script_hook(
     hook: ScriptHook,
     context: str = "",
@@ -179,10 +213,7 @@ async def run_script_hook(
     if hook.command:
 
         def _shell_deny_reason() -> str | None:
-            reason = current_context().security.is_denied(
-                hook.command, denied_regexes=effective_denied_regexes_from_config()
-            )
-            return redact_via_context(reason) if reason else None
+            return hook_command_deny_reason(hook.command)
 
         deny_reason = await asyncio.to_thread(_shell_deny_reason)
         if deny_reason:

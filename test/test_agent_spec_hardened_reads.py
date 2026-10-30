@@ -1158,6 +1158,9 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     # The installed spec as an OAuth discovery trust anchor; any chat interface
     # can raise the banner that triggers it.
     "kiro_crew/mcp_oauth_discovery.py": [("mcp_oauth_discovery", "unknown")],
+    # The refused-hook scan reads every installed spec's hooks; doctor and the
+    # gateway's startup warning both run it, so the channel is unknown.
+    "kiro_crew/refused_hook_scan.py": [("refused_hook_scan", "unknown")],
     "kiro_crew/member_essential_context.py": [
         ("member_essentials", "context"),
         ("member_essentials", "context"),

@@ -111,6 +111,16 @@ The **Credentials** section reports:
 Nothing in that section reads a secret value, and it never fails the overall
 `doctor` run — a missing AWS setup is not a Kiro Crew fault.
 
+## Hooks the rules refuse
+
+A script hook's command is checked against the same rules before it runs, and a
+hook whose command matches one is refused and does not run. `kirocrew doctor`
+lists every such hook in its **Refused Hooks** section: the agent (or the Hooks
+page), the event, the hook's name and the rule. It never prints the command. An
+agent spec's own hooks are affected only on the harnesses where Kiro Crew runs
+them (KAS, goose, opencode); on kiro-cli, kiro-cli runs them itself. The gateway
+writes the same list to its log once when it starts.
+
 ## Adjusting the rules
 
 **Settings → Security** lets you disable individual built-in rules, disable them

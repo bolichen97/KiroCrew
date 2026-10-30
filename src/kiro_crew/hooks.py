@@ -172,6 +172,8 @@ from kiro_crew.hook_runtime.script_hooks import (  # noqa: F401
     ScriptHookResult,
     ScriptHookStore,
     _hook_subprocess_env,
+    hook_command_deny_reason,
+    refused_script_hooks,
     run_script_hook,
 )
 from kiro_crew.hook_runtime.script_validation import (  # noqa: F401

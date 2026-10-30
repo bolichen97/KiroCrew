@@ -313,6 +313,7 @@ from kiro_crew.dashboard.server_runtime.maintenance import (  # noqa: F401
     _kick_otel_crew_log_subscriber,
     _kick_owner_only_sweep,
     _kick_pinned_order_load,
+    _kick_refused_hook_warning,
     _kick_session_search_index,
     _own_host_warm_done,
     _prebuild_memory_after_preparation,
@@ -1304,6 +1305,7 @@ async def start_dashboard(
     # And for the data home's owner-only mode repair, whose walk grows with the
     # files the user has accumulated.
     _kick_owner_only_sweep(state)
+    _kick_refused_hook_warning(state)
     _kick_display_verdicts(state)
     # Bind the crew-log push to this loop and register it with the session emitter,
     # once the listener is serving: installing it imports and builds the publisher,

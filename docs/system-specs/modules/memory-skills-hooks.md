@@ -6139,7 +6139,7 @@ wedged owner frame still reads as a gate stall.
 | `stream_caps` | A hook's bounded output drain, the truncation-marking decode and the concurrent stdin/stdout/stderr exchange |
 | `hook_dispatch` | The global store accessors, the strict on-disk read a store-less process uses, the informational tool-call fire, and the PreToolUse block gate with the names a matcher meets |
 | `hook_types` | The pipeline's value types: `HookResult`, the tool gate's verdict `ToolHookResult` (its constructors emit the approval-decision counter, which `test/metrics/test_business_counters.py` reads in this file), the rule dataclasses, `UserDeniedPattern`, and `HooksConfig` with its defensive parse of the `hooks` section |
-| `script_hooks` | Running script hooks: a hook process's environment (`_hook_subprocess_env`, the one reader of `_HOOK_BASE_ENV_KEYS`), one hook's sandboxed run (`run_script_hook`) and its `ScriptHookResult`, and `ScriptHookStore`, which persists the Hooks page's hooks, validates every edit and fires the hooks an event matches; `fire` sits beside `run_script_hook`, and `test_hook_events_kas_triggers` reads its source through the object |
+| `script_hooks` | Running script hooks: a hook process's environment (`_hook_subprocess_env`, the one reader of `_HOOK_BASE_ENV_KEYS`), one hook's sandboxed run (`run_script_hook`) and its `ScriptHookResult`, the shell deny check that run applies (`hook_command_deny_reason`, and `refused_script_hooks` over a list of hooks), and `ScriptHookStore`, which persists the Hooks page's hooks, validates every edit and fires the hooks an event matches; `fire` sits beside `run_script_hook`, and `test_hook_events_kas_triggers` reads its source through the object |
 
 What stays in `hooks.py`, and why, because a guard or a contract reads it there:
 
@@ -6236,6 +6236,23 @@ a hook is therefore **not portable across platforms**. `ScriptHookStore.fire` al
 
 Both platforms receive the same `KIROCREW_HOOK_EVENT` / `KIROCREW_HOOK_CONTEXT`
 env vars and the same hook-event JSON on stdin.
+
+**A hook command the shell deny-list matches is refused without running.** The
+command runs outside the tool gate, so `run_script_hook` vets it first through
+`hook_command_deny_reason`: the effective deny set (`effective_denied_regexes_from_config`)
+matched through the active context's PolicyAuthority, the reason redacted. The same
+helper answers ahead of time: `refused_hook_scan.scan_refused_hooks` converts each
+installed agent spec's `hooks` (user level and the crewmate folder) the way the turn
+loop does (`spec_hooks.spec_script_hooks`), adds the Hooks page's enabled hooks, and
+lists each refusal as agent, event, hook name and reason, never the command.
+`kirocrew doctor` prints it as the **Refused Hooks** section, which says that spec
+hooks are affected only on `ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS` (on kiro-cli, kiro-cli
+runs them) and whether the selected harness is one of them, and a spec it cannot read
+is named as not checked. Each gateway process logs the same list once, as one
+warning, on a worker thread after the listener serves
+(`server_runtime.maintenance._kick_refused_hook_warning`). Both are reporting only.
+Each listed refusal records a SEL `deny_event`, as `is_denied` does for every
+refusal it decides.
 
 **Attribution keys in the stdin JSON.** Beyond `hook_event_name`, `cwd` and the
 event's own fields (`prompt`, `tool_name`, `tool_input`, `tool_response`,

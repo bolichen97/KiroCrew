@@ -157,6 +157,30 @@ def _kick_owner_only_sweep(state: DashboardState) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
+def _kick_refused_hook_warning(state: DashboardState) -> None:
+    """Log the hooks the shell deny-list will refuse, once per process, post-bind.
+
+    ``refused_hook_scan.warn_refused_hooks_once`` reads every installed agent spec
+    and ``hooks.json`` and runs the deny check on each command, so it runs on a
+    worker thread once the listener serves. Log only: no hook's behavior changes.
+    """
+
+    def _warn_in_thread() -> None:
+        from kiro_crew.refused_hook_scan import warn_refused_hooks_once
+
+        warn_refused_hooks_once()
+
+    async def _refused_hook_warning() -> None:
+        try:
+            await asyncio.to_thread(_warn_in_thread)
+        except Exception:  # noqa: BLE001 -- a diagnostic never fails the gateway
+            logger.debug("refused-hook startup warning failed", exc_info=True)
+
+    task = asyncio.create_task(_refused_hook_warning())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _kick_session_search_index(state: DashboardState) -> None:
     """Keep the session search candidate index caught up, in its OWN process.
 

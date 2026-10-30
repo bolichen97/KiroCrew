@@ -295,6 +295,90 @@ def _doctor_deprecated_agent_specs(cfg: KiroCrewConfig, issues: list[str]) -> No
     issues.append("a config names a deprecated agent spec")
 
 
+def _refused_hook_reason_line(reason: str) -> str:
+    """The first line of a deny reason, bounded: the rest is the agent-facing remedy."""
+    first = reason.strip().splitlines()[0] if reason.strip() else reason
+    return first[:300]
+
+
+def _doctor_refused_hooks(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """List installed hooks the shell deny-list will refuse, without printing a command.
+
+    ``run_script_hook`` vets a hook's command against the same deny-list a shell
+    tool call meets and refuses a match without running it, so a hook that ran on
+    an earlier release can stop running after an upgrade with nothing said until
+    its event fires. This walks every installed agent spec's own ``hooks`` and the
+    Hooks page's enabled hooks through that same check
+    (``refused_hook_scan.scan_refused_hooks``) and names each refusal: agent,
+    event, hook name and the rule's reason, all escaped. The command is never
+    printed; it can carry a credential.
+
+    Spec hooks are fired by Kiro Crew only on ``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``;
+    on kiro-cli, kiro-cli runs them itself, so the row names which harnesses the
+    finding applies to and whether the selected one is among them. Silent when
+    nothing is refused and every spec was read.
+    """
+    from kiro_crew.config.paths import mate_agents_dir
+    from kiro_crew.refused_hook_scan import (
+        RefusedHookScan,
+        crew_fired_spec_hook_backends,
+        scan_refused_hooks,
+    )
+
+    try:
+        scan = scan_refused_hooks(spec_dirs=[cli_doctor._agents_dir(), mate_agents_dir()])
+    except Exception as exc:  # noqa: BLE001 -- doctor must survive a broken setup
+        scan = RefusedHookScan(error=type(exc).__name__)
+    if scan.error:
+        print("\nRefused Hooks")
+        print(
+            "  ⚠️  not checked: the deny check could not run "
+            f"({render._safe_display(scan.error)})"
+        )
+        return
+    if not scan.refused and not scan.unreadable:
+        return
+
+    print("\nRefused Hooks")
+    spec_findings = [hook for hook in scan.refused if hook.owner]
+    page_findings = [hook for hook in scan.refused if not hook.owner]
+    for hook in spec_findings:
+        print(
+            f"  agent {render._safe_display(hook.owner)}:  \u26a0\ufe0f  "
+            f"{hook.event} hook {render._safe_display(hook.name)} will be refused by the "
+            "security policy and will not run"
+        )
+        print(f"{render._INDENT}{render._safe_display(_refused_hook_reason_line(hook.reason))}")
+    for hook in page_findings:
+        print(
+            f"  Hooks page:  \u26a0\ufe0f  {hook.event} hook {render._safe_display(hook.name)} "
+            "will be refused by the security policy and will not run"
+        )
+        print(f"{render._INDENT}{render._safe_display(_refused_hook_reason_line(hook.reason))}")
+    if spec_findings:
+        fired_on = crew_fired_spec_hook_backends()
+        labels = ", ".join(_backend_policy_label(backend) for backend in fired_on)
+        selected = cfg.agent.acp_backend
+        affected = "affected" if selected in fired_on else "not affected"
+        render._print_wrapped(
+            f"Agent spec hooks: applies where Kiro Crew runs them ({labels}); on kiro-cli, "
+            "kiro-cli runs a spec's hooks itself and this check does not apply. "
+            f"Selected harness: {_backend_policy_label(selected)} ({affected})."
+        )
+    if page_findings:
+        render._print_wrapped("Hooks page hooks: applies on every harness.")
+    if scan.refused:
+        render._print_wrapped(
+            "To fix: change the hook's command, or the matching rule under " "Settings -> Security."
+        )
+        issues.append("hooks the security policy will refuse")
+    if scan.unreadable:
+        names = ", ".join(render._safe_display(name) for name in scan.unreadable)
+        print(
+            f"  ⚠️  not checked: {len(scan.unreadable)} agent spec(s) could not be read ({names})"
+        )
+
+
 def _doctor_claude_backend() -> None:
     """Report Claude Code as an optional agent backend, installed or not.
 
