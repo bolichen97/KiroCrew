@@ -74,10 +74,10 @@ _BASH_EXFIL_RES: list[tuple[re.Pattern[str], str]] = [
     # anchored at a word boundary so `rsync -e ssh` (contains `nc -e`) and
     # `vnc -e` do NOT match; a plain substring `"nc -e"` false-positived on them.
     (re.compile(r"(?:^|\s)nc(?:at)?\s+-e\b", re.IGNORECASE), "nc/ncat reverse shell"),
-    # curl upload short form `-T <file>` / `-Tfile` (no space). CASE-SENSITIVE
-    # `-T`: curl's upload flag is uppercase, so this does NOT match lowercase long
-    # options such as `--trace-time`. `-T` must begin at a word boundary.
-    (re.compile(r"\bcurl\b.*(?:^|\s)-T\s*\S"), "curl -T upload"),
+    # curl upload short form `-T <file>` / `-Tfile` (no space). `curl` matches
+    # case-insensitively at a command-token boundary (so `CURL` matches, `--post-curl`
+    # does not); `-T` stays case-sensitive so lowercase `-t`/`--trace-time` do not.
+    (re.compile(r"(?:^|[\s;&|(`/])(?i:curl)\b.*(?:^|\s)-T\s*\S"), "curl -T upload"),
 ]
 
 
