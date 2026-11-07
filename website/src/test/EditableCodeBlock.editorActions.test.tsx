@@ -56,6 +56,7 @@ vi.mock('../utils/clipboard', () => ({ copyCode: vi.fn(() => Promise.resolve(tru
 
 import { copyCode } from '../utils/clipboard'
 import EditableCodeBlock from '../components/EditableCodeBlock'
+import { FileViewCodeCtx } from '../components/markdown/contexts'
 
 /** The mock always renders both rows regardless of height (the real CodeBlock
  *  only renders the footer once tall), so tests that don't care which row
@@ -292,6 +293,15 @@ describe('EditableCodeBlock edit re-anchors the block only when its top has scro
     stubWrapperTop(200)
     render(<EditableCodeBlock code="const a = 1" lang="ts" complete />)
     fireEvent.click(headerActions().getByLabelText('Edit code block'))
+    flushRaf()
+
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled()
+  })
+
+  it('leaves a file view where the footer edit was clicked: its editor does not collapse', () => {
+    stubWrapperTop(-400)
+    render(<FileViewCodeCtx.Provider value={true}><EditableCodeBlock code="const a = 1" lang="ts" complete /></FileViewCodeCtx.Provider>)
+    fireEvent.click(footerActionsRow().getByLabelText('Edit code block'))
     flushRaf()
 
     expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled()

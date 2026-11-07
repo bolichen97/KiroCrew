@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Pencil, X, Copy, Check } from 'lucide-react'
 import { copyCode } from '../utils/clipboard'
 import { CodeBlock } from './CodeBlock'
@@ -6,6 +6,7 @@ import { PierreEditor } from '../pierre'
 import RunInTerminalBtn, { SHELL_LANGS } from './RunInTerminalBtn'
 import RunYourselfCard, { RUN_YOURSELF_LANG, runYourselfSummary } from './RunYourselfCard'
 import { useTerminalEnabled } from '../utils/terminalRegistry'
+import { FileViewCodeCtx } from './markdown/contexts'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -34,6 +35,7 @@ const EditableCodeBlock = memo(function EditableCodeBlock(
   },
 ) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const fileView = useContext(FileViewCodeCtx)
   const [editing, setEditing] = useState(false)
   const [copied, setCopied] = useState(false)
   const valueRef = useRef(code)
@@ -52,24 +54,26 @@ const EditableCodeBlock = memo(function EditableCodeBlock(
     timerRef.current = setTimeout(() => setCopied(false), 1500)
   }, [])
 
-  // The editor caps at max-h-[480px], so opening it can collapse a tall block
-  // by thousands of pixels with the scroll offset left where it was -- most
-  // visibly from the FOOTER'S edit button, whose whole point is reachability
-  // on a block long enough that its start has scrolled off screen. One code
-  // path handles both triggers, gated on the wrapper's top actually being
-  // above the viewport: unconditionally calling scrollIntoView would also
-  // fire for a HEADER edit on a block sitting mid-viewport (top already
-  // visible, just not flush with it), yanking the page up for no reason the
-  // click gave it.
+  // Outside a file view the editor caps at max-h-[480px], so opening it can
+  // collapse a tall block by thousands of pixels with the scroll offset left
+  // where it was -- most visibly from the FOOTER'S edit button, whose whole
+  // point is reachability on a block long enough that its start has scrolled
+  // off screen. One code path handles both triggers, gated on the wrapper's top
+  // actually being above the viewport: unconditionally calling scrollIntoView
+  // would also fire for a HEADER edit on a block sitting mid-viewport (top
+  // already visible, just not flush with it), yanking the page up for no reason
+  // the click gave it. A file view's editor keeps the block's height, so nothing
+  // collapses and the reader stays where they clicked.
   const startEditing = useCallback(() => {
     setEditing(true)
+    if (fileView) return
     requestAnimationFrame(() => {
       const el = wrapperRef.current
       if (el && el.getBoundingClientRect().top < 0) {
         el.scrollIntoView({ block: 'start', behavior: 'smooth' })
       }
     })
-  }, [])
+  }, [fileView])
 
   const terminalEnabled = useTerminalEnabled()
   const showRunBtn = complete && terminalEnabled && !!lang && SHELL_LANGS.has(lang)
@@ -132,11 +136,14 @@ const EditableCodeBlock = memo(function EditableCodeBlock(
           to its full content height, the wrapper clips it, and the wheel finds
           nothing scrollable -- it scrolls the transcript instead, and only the
           caret (arrow keys) can move the view. Capping the scroller itself gives
-          it a definite max height, so it scrolls under the pointer. */}
+          it a definite max height, so it scrolls under the pointer. A file view
+          has no cap: the editor keeps the read view's height, the whole file,
+          and the panel scrolls it as it scrolls the read view. */}
       <PierreEditor
         file={{ name: `snippet.${lang || 'txt'}`, contents: code, cacheKey: `chat-edit:${lang}:${code.length}:${contentHash(code)}` }}
+        langHint={lang}
         onChange={v => { valueRef.current = v }}
-        className="max-h-[480px]"
+        className={fileView ? undefined : 'max-h-[480px]'}
       />
     </div>
   )

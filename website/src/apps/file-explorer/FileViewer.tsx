@@ -1,6 +1,7 @@
 import { FileText, FileQuestion, RefreshCw, Download, Copy, ExternalLink, FolderOpen, MoreHorizontal, ShieldAlert } from 'lucide-react'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import MarkdownRenderer, { BasePathCtx } from '../../components/MarkdownRenderer'
+import { FileViewCodeCtx } from '../../components/markdown/contexts'
 import { EmptyState, Skeleton } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import {
@@ -41,7 +42,7 @@ function renderViewerBody({ ext, fileMeta, content, openFile }: { ext: string; f
   const maxRun = (content || '').match(/`{3,}/g)?.reduce((max, s) => Math.max(max, s.length), 0) ?? 0
   const fence = '`'.repeat(Math.max(3, maxRun + 1))
   const wrapped = fence + lang + '\n' + (content || '') + '\n' + fence
-  return <MarkdownRenderer content={wrapped} />
+  return <FileViewCodeCtx.Provider value={true}><MarkdownRenderer content={wrapped} /></FileViewCodeCtx.Provider>
 }
 
 export default function FileViewer({ filePath, fileMeta, content, loading, error, onReload, onDownload }: FileViewerProps) {

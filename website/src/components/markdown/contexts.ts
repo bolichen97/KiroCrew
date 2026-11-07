@@ -49,6 +49,13 @@ export const CompactImagesCtx = createContext<boolean>(false)
 export const ReadOnlyCodeCtx = createContext<boolean>(false)
 
 /**
+ * True where a fenced code block is a whole file in a panel that scrolls (the
+ * Files app shows a code file as one fence): the block's scratch editor keeps
+ * the read view's height instead of the chat's 480px cap. Default false.
+ */
+export const FileViewCodeCtx = createContext<boolean>(false)
+
+/**
  * A per-message token appended to local image URLs.
  *
  * `/api/file-raw?path=…` addresses a file by PATH, so every impression of a file
