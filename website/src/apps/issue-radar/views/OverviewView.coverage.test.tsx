@@ -88,9 +88,12 @@ describe('OverviewView', () => {
 
     setContext({ issuesError: new Error('GitHub API returned 502') })
     rerender(<OverviewView />)
-    expect(screen.getByRole('alert')).toHaveTextContent('GitHub API returned 502')
-    // The cached tiles stay, so the notice is what says they may be old.
-    expect(screen.getByText('Open issues')).toBeInTheDocument()
+    const notice = screen.getByRole('alert')
+    expect(notice).toHaveTextContent('GitHub API returned 502')
+    expect(within(notice).getByRole('button', { name: 'Ask the agent' })).toBeInTheDocument()
+    // The cached tiles stay below it, so the notice is what says they may be old.
+    const tile = screen.getByText('Open issues')
+    expect(notice.compareDocumentPosition(tile) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
   it('names the disabled refresh button for the refresh in flight, then restores it', () => {

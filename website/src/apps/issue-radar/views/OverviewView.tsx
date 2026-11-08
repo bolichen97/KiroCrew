@@ -159,7 +159,7 @@ export default function OverviewView() {
         </button>
       </div>
 
-      {/* A failed refresh keeps the cached numbers below, so say it failed. */}
+      {/* A failed issue load keeps the cached numbers below, so say it failed. */}
       <ErrorNotice message={issuesError?.message} askAgent />
 
       {/* KPI strip — fills the width; each tile jumps into the issue list. */}

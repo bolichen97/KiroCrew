@@ -139,6 +139,13 @@ function saveCrewUi(patch: Partial<PersistedCrewUi>): boolean {
   }
 }
 
+/** Stamps a list answer the server read from the provider. A cached answer is not
+ * stamped: the server also serves its cache when it could not reach the provider.
+ * A local `setQueryData` patch spreads the old answer, so it keeps the old stamp. */
+function stampProviderRead<T extends { from_cache: boolean }>(r: T): T & { readAt?: number } {
+  return r.from_cache ? r : { ...r, readAt: Date.now() }
+}
+
 export interface IssueRadarContextValue {
   // ── repos ──
   repos: ConnectedRepo[]
@@ -713,7 +720,8 @@ export function IssueRadarProvider({
   const issuesKey = ['issue-radar', 'issues', scopeKey, stateFilter] as const
   const issuesQuery = useQuery({
     queryKey: issuesKey,
-    queryFn: () => issueRadarApi.issues(active, { state: stateFilter, poll: isRefetch(issuesKey) }),
+    queryFn: () => issueRadarApi.issues(active, { state: stateFilter, poll: isRefetch(issuesKey) })
+      .then(stampProviderRead),
     // react-query pauses this while the window is unfocused unless the user opts
     // in: a backgrounded tab then costs nothing, at the price of returning to a
     // stale list and waiting out the first poll.
@@ -829,7 +837,8 @@ export function IssueRadarProvider({
   const pullsKey = ['issue-radar', 'pulls', scopeKey, prFetchState] as const
   const pullsQuery = useQuery({
     queryKey: pullsKey,
-    queryFn: () => issueRadarApi.pulls(active, { state: prFetchState, poll: isRefetch(pullsKey) }),
+    queryFn: () => issueRadarApi.pulls(active, { state: prFetchState, poll: isRefetch(pullsKey) })
+      .then(stampProviderRead),
     // The two PR sources are MUTUALLY EXCLUSIVE, and only one of them is ever
     // read (see `pulls` below). Enabling both while a person filter is on would
     // poll the provider twice a minute to fill a cache nothing renders.
@@ -854,6 +863,11 @@ export function IssueRadarProvider({
   // refreshed, so drop it when the shown list changes.
   const resetPullsRefresh = refreshPullsMutation.reset
   useEffect(() => { resetPullsRefresh() }, [scopeKey, prFetchState, resetPullsRefresh])
+  const failedPullsRefreshAt = refreshPullsMutation.isError ? refreshPullsMutation.submittedAt : 0
+  const pullsReadAt = pullsQuery.data?.readAt ?? 0
+  useEffect(() => {
+    if (failedPullsRefreshAt && pullsReadAt > failedPullsRefreshAt) resetPullsRefresh()
+  }, [pullsReadAt, failedPullsRefreshAt, resetPullsRefresh])
   // Progressive first paint for PRs — the same shape as `firstPageQuery` for
   // issues, and the larger win: a cold `pullsQuery` blocks on BOTH the full
   // pagination AND the GraphQL enrichment before it resolves, so the PR pane is
@@ -933,6 +947,14 @@ export function IssueRadarProvider({
   // otherwise `issuesError` would report the old list's failure on the new one.
   const resetRefresh = refreshMutation.reset
   useEffect(() => { resetRefresh() }, [scopeKey, stateFilter, resetRefresh])
+  // A provider read of this list after a failed refresh was sent is newer than
+  // the list that refresh failed to load, so its error goes. The PR refresh
+  // above does the same.
+  const failedRefreshAt = refreshMutation.isError ? refreshMutation.submittedAt : 0
+  const issuesReadAt = issuesQuery.data?.readAt ?? 0
+  useEffect(() => {
+    if (failedRefreshAt && issuesReadAt > failedRefreshAt) resetRefresh()
+  }, [issuesReadAt, failedRefreshAt, resetRefresh])
 
   // The full list once it exists, else the cold-start first page. Falling back
   // only when `issuesQuery.data` is undefined means the authoritative set ALWAYS

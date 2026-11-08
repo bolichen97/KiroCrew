@@ -1,6 +1,6 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { defaultScheduler, notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, render, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import {
   IssueRadarProvider, useIssueRadar, type IssueRadarContextValue,
 } from './context'
@@ -479,6 +479,38 @@ describe('manual refresh', () => {
     await drive(() => ctx.setStateFilter('closed'))
     await waitFor(() => expect(ctx.issuesError).toBeNull())
   })
+
+  it('drops a failed refresh\'s error once a later poll reads the list from the provider', async () => {
+    // Query results reach React as microtasks here, so each act() below settles
+    // every render and effect its step causes before the next assertion.
+    onTestFinished(() => { notifyManager.setScheduler(defaultScheduler); vi.useRealTimers() })
+    notifyManager.setScheduler(queueMicrotask)
+    vi.setSystemTime(Date.parse('2026-07-10T00:00:00Z'))
+    const client = renderProvider()
+    await readyIssues()
+    api.issues.mockRejectedValueOnce(new Error('GitHub API returned 502'))
+    vi.setSystemTime(Date.parse('2026-07-10T00:01:00Z'))
+    await drive(() => ctx.refresh())
+    await waitFor(() => expect(ctx.issuesError?.message).toBe('GitHub API returned 502'))
+
+    // A local patch reads nothing, and the server also answers from its cache when it
+    // cannot reach the provider, so neither one clears the error.
+    const key = ['issue-radar', 'issues', SCOPE, 'open']
+    vi.setSystemTime(Date.parse('2026-07-10T00:02:00Z'))
+    await act(async () => { client.setQueryData<object>(key, (old) => ({ ...old, issues: [ISSUES[0]] })) })
+    expect(ctx.issues).toHaveLength(1)
+    expect(ctx.issuesError?.message).toBe('GitHub API returned 502')
+    api.issues.mockResolvedValueOnce({ issues: ISSUES, from_cache: true })
+    await act(async () => { await client.refetchQueries({ queryKey: key }) })
+    expect(ctx.issues).toHaveLength(ISSUES.length)
+    expect(ctx.issuesError?.message).toBe('GitHub API returned 502')
+
+    vi.setSystemTime(Date.parse('2026-07-10T00:03:00Z'))
+    api.issues.mockResolvedValueOnce({ issues: ISSUES, from_cache: false })
+    await act(async () => { await client.refetchQueries({ queryKey: key }) })
+    expect(api.issues).toHaveBeenLastCalledWith(ACTIVE, { state: 'open', poll: true })
+    await waitFor(() => expect(ctx.issuesError).toBeNull())
+  })
 })
 
 describe('pull-request filters, sort and selection', () => {
@@ -641,6 +673,37 @@ describe('manual PR refresh', () => {
     await drive(() => ctx.refreshPulls())
     await waitFor(() => expect(ctx.pullsError?.message).toBe('rate limited'))
     expect(ctx.pullsRefreshing).toBe(false)
+  })
+
+  it('drops a failed refresh\'s error once a later poll reads the list from the provider', async () => {
+    // Query results reach React as microtasks here, so each act() below settles
+    // every render and effect its step causes before the next assertion.
+    onTestFinished(() => { notifyManager.setScheduler(defaultScheduler); vi.useRealTimers() })
+    notifyManager.setScheduler(queueMicrotask)
+    vi.setSystemTime(Date.parse('2026-07-10T00:00:00Z'))
+    persistUi({ mainView: 'pulls' })
+    const client = renderProvider()
+    await readyPulls()
+    api.pulls.mockRejectedValueOnce(new Error('GitHub API returned 502'))
+    vi.setSystemTime(Date.parse('2026-07-10T00:01:00Z'))
+    await drive(() => ctx.refreshPulls())
+    await waitFor(() => expect(ctx.pullsError?.message).toBe('GitHub API returned 502'))
+
+    const key = ['issue-radar', 'pulls', SCOPE, 'open']
+    vi.setSystemTime(Date.parse('2026-07-10T00:02:00Z'))
+    await act(async () => { client.setQueryData<object>(key, (old) => ({ ...old, pulls: [PULLS[0]] })) })
+    expect(ctx.pulls).toHaveLength(1)
+    expect(ctx.pullsError?.message).toBe('GitHub API returned 502')
+    api.pulls.mockResolvedValueOnce({ pulls: PULLS, bulk_max: 5, from_cache: true })
+    await act(async () => { await client.refetchQueries({ queryKey: key }) })
+    expect(ctx.pulls).toHaveLength(PULLS.length)
+    expect(ctx.pullsError?.message).toBe('GitHub API returned 502')
+
+    vi.setSystemTime(Date.parse('2026-07-10T00:03:00Z'))
+    api.pulls.mockResolvedValueOnce({ pulls: PULLS, bulk_max: 5, from_cache: false })
+    await act(async () => { await client.refetchQueries({ queryKey: key }) })
+    expect(api.pulls).toHaveBeenLastCalledWith(ACTIVE, { state: 'open', poll: true })
+    await waitFor(() => expect(ctx.pullsError).toBeNull())
   })
 })
 
